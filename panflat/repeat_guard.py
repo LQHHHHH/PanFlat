@@ -11,7 +11,12 @@ import mappy
 import numpy as np
 
 from panflat.gfa_io import revcomp
-from panflat.models import InputContractError, Step, StepProvenance
+from panflat.models import (
+    InputContractError,
+    LazyProvenanceTuple,
+    Step,
+    StepProvenance,
+)
 
 # Fixed initial screening constants (§3.8.4-C item 8, reported in summary.tsv)
 REPEAT_MIN_SEQ_LEN: int = 500
@@ -134,6 +139,17 @@ def merge_contiguous_provenance(
     and are contiguous on the original unflipped path (`prev.src_end == curr.src_start` for `+`,
     or `prev.src_start == curr.src_end` for `-`).
     """
+    if isinstance(provenance, LazyProvenanceTuple):
+        runs = provenance.merged_runs()
+        if not runs:
+            return []
+        seq_str = sub_seq if sub_seq is not None else ""
+        total_prov_len = runs[-1][2]
+        has_seq = len(seq_str) == total_prov_len
+        if has_seq:
+            return [(prov, seq_str[s_bp:e_bp]) for prov, s_bp, e_bp in runs]
+        return [(prov, "") for prov, _, _ in runs]
+
     if not provenance:
         return []
     seq_str = sub_seq if sub_seq is not None else ""
@@ -183,6 +199,20 @@ def merge_contiguous_provenance(
     return merged
 
 
+_RC5_LUT = np.array(
+    [
+        ((3 - ((x >> 8) & 3)) << 0)
+        | ((3 - ((x >> 6) & 3)) << 2)
+        | ((3 - ((x >> 4) & 3)) << 4)
+        | ((3 - ((x >> 2) & 3)) << 6)
+        | ((3 - (x & 3)) << 8)
+        for x in range(1024)
+    ],
+    dtype=np.uint32,
+)
+_REPEAT_MASK_CACHE: dict[str, tuple[list[tuple[int, int]], list[dict[str, Any]]]] = {}
+
+
 def repeat_mask_intervals(
     seq: str,
 ) -> tuple[list[tuple[int, int]], list[dict[str, Any]]]:
@@ -205,6 +235,9 @@ def repeat_mask_intervals(
     seq_len = len(seq)
     if seq_len < REPEAT_MIN_SEQ_LEN:
         return [], []
+    cached = _REPEAT_MASK_CACHE.get(seq)
+    if cached is not None:
+        return list(cached[0]), list(cached[1])
 
     if seq_len <= REPEAT_WINDOW_SIZE:
         window_bounds: list[tuple[int, int]] = [(0, seq_len)]
@@ -215,25 +248,36 @@ def repeat_mask_intervals(
         )
         window_bounds = [(s, s + REPEAT_WINDOW_SIZE) for s in starts]
 
-    # Vectorized 30-bit canonical 15-mer encoding
+    # Vectorized 30-bit canonical 15-mer encoding via three 5-mer blocks
     arr = np.frombuffer(seq.encode("ascii", errors="replace"), dtype=np.uint8)
     codes = _BASE_LUT[arr]
 
-    num_kmers = seq_len - REPEAT_KMER_SIZE + 1
     invalid_prefix = np.zeros(seq_len + 1, dtype=np.int32)
     np.cumsum(codes > 3, out=invalid_prefix[1:])
     valid_mask = (
         invalid_prefix[REPEAT_KMER_SIZE:] - invalid_prefix[:-REPEAT_KMER_SIZE]
     ) == 0
 
-    safe = np.where(codes <= 3, codes, 0).astype(np.uint64)
-    comp = np.uint64(3) - safe
-    fwd = np.zeros(num_kmers, dtype=np.uint64)
-    rev = np.zeros(num_kmers, dtype=np.uint64)
-    for j in range(REPEAT_KMER_SIZE):
-        fwd = (fwd << np.uint64(2)) | safe[j : j + num_kmers]
-        rev = rev | (comp[j : j + num_kmers] << np.uint64(2 * j))
-    canon = np.minimum(fwd, rev)
+    safe = np.where(codes <= 3, codes, 0).astype(np.uint32)
+    s5 = (
+        (safe[:-4] << np.uint32(8))
+        | (safe[1:-3] << np.uint32(6))
+        | (safe[2:-2] << np.uint32(4))
+        | (safe[3:-1] << np.uint32(2))
+        | safe[4:]
+    )
+    fwd = (
+        (s5[:-10] << np.uint32(20))
+        | (s5[5:-5] << np.uint32(10))
+        | s5[10:]
+    )
+    r5 = _RC5_LUT[s5]
+    rev = (
+        (r5[10:] << np.uint32(20))
+        | (r5[5:-5] << np.uint32(10))
+        | r5[:-10]
+    )
+    canon = np.minimum(fwd, rev, out=fwd)
 
     window_diagnostics: list[dict[str, Any]] = []
     for w_s, w_e in window_bounds:
@@ -251,9 +295,20 @@ def repeat_mask_intervals(
             w_canon = canon[w_s : w_s + total_pos]
             if valid_pos < total_pos:
                 w_canon = w_canon[w_valid]
-            counts = collections.Counter(w_canon.tolist())
-            unique_keys = len(counts)
-            singleton_count = sum(1 for c in counts.values() if c == 1)
+            if valid_pos == 1:
+                unique_keys = 1
+                singleton_count = 1
+            else:
+                w_sorted = np.sort(w_canon)
+                diff = w_sorted[1:] != w_sorted[:-1]
+                unique_keys = int(np.count_nonzero(diff)) + 1
+                left_ok = np.empty(valid_pos, dtype=bool)
+                left_ok[0] = True
+                left_ok[1:] = diff
+                right_ok = np.empty(valid_pos, dtype=bool)
+                right_ok[:-1] = diff
+                right_ok[-1] = True
+                singleton_count = int(np.count_nonzero(left_ok & right_ok))
             singleton_ratio = singleton_count / valid_pos
             # Strictly < 0.30 -> "low", >= 0.30 -> "non-low"
             if singleton_count * 10 < valid_pos * 3:
@@ -295,7 +350,10 @@ def repeat_mask_intervals(
             raw_masked.append((current_run[0]["start"], current_run[-1]["end"]))
         masked_intervals = merge_intervals(raw_masked)
 
-    return masked_intervals, window_diagnostics
+    if len(_REPEAT_MASK_CACHE) >= 32:
+        _REPEAT_MASK_CACHE.clear()
+    _REPEAT_MASK_CACHE[seq] = (masked_intervals, window_diagnostics)
+    return list(masked_intervals), list(window_diagnostics)
 
 
 def slice_candidate_by_intervals(

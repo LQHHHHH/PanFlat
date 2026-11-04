@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from typing import Sequence
 
@@ -253,7 +254,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_build_config(config)
             graph = load_and_validate_inputs(config)
             result = run_chromosome_pipeline(graph, config)
+            del graph
+            gc.collect()
             write_build_outputs(result, config)
+            del result
+            gc.collect()
 
             verify_build_outputs(
                 prefix=config.out_prefix,

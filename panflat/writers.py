@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
+
 from panflat.gfa_io import parse_fasta
 from panflat.gff_liftover import liftover_gff3
 from panflat.models import (
@@ -13,6 +15,7 @@ from panflat.models import (
     BuildConfig,
     ChromosomeBuildResult,
     InputContractError,
+    LazyStepOffsetSequence,
     StepOffsetRow,
 )
 from panflat.verify_qc import (
@@ -33,13 +36,41 @@ def _build_chain_text(
     chain_id: int = 1,
 ) -> str:
     """Format `{p}.ref_to_pan.chain` with header, blocks, blank line, and `# block` / `# step` comments."""
+    if isinstance(step_offsets, LazyStepOffsetSequence):
+        n_steps = len(step_offsets)
+        ref_len = int(step_offsets.ref_ends[-1]) if n_steps > 0 else 0
+        lines: list[str] = [
+            f"chain {ref_len} {chrom} {ref_len} + 0 {ref_len} "
+            f"{chrom} {pan_len} + 0 {pan_len} {chain_id}"
+        ]
+        block_meta: list[tuple[int, int, int]] = []
+        if n_steps > 0:
+            dq_steps = (
+                np.flatnonzero(step_offsets.slot_ins_lens[1:] > 0) + 1
+            ).tolist()
+            cur_t_start = 0
+            for s_idx in dq_steps:
+                t_end = int(step_offsets.ref_ends[s_idx - 1])
+                next_dq = int(step_offsets.slot_ins_lens[s_idx])
+                cur_size = t_end - cur_t_start
+                lines.append(f"{cur_size}\t0\t{next_dq}")
+                block_meta.append((cur_t_start, t_end, next_dq))
+                cur_t_start = t_end
+            last_size = ref_len - cur_t_start
+            lines.append(f"{last_size}")
+            block_meta.append((cur_t_start, ref_len, 0))
+        lines.append("")
+        for b_ts, b_te, b_dq in block_meta:
+            lines.append(f"# block\t{b_ts}\t{b_te}\t{b_dq}")
+        return "\n".join(lines) + "\n"
+
     ref_len = step_offsets[-1].ref_end if step_offsets else 0
-    lines: list[str] = [
+    lines = [
         f"chain {ref_len} {chrom} {ref_len} + 0 {ref_len} "
         f"{chrom} {pan_len} + 0 {pan_len} {chain_id}"
     ]
 
-    block_meta: list[tuple[int, int, int]] = []
+    block_meta = []
     cur_t_start = 0
     cur_size = 0
 
@@ -134,14 +165,37 @@ def write_build_outputs(
 
     # 2. {p}.offsets.tsv
     offsets_path = Path(f"{p}.offsets.tsv")
-    offset_lines = ["\t".join(OFFSETS_HEADER)]
-    for row in result.step_offsets:
-        offset_lines.append(
-            f"{row.chrom}\t{row.ref_step}\t{row.node_id}\t"
-            f"{row.ref_start}\t{row.ref_end}\t{row.pan_start}\t"
-            f"{row.pan_end}\t{row.slot_ins_len}"
-        )
-    offsets_path.write_text("\n".join(offset_lines) + "\n", encoding="utf-8")
+    if isinstance(result.step_offsets, LazyStepOffsetSequence):
+        lo = result.step_offsets
+        n_rows = len(lo)
+        chrom_s = lo.chrom
+        nids_l = lo.ref_nids.tolist()
+        rs_l = lo.ref_starts.tolist()
+        re_l = lo.ref_ends.tolist()
+        ps_l = lo.pan_starts.tolist()
+        pe_l = lo.pan_ends.tolist()
+        si_l = lo.slot_ins_lens.tolist()
+        with offsets_path.open("w", encoding="utf-8") as fh:
+            fh.write("\t".join(OFFSETS_HEADER) + "\n")
+            chunk_size = 100_000
+            for c_start in range(0, n_rows, chunk_size):
+                c_end = min(n_rows, c_start + chunk_size)
+                fh.write(
+                    "\n".join(
+                        f"{chrom_s}\t{i}\t{nids_l[i]}\t{rs_l[i]}\t{re_l[i]}\t{ps_l[i]}\t{pe_l[i]}\t{si_l[i]}"
+                        for i in range(c_start, c_end)
+                    )
+                    + "\n"
+                )
+    else:
+        offset_lines = ["\t".join(OFFSETS_HEADER)]
+        for row in result.step_offsets:
+            offset_lines.append(
+                f"{row.chrom}\t{row.ref_step}\t{row.node_id}\t"
+                f"{row.ref_start}\t{row.ref_end}\t{row.pan_start}\t"
+                f"{row.pan_end}\t{row.slot_ins_len}"
+            )
+        offsets_path.write_text("\n".join(offset_lines) + "\n", encoding="utf-8")
     written["offsets_tsv"] = str(offsets_path)
 
     # 3. {p}.ref_to_pan.chain

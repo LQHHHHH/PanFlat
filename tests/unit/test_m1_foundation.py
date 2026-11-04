@@ -1352,3 +1352,152 @@ def test_check_similarity_merge_rejects_reverse_complement_unaligned_and_engine_
         (40, 60),
         (80, 100),
     ]
+
+
+def test_pansn_multifasta_ref_and_bare_sample_backbone_prefix(tmp_path: Path) -> None:
+    """Verify multi-FASTA --ref-fa and bare sample-name --backbone-prefix resolution."""
+    from panflat.cli import main as cli_main
+
+    s1 = make_complex_seq(120, seed=801)
+    s2 = make_complex_seq(120, seed=802)
+    s3 = make_complex_seq(120, seed=803)
+    s4 = make_complex_seq(120, seed=804)
+
+    gfa_path = tmp_path / "pansn_multi.gfa"
+    gfa_path.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{s1}",
+                f"S\t2\t{s2}",
+                f"S\t3\t{s3}",
+                f"S\t4\t{s4}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t4\t+\t0M",
+                "L\t1\t+\t3\t+\t0M",
+                "L\t3\t+\t4\t+\t0M",
+                "P\tPyrar_xinyeli#1#Chr10A\t1+,2+,4+\t*",
+                "P\tPyrar_xinyeli#2#Chr10B\t1+,3+,4+\t*",
+                "P\tPyrbe_duli#1#Chr10A\t1+,3+,4+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ref_fa_path = tmp_path / "pangenome_multi.ref.fa"
+    ref_fa_path.write_text(
+        "\n".join(
+            [
+                ">Pyrar_xinyeli#1#Chr10A",
+                s1 + s2 + s4,
+                ">Pyrar_xinyeli#2#Chr10B",
+                s1 + s3 + s4,
+                ">Pyrbe_duli#1#Chr10A",
+                s1 + s3 + s4,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    out_prefix = tmp_path / "out_pansn"
+    rc_build = cli_main(
+        [
+            "build",
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(ref_fa_path),
+            "--backbone-prefix",
+            "Pyrar_xinyeli",
+            "--out-prefix",
+            str(out_prefix),
+        ]
+    )
+    assert rc_build == 0
+
+    rc_verify = cli_main(
+        [
+            "verify",
+            "--prefix",
+            str(out_prefix),
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(ref_fa_path),
+        ]
+    )
+    assert rc_verify == 0
+
+
+def test_lazy_step_and_provenance_detach_unpins_parent_buffers() -> None:
+    """Verify detach()/detached() copy only sliced sub-arrays and preserve exact provenance coordinates."""
+    import numpy as np
+    from panflat.models import (
+        CompactVisitCounts,
+        DeviationSegment,
+        LazyProvenanceTuple,
+        LazyStepTuple,
+    )
+
+    codes = np.array([1, 2, -3, 4, 5], dtype=np.int32)
+    node_lens = np.array([0, 10, 20, 30, 40, 50], dtype=np.int32)
+    parent_steps = LazyStepTuple(codes)
+    parent_prov = LazyProvenanceTuple(
+        src_hap="Alt#1",
+        src_path="Alt#1#Chr01",
+        base_offset=100,
+        orig_codes=codes,
+        node_lens=node_lens,
+        total_bp=150,
+    )
+
+    # Forward contiguous slice [1:4]
+    sl_steps = parent_steps[1:4]
+    sl_prov = parent_prov[1:4]
+    assert sl_steps._codes.base is not None
+
+    dev = DeviationSegment(
+        hap_id="Alt#1",
+        src_path="Alt#1#Chr01",
+        left_anchor_rank=0,
+        right_anchor_rank=4,
+        branch_start_idx=1,
+        branch_end_idx=4,
+        branch_steps=sl_steps,
+        branch_provenance=sl_prov,
+        backbone_steps=parent_steps[1:4],
+    )
+    det_dev = dev.detached(keep_provenance=True)
+    assert isinstance(det_dev.branch_steps, LazyStepTuple)
+    assert det_dev.branch_steps._codes.base is None
+    assert list(det_dev.branch_steps) == list(sl_steps)
+    assert list(det_dev.branch_provenance) == list(sl_prov)
+    assert det_dev.backbone_steps == ()
+
+    # Detach with keep_provenance=False drops provenance
+    det_no_prov = dev.detached(keep_provenance=False)
+    assert det_no_prov.branch_provenance == ()
+
+    # Empty slice detach returns shared empty LazyStepTuple singleton
+    empty_sl = parent_steps[2:2].detach()
+    assert len(empty_sl) == 0
+    assert empty_sl._codes.base is None
+
+    # Flipped contig slice detach preserves exact reversed provenance
+    flipped_prov = parent_prov.flipped_contig()
+    flipped_sl = flipped_prov[1:4]
+    det_flipped = flipped_sl.detach()
+    assert list(det_flipped) == list(flipped_sl)
+
+    # CompactVisitCounts O(1) membership and get()
+    cvc = CompactVisitCounts(
+        multi_nids=np.array([2, 5], dtype=np.int32),
+        multi_counts=np.array([3, 7], dtype=np.int32),
+    )
+    assert cvc.get("1", 0) == 0
+    assert cvc.get("2", 0) == 3
+    assert cvc.get("5", 0) == 7
+    assert cvc.get("non_int", 0) == 0
+

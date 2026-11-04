@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from array import array
 import collections
+from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import random
@@ -10,6 +12,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 import mappy
+import numpy as np
 
 from panflat.gfa_io import parse_fasta, revcomp
 from panflat.models import (
@@ -17,7 +20,9 @@ from panflat.models import (
     UNRESOLVED_REASONS,
     BuildConfig,
     ChromosomeBuildResult,
+    CompactNodeStore,
     InvariantViolationError,
+    LazyStepTuple,
     VerificationReport,
 )
 
@@ -133,10 +138,6 @@ def run_qc(
 ) -> dict[str, Any]:
     """
     Compute `--qc` alignment redundancy metrics for inserted pieces (§7, F26).
-
-    - Short pieces (`50 <= L < 150`) are reported separately (`qc_short_50_149_*`).
-    - Long pieces (`L >= 150`) are aligned against `result.pan_seq` with `mappy` (`preset="asm20"`)
-      and per-piece union redundant bases are computed at `0.90`, `0.95`, and `0.98` identity thresholds.
     """
     short_lengths: list[int] = []
     long_rows: list[dict[str, Any]] = []
@@ -248,32 +249,222 @@ def _parse_tsv_file(path: Path) -> tuple[list[str], list[dict[str, str]]]:
 def _parse_fasta_allow_empty(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
-    text = path.read_text(encoding="utf-8")
-    if not text.strip():
-        return {}
     records: dict[str, str] = {}
     cur_name: str | None = None
     chunks: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith(">"):
-            if cur_name is not None:
-                records[cur_name] = "".join(chunks).upper()
-            cur_name = line[1:].strip().split()[0]
-            chunks = []
-        else:
-            chunks.append("".join(line.split()))
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur_name is not None:
+                    records[cur_name] = "".join(chunks).upper()
+                cur_name = line[1:].strip().split()[0]
+                chunks = []
+            else:
+                chunks.append("".join(line.split()))
     if cur_name is not None:
         records[cur_name] = "".join(chunks).upper()
     return records
 
 
+@dataclass
+class _SparsePathSlices:
+    """Stores only requested source intervals for a chromosome-scale GFA path."""
+
+    base_offset: int
+    total_len: int
+    slices: dict[tuple[int, int], str]
+
+
 def _parse_gfa_paths_and_walks(
     gfa_path: Path,
-) -> tuple[dict[str, str], dict[str, tuple[int, str]]]:
+    required_slices_by_path: Mapping[str, set[tuple[int, int]]] | None = None,
+) -> tuple[Mapping[str, str], dict[str, Any]]:
     """Independently parse GFA S, P, W lines into `(nodes, path_seqs)`."""
+    file_size = gfa_path.stat().st_size
+    if file_size > 10_000_000 and required_slices_by_path is not None:
+        from array import array as _c_array
+
+        seq_buf = bytearray()
+        node_lens_arr = _c_array("i", [0])
+        expected_nid = 1
+        all_seq_int = True
+        max_nid = 0
+        raw_pw_lines: list[bytes] = []
+
+        with gfa_path.open("rb") as fh:
+            for raw_b in fh:
+                if not raw_b:
+                    continue
+                b0 = raw_b[0]
+                if b0 == 76:  # b'L'
+                    continue
+                if b0 == 83 and raw_b[1:2] == b"\t":  # b'S\t'
+                    t1 = raw_b.find(b"\t", 2)
+                    if t1 < 0:
+                        continue
+                    nid_b = raw_b[2:t1]
+                    if not nid_b.isdigit():
+                        all_seq_int = False
+                        break
+                    nid_int = int(nid_b)
+                    if nid_int != expected_nid:
+                        all_seq_int = False
+                        break
+                    t2 = raw_b.find(b"\t", t1 + 1)
+                    seq_b = (
+                        raw_b[t1 + 1 :].rstrip(b"\r\n")
+                        if t2 < 0
+                        else raw_b[t1 + 1 : t2]
+                    ).upper()
+                    seq_buf.extend(seq_b)
+                    node_lens_arr.append(len(seq_b))
+                    expected_nid += 1
+                    max_nid = nid_int
+                elif (b0 == 80 or b0 == 87) and raw_b[1:2] == b"\t":  # b'P\t' or b'W\t'
+                    raw_pw_lines.append(raw_b)
+
+        if all_seq_int and max_nid > 0:
+            node_lens = np.frombuffer(node_lens_arr, dtype=np.int32).copy()
+            del node_lens_arr
+            seq_offsets = np.zeros(max_nid + 2, dtype=np.int64)
+            np.cumsum(node_lens[1:], dtype=np.int64, out=seq_offsets[2:])
+            node_store = CompactNodeStore(
+                seq_bytes=bytes(seq_buf),
+                offsets=seq_offsets,
+                node_lens=node_lens,
+                max_nid=max_nid,
+                extra={},
+                count=max_nid,
+            )
+            del seq_buf
+            path_seqs_sparse: dict[str, Any] = {}
+            w_re = re.compile(r"([><])(\d+)")
+
+            def _matching_reqs(
+                key1: str, key2: str | None = None
+            ) -> set[tuple[int, int]]:
+                reqs: set[tuple[int, int]] = set()
+                for q_path, ivs in required_slices_by_path.items():
+                    lookup = (
+                        q_path.split("::", 1)[-1] if "::" in q_path else q_path
+                    )
+                    if (
+                        lookup == key1
+                        or key1.startswith(f"{lookup}:")
+                        or (
+                            key2 is not None
+                            and (
+                                lookup == key2 or key2.startswith(f"{lookup}:")
+                            )
+                        )
+                    ):
+                        reqs.update(ivs)
+                return reqs
+
+            def _extract_reqs_from_codes(
+                codes: np.ndarray,
+                reqs: set[tuple[int, int]],
+                base_offset: int,
+            ) -> tuple[int, dict[tuple[int, int], str]]:
+                step_lens = node_lens[np.abs(codes)]
+                n_c = int(codes.shape[0])
+                cum_bp = np.empty(n_c + 1, dtype=np.int64)
+                cum_bp[0] = 0
+                np.cumsum(step_lens, dtype=np.int64, out=cum_bp[1:])
+                total_len = int(cum_bp[-1])
+                sl_map: dict[tuple[int, int], str] = {}
+                for s_i, e_i in reqs:
+                    rs = s_i - base_offset
+                    re_ = e_i - base_offset
+                    if 0 <= rs <= re_ <= total_len:
+                        if rs == re_:
+                            sl_map[(s_i, e_i)] = ""
+                        else:
+                            st_lo = (
+                                int(np.searchsorted(cum_bp, rs, side="right"))
+                                - 1
+                            )
+                            st_hi = int(
+                                np.searchsorted(cum_bp, re_, side="left")
+                            )
+                            sub_seq = LazyStepTuple(codes[st_lo:st_hi]).spell(
+                                node_store
+                            )
+                            base_lo = int(cum_bp[st_lo])
+                            sl_map[(s_i, e_i)] = sub_seq[
+                                rs - base_lo : re_ - base_lo
+                            ]
+                return total_len, sl_map
+
+            for raw_b in raw_pw_lines:
+                raw = raw_b.decode("utf-8")
+                parts = raw.rstrip("\r\n").split("\t")
+                rec_type = parts[0]
+                if rec_type == "P" and len(parts) >= 3:
+                    pname = parts[1]
+                    reqs = _matching_reqs(pname)
+                    if not reqs:
+                        path_seqs_sparse[pname] = _SparsePathSlices(0, 0, {})
+                        continue
+                    step_str = parts[2].strip()
+                    nids = np.fromstring(
+                        step_str.translate({43: None, 45: None}),
+                        dtype=np.int32,
+                        sep=",",
+                    )
+                    signs = np.frombuffer(
+                        step_str.encode("ascii").translate(
+                            None, b"0123456789, \t\r\n"
+                        ),
+                        dtype=np.uint8,
+                    )
+                    codes = np.where(signs == 45, -nids, nids).astype(
+                        np.int32, copy=False
+                    )
+                    del step_str, nids, signs
+                    total_len, sl_map = _extract_reqs_from_codes(codes, reqs, 0)
+                    path_seqs_sparse[pname] = _SparsePathSlices(
+                        0, total_len, sl_map
+                    )
+                elif rec_type == "W" and len(parts) >= 7:
+                    sample, hap, seqid = parts[1], parts[2], parts[3]
+                    start = 0 if parts[4] == "*" else int(parts[4])
+                    end = -1 if parts[5] == "*" else int(parts[5])
+                    key_plain = f"{sample}#{hap}#{seqid}"
+                    codes = np.asarray(
+                        [
+                            int(m.group(2))
+                            if m.group(1) == ">"
+                            else -int(m.group(2))
+                            for m in w_re.finditer(parts[6])
+                        ],
+                        dtype=np.int32,
+                    )
+                    walk_len = int(node_lens[np.abs(codes)].sum())
+                    computed_end = start + walk_len if end < 0 else end
+                    key_with_coords = (
+                        f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
+                    )
+                    reqs = _matching_reqs(key_with_coords, key_plain)
+                    if not reqs:
+                        sp_empty = _SparsePathSlices(start, walk_len, {})
+                        path_seqs_sparse[key_with_coords] = sp_empty
+                        if key_plain not in path_seqs_sparse:
+                            path_seqs_sparse[key_plain] = sp_empty
+                        continue
+                    total_len, sl_map = _extract_reqs_from_codes(
+                        codes, reqs, start
+                    )
+                    sp_obj = _SparsePathSlices(start, total_len, sl_map)
+                    path_seqs_sparse[key_with_coords] = sp_obj
+                    if key_plain not in path_seqs_sparse:
+                        path_seqs_sparse[key_plain] = sp_obj
+
+            return node_store, path_seqs_sparse
+
     nodes: dict[str, str] = {}
     raw_p: list[tuple[str, str]] = []
     raw_w: list[tuple[str, str, str, int, int, str]] = []
@@ -326,7 +517,7 @@ def _parse_gfa_paths_and_walks(
 
 
 def _extract_source_slice(
-    path_seqs: Mapping[str, tuple[int, str]],
+    path_seqs: Mapping[str, Any],
     src_path: str,
     src_start: int,
     src_end: int,
@@ -337,20 +528,32 @@ def _extract_source_slice(
         lookup = lookup.split("::", 1)[-1]
 
     if lookup in path_seqs:
-        base_offset, full_seq = path_seqs[lookup]
-        rs = src_start - base_offset
-        re_ = src_end - base_offset
-        if 0 <= rs <= re_ <= len(full_seq):
-            sub = full_seq[rs:re_]
-            return sub if src_strand == "+" else revcomp(sub)
-
-    for k, (cand_offset, cand_seq) in path_seqs.items():
-        if k == lookup or k.startswith(f"{lookup}:"):
-            rs = src_start - cand_offset
-            re_ = src_end - cand_offset
-            if 0 <= rs <= re_ <= len(cand_seq):
-                sub = cand_seq[rs:re_]
+        val = path_seqs[lookup]
+        if isinstance(val, _SparsePathSlices):
+            if (src_start, src_end) in val.slices:
+                sub = val.slices[(src_start, src_end)]
                 return sub if src_strand == "+" else revcomp(sub)
+        else:
+            base_offset, full_seq = val
+            rs = src_start - base_offset
+            re_ = src_end - base_offset
+            if 0 <= rs <= re_ <= len(full_seq):
+                sub = full_seq[rs:re_]
+                return sub if src_strand == "+" else revcomp(sub)
+
+    for k, val in path_seqs.items():
+        if k == lookup or k.startswith(f"{lookup}:"):
+            if isinstance(val, _SparsePathSlices):
+                if (src_start, src_end) in val.slices:
+                    sub = val.slices[(src_start, src_end)]
+                    return sub if src_strand == "+" else revcomp(sub)
+            else:
+                cand_offset, cand_seq = val
+                rs = src_start - cand_offset
+                re_ = src_end - cand_offset
+                if 0 <= rs <= re_ <= len(cand_seq):
+                    sub = cand_seq[rs:re_]
+                    return sub if src_strand == "+" else revcomp(sub)
 
     raise InvariantViolationError(
         f"Source slice {src_path}:{src_start}-{src_end}({src_strand}) out of bounds or missing in GFA"
@@ -481,6 +684,87 @@ def _reconstruct_gff3_transcripts_and_proteins(
     return transcripts, proteins
 
 
+def _load_ref_records_for_verify(
+    ref_fa_file: Path,
+    pan_records: Mapping[str, str],
+    summary_chrom: str | None,
+    backbone_prefix: str | None = None,
+) -> dict[str, str]:
+    """
+    Load reference FASTA records for `verify_build_outputs`.
+    When `summary_chrom` is a single chromosome present in `pan_records` and `ref_fa_file`
+    is a multi-FASTA, streams only the matching reference chromosome (including PanSN `#`-suffix match).
+    """
+    if (
+        summary_chrom
+        and summary_chrom != "ALL"
+        and summary_chrom in pan_records
+        and len(pan_records) == 1
+    ):
+        exact_seq: str | None = None
+        prefix_matches: list[tuple[str, str]] = []
+        suffix_matches: list[tuple[str, str]] = []
+        cur_name: str | None = None
+        keep_mode: str | None = None
+        chunks: list[str] = []
+        bp = (backbone_prefix or "").strip()
+
+        def _check_hdr(hdr: str) -> str | None:
+            if hdr == summary_chrom:
+                return "exact"
+            if bp and hdr.startswith(bp) and hdr.endswith(f"#{summary_chrom}"):
+                return "prefix"
+            if "#" in summary_chrom and summary_chrom.endswith(f"#{hdr}"):
+                return "suffix"
+            if "#" in hdr and hdr.endswith(f"#{summary_chrom}"):
+                return "suffix"
+            return None
+
+        with ref_fa_file.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    if cur_name is not None and keep_mode is not None:
+                        s_val = "".join(chunks).upper()
+                        if keep_mode == "exact":
+                            exact_seq = s_val
+                        elif keep_mode == "prefix":
+                            prefix_matches.append((cur_name, s_val))
+                        else:
+                            suffix_matches.append((cur_name, s_val))
+                    cur_name = line[1:].strip().split()[0]
+                    if not cur_name:
+                        raise InvariantViolationError("Empty FASTA header")
+                    keep_mode = _check_hdr(cur_name)
+                    chunks = []
+                elif keep_mode is not None:
+                    chunks.append("".join(line.split()))
+
+        if cur_name is not None and keep_mode is not None:
+            s_val = "".join(chunks).upper()
+            if keep_mode == "exact":
+                exact_seq = s_val
+            elif keep_mode == "prefix":
+                prefix_matches.append((cur_name, s_val))
+            else:
+                suffix_matches.append((cur_name, s_val))
+
+        if exact_seq is not None:
+            return {summary_chrom: exact_seq}
+        if len(prefix_matches) == 1:
+            return {summary_chrom: prefix_matches[0][1]}
+        if len(prefix_matches) > 1 and bp:
+            for h_name, h_seq in prefix_matches:
+                if h_name in (f"{bp}#1#{summary_chrom}", f"{bp}#0#{summary_chrom}"):
+                    return {summary_chrom: h_seq}
+        if len(suffix_matches) == 1:
+            return {summary_chrom: suffix_matches[0][1]}
+
+    return parse_fasta(str(ref_fa_file))
+
+
 def verify_build_outputs(
     prefix: str | Path,
     gfa_path: str | Path,
@@ -583,7 +867,8 @@ def verify_build_outputs(
         if len(parts) >= 2:
             summary_kv[parts[0]] = parts[1]
 
-    actual_sha = hashlib.sha256(gfa_file.read_bytes()).hexdigest().lower()
+    with gfa_file.open("rb") as gfa_bin_fh:
+        actual_sha = hashlib.file_digest(gfa_bin_fh, "sha256").hexdigest().lower()
     recorded_sha = summary_kv.get("gfa_sha256")
     if recorded_sha and recorded_sha.lower() != actual_sha:
         _err(
@@ -597,15 +882,46 @@ def verify_build_outputs(
         else int(summary_kv.get("spacer_n", "100"))
     )
 
+    is_large_offsets = offsets_path.stat().st_size > 2_000_000
+
     try:
-        ref_records = parse_fasta(str(ref_fa_file))
         pan_records = parse_fasta(str(pan_fa_path))
-        offsets_hdr, offsets_rows = _parse_tsv_file(offsets_path)
+        ref_records = _load_ref_records_for_verify(
+            ref_fa_file,
+            pan_records,
+            summary_kv.get("chrom"),
+            summary_kv.get("backbone_prefix"),
+        )
         sv_hdr, sv_rows = _parse_tsv_file(sv_path)
         ins_hdr, ins_rows = _parse_tsv_file(inserts_path)
         unres_hdr, unres_rows = _parse_tsv_file(unresolved_path)
         unres_fa = _parse_fasta_allow_empty(unresolved_fa_path)
-        gfa_nodes, path_seqs = _parse_gfa_paths_and_walks(gfa_file)
+
+        req_slices: dict[str, set[tuple[int, int]]] = collections.defaultdict(set)
+        for r in ins_rows:
+            try:
+                s_i, e_i = _parse_src_interval(r.get("src_intervals", ""))
+                req_slices[r.get("src_path", "")].add((s_i, e_i))
+            except Exception:
+                pass
+        for u in unres_rows:
+            try:
+                req_slices[u.get("src_path", "")].add(
+                    (int(u.get("src_start", "0")), int(u.get("src_end", "0")))
+                )
+            except Exception:
+                pass
+
+        gfa_nodes, path_seqs = _parse_gfa_paths_and_walks(gfa_file, req_slices)
+        if not is_large_offsets:
+            offsets_hdr, offsets_rows = _parse_tsv_file(offsets_path)
+        else:
+            offsets_rows = []
+            with offsets_path.open("r", encoding="utf-8") as off_fh:
+                first_line = off_fh.readline().rstrip("\r\n")
+                offsets_hdr = (
+                    first_line.lstrip("#").split("\t") if first_line else []
+                )
     except Exception as exc:
         _err("INV1", f"Failed to parse build output or input files: {exc}")
         report = VerificationReport(
@@ -630,19 +946,192 @@ def verify_build_outputs(
     if unres_hdr != UNRESOLVED_HEADER:
         _err("UNRES", f"unresolved.tsv header mismatch: {unres_hdr}")
 
-    # 1. Global Invariant I: Reference Base Preservation
+    # Compact array representation for chromosome-scale offsets.tsv
+    @dataclass
+    class _CompactChromOffsets:
+        step_idx: np.ndarray
+        nids: np.ndarray | list[str]
+        r_s: np.ndarray
+        r_e: np.ndarray
+        p_s: np.ndarray
+        p_e: np.ndarray
+        slot_ins: np.ndarray
+
+    compact_offsets_by_chrom: dict[str, _CompactChromOffsets] = {}
     offsets_by_chrom: dict[str, list[dict[str, str]]] = collections.defaultdict(
         list
     )
-    for r in offsets_rows:
-        offsets_by_chrom[r["chrom"]].append(r)
 
+    if is_large_offsets:
+        raw_cols_by_chrom: dict[
+            str,
+            tuple[
+                array,
+                array,
+                list[str],
+                array,
+                array,
+                array,
+                array,
+                array,
+            ],
+        ] = {}
+        with offsets_path.open("r", encoding="utf-8") as off_fh:
+            _ = off_fh.readline()
+            for line_no, raw_line in enumerate(off_fh, start=1):
+                line = raw_line.rstrip("\r\n")
+                if not line or line.startswith("##"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 8:
+                    _err(
+                        "INV1",
+                        f"Malformed TSV row in '{offsets_path}' at line {line_no}",
+                    )
+                    break
+                c_name = parts[0]
+                if c_name not in raw_cols_by_chrom:
+                    raw_cols_by_chrom[c_name] = (
+                        array("q"),
+                        array("i"),
+                        [],
+                        array("q"),
+                        array("q"),
+                        array("q"),
+                        array("q"),
+                        array("q"),
+                    )
+                cols = raw_cols_by_chrom[c_name]
+                try:
+                    cols[0].append(int(parts[1]))
+                    if not cols[2] and parts[2].isdigit():
+                        cols[1].append(int(parts[2]))
+                    else:
+                        if not cols[2] and len(cols[1]) > 0:
+                            cols[2].extend(str(x) for x in cols[1])
+                            del cols[1][:]
+                        cols[2].append(parts[2])
+                    cols[3].append(int(parts[3]))
+                    cols[4].append(int(parts[4]))
+                    cols[5].append(int(parts[5]))
+                    cols[6].append(int(parts[6]))
+                    cols[7].append(int(parts[7]))
+                except ValueError as exc:
+                    _err(
+                        "INV1",
+                        f"Non-integer field in offsets.tsv at line {line_no}: {exc}",
+                    )
+                    break
+        for c_name, cols in raw_cols_by_chrom.items():
+            nids_val: np.ndarray | list[str] = (
+                cols[2]
+                if cols[2]
+                else np.frombuffer(cols[1], dtype=np.int32).copy()
+            )
+            compact_offsets_by_chrom[c_name] = _CompactChromOffsets(
+                step_idx=np.frombuffer(cols[0], dtype=np.int64).copy(),
+                nids=nids_val,
+                r_s=np.frombuffer(cols[3], dtype=np.int64).copy(),
+                r_e=np.frombuffer(cols[4], dtype=np.int64).copy(),
+                p_s=np.frombuffer(cols[5], dtype=np.int64).copy(),
+                p_e=np.frombuffer(cols[6], dtype=np.int64).copy(),
+                slot_ins=np.frombuffer(cols[7], dtype=np.int64).copy(),
+            )
+        raw_cols_by_chrom.clear()
+    else:
+        for r in offsets_rows:
+            offsets_by_chrom[r["chrom"]].append(r)
+
+    # 1. Global Invariant I: Reference Base Preservation
     for ref_chrom, ref_seq in ref_records.items():
         ref_up = ref_seq.upper()
         if ref_chrom not in pan_records:
             _err("INV1", f"Reference chromosome '{ref_chrom}' missing in pan.fa")
             continue
         pan_up = pan_records[ref_chrom].upper()
+
+        if is_large_offsets:
+            co = compact_offsets_by_chrom.get(ref_chrom)
+            if co is None or int(co.step_idx.shape[0]) == 0:
+                _err("INV1", f"No offsets.tsv rows for chromosome '{ref_chrom}'")
+                continue
+            n_st = int(co.step_idx.shape[0])
+            expected_idx = np.arange(n_st, dtype=np.int64)
+            if not bool(np.array_equal(co.step_idx, expected_idx)):
+                bad_i = int(np.flatnonzero(co.step_idx != expected_idx)[0])
+                _err("INV1", f"Expected ref_step {bad_i}, got {int(co.step_idx[bad_i])}")
+            if co.r_s[0] != 0 or co.slot_ins[0] != 0 or co.p_s[0] != 0:
+                _err(
+                    "INV1",
+                    f"First reference step must have ref_start=0, pan_start=0, slot_ins_len=0; got ({int(co.r_s[0])}, {int(co.p_s[0])}, {int(co.slot_ins[0])})",
+                )
+            if n_st > 1 and not bool(np.array_equal(co.r_s[1:], co.r_e[:-1])):
+                bad_i = int(np.flatnonzero(co.r_s[1:] != co.r_e[:-1])[0]) + 1
+                _err(
+                    "INV1",
+                    f"Ref coordinate gap/overlap at step {bad_i}: expected {int(co.r_e[bad_i - 1])}, got {int(co.r_s[bad_i])}",
+                )
+            if bool(np.any(co.r_e <= co.r_s)):
+                bad_i = int(np.flatnonzero(co.r_e <= co.r_s)[0])
+                _err("INV1", f"Invalid ref step range at step {bad_i}")
+            if not bool(np.array_equal(co.p_e - co.p_s, co.r_e - co.r_s)):
+                bad_i = int(np.flatnonzero((co.p_e - co.p_s) != (co.r_e - co.r_s))[0])
+                _err("INV1", f"Step length mismatch at step {bad_i}")
+            if bool(np.any(co.slot_ins < 0)) or (
+                n_st > 1
+                and not bool(
+                    np.array_equal(co.p_s[1:], co.p_e[:-1] + co.slot_ins[1:])
+                )
+            ):
+                _err("INV1", "pan_start mismatch in offsets.tsv")
+            if int(co.p_s[0]) < 0 or int(co.p_e[-1]) > len(pan_up):
+                _err("INV1", f"Pan step coordinates out of bounds for pan_len={len(pan_up)}")
+            else:
+                # Check contiguous blocks between insertion slots in O(blocks) + every node against gfa_nodes
+                slot_breaks = (
+                    np.flatnonzero(co.slot_ins[1:] > 0) + 1
+                ).tolist()
+                blk_starts = [0, *slot_breaks]
+                blk_ends = [*slot_breaks, n_st]
+                for b_s, b_e in zip(blk_starts, blk_ends):
+                    rs_blk = int(co.r_s[b_s])
+                    re_blk = int(co.r_e[b_e - 1])
+                    ps_blk = int(co.p_s[b_s])
+                    pe_blk = int(co.p_e[b_e - 1])
+                    if pan_up[ps_blk:pe_blk] != ref_up[rs_blk:re_blk]:
+                        _err(
+                            "INV1",
+                            f"Reference base mismatch in block steps [{b_s}, {b_e})",
+                        )
+                        break
+                if isinstance(gfa_nodes, CompactNodeStore):
+                    nids_int = (
+                        co.nids
+                        if isinstance(co.nids, np.ndarray)
+                        else np.asarray(co.nids, dtype=np.int32)
+                    )
+                    if bool(np.any((nids_int <= 0) | (nids_int >= int(gfa_nodes.node_lens.shape[0])) | (gfa_nodes.node_lens[nids_int] == 0))):
+                        _err("INV1", "Reference step node missing from GFA")
+                    elif not bool(np.array_equal(gfa_nodes.node_lens[nids_int], co.r_e - co.r_s)):
+                        _err("INV1", "GFA node length mismatch with ref step range")
+                else:
+                    for idx_n, nid in enumerate(co.nids):
+                        if str(nid) not in gfa_nodes:
+                            _err("INV1", f"Reference step node '{nid}' missing from GFA")
+                            break
+            if int(co.r_e[-1]) != len(ref_up):
+                _err(
+                    "INV1",
+                    f"offsets.tsv ends at ref {int(co.r_e[-1])}, expected {len(ref_up)}",
+                )
+            if int(co.p_e[-1]) != len(pan_up):
+                _err(
+                    "INV1",
+                    f"offsets.tsv ends at pan {int(co.p_e[-1])}, expected pan_len={len(pan_up)}",
+                )
+            checked_ref_steps += n_st
+            continue
+
         chrom_offsets = offsets_by_chrom.get(ref_chrom, [])
         if not chrom_offsets:
             _err("INV1", f"No offsets.tsv rows for chromosome '{ref_chrom}'")
@@ -731,20 +1220,41 @@ def verify_build_outputs(
 
     for ref_chrom, pan_seq in pan_records.items():
         pan_up = pan_seq.upper()
-        covered = bytearray(len(pan_up))
+        n_pan = len(pan_up)
+        covered_arr = np.zeros(n_pan, dtype=np.uint8)
 
-        for srow in offsets_by_chrom.get(ref_chrom, ()):
-            p_s = int(srow["pan_start"])
-            p_e = int(srow["pan_end"])
-            if 0 <= p_s <= p_e <= len(pan_up):
-                for pos in range(p_s, p_e):
-                    if covered[pos] != 0:
+        if is_large_offsets:
+            co = compact_offsets_by_chrom.get(ref_chrom)
+            if co is not None and int(co.step_idx.shape[0]) > 0:
+                n_st = int(co.step_idx.shape[0])
+                slot_breaks = (
+                    np.flatnonzero(co.slot_ins[1:] > 0) + 1
+                ).tolist()
+                blk_starts = [0, *slot_breaks]
+                blk_ends = [*slot_breaks, n_st]
+                for b_s, b_e in zip(blk_starts, blk_ends):
+                    ps_blk = int(co.p_s[b_s])
+                    pe_blk = int(co.p_e[b_e - 1])
+                    if 0 <= ps_blk <= pe_blk <= n_pan:
+                        if bool(np.any(covered_arr[ps_blk:pe_blk] != 0)):
+                            _err(
+                                "INV1",
+                                f"Overlapping reference step in [{ps_blk}, {pe_blk}) on {ref_chrom}",
+                            )
+                            break
+                        covered_arr[ps_blk:pe_blk] = 1
+        else:
+            for srow in offsets_by_chrom.get(ref_chrom, ()):
+                p_s = int(srow["pan_start"])
+                p_e = int(srow["pan_end"])
+                if 0 <= p_s <= p_e <= n_pan:
+                    if bool(np.any(covered_arr[p_s:p_e] != 0)):
                         _err(
                             "INV1",
-                            f"Overlapping reference step at pan pos {pos} on {ref_chrom}",
+                            f"Overlapping reference step at pan [{p_s}, {p_e}) on {ref_chrom}",
                         )
                         break
-                    covered[pos] = 1
+                    covered_arr[p_s:p_e] = 1
 
         prev_p_e: int | None = None
         prev_ev_id: str | None = None
@@ -759,10 +1269,10 @@ def verify_build_outputs(
                 _err("INV2", f"Invalid coordinates in inserts.tsv: {exc}")
                 continue
 
-            if not (0 <= p_s < p_e <= len(pan_up)):
+            if not (0 <= p_s < p_e <= n_pan):
                 _err(
                     "INV2",
-                    f"Insert piece [{p_s}, {p_e}) out of bounds for pan_len={len(pan_up)}",
+                    f"Insert piece [{p_s}, {p_e}) out of bounds for pan_len={n_pan}",
                 )
                 continue
 
@@ -823,14 +1333,12 @@ def verify_build_outputs(
                     f"Overlapping insert pieces in inserts.tsv: {p_s} < {prev_p_e}",
                 )
 
-            for pos in range(p_s, p_e):
-                if covered[pos] != 0:
-                    _err(
-                        "INV2",
-                        f"Overlap between insert piece and existing interval at pan pos {pos}",
-                    )
-                    break
-                covered[pos] = 2
+            if bool(np.any(covered_arr[p_s:p_e] != 0)):
+                _err(
+                    "INV2",
+                    f"Overlap between insert piece and existing interval at pan[{p_s}:{p_e}]",
+                )
+            covered_arr[p_s:p_e] = 2
 
             prev_p_e = p_e
             prev_ev_id = row["event_id"]
@@ -838,29 +1346,28 @@ def verify_build_outputs(
             checked_pieces += 1
 
         # Partition check: uncovered bases must be 'N' in exact multiples of eff_spacer_n
-        idx_pos = 0
-        n_pan = len(pan_up)
-        while idx_pos < n_pan:
-            if covered[idx_pos] != 0:
-                idx_pos += 1
-                continue
-            run_s = idx_pos
-            while idx_pos < n_pan and covered[idx_pos] == 0:
-                if pan_up[idx_pos] != "N":
+        zero_indices = np.flatnonzero(covered_arr == 0)
+        if int(zero_indices.shape[0]) > 0:
+            gaps = np.flatnonzero(np.diff(zero_indices) > 1)
+            run_starts = np.empty(int(gaps.shape[0]) + 1, dtype=np.int64)
+            run_ends = np.empty(int(gaps.shape[0]) + 1, dtype=np.int64)
+            run_starts[0] = zero_indices[0]
+            if int(gaps.shape[0]) > 0:
+                run_starts[1:] = zero_indices[gaps + 1]
+                run_ends[:-1] = zero_indices[gaps] + 1
+            run_ends[-1] = zero_indices[-1] + 1
+            for r_s_i, r_e_i in zip(run_starts.tolist(), run_ends.tolist()):
+                run_len = r_e_i - r_s_i
+                if pan_up[r_s_i:r_e_i] != "N" * run_len:
                     _err(
                         "INV2",
-                        f"Uncovered non-spacer base '{pan_up[idx_pos]}' at pan[{idx_pos}] on {ref_chrom}",
+                        f"Uncovered non-spacer base in pan[{r_s_i}:{r_e_i}] on {ref_chrom}",
                     )
-                    break
-                idx_pos += 1
-            while idx_pos < n_pan and covered[idx_pos] == 0:
-                idx_pos += 1
-            run_len = idx_pos - run_s
-            if eff_spacer_n > 0 and (run_len % eff_spacer_n) != 0:
-                _err(
-                    "INV2",
-                    f"Spacer run [{run_s}, {idx_pos}) of length {run_len} is not a multiple of spacer_n={eff_spacer_n}",
-                )
+                if eff_spacer_n > 0 and (run_len % eff_spacer_n) != 0:
+                    _err(
+                        "INV2",
+                        f"Spacer run [{r_s_i}, {r_e_i}) of length {run_len} is not a multiple of spacer_n={eff_spacer_n}",
+                    )
 
     # 3. Global Invariant III: Chain, Offsets & Coordinate Consistency
     chain_text = chain_path.read_text(encoding="utf-8")
@@ -975,15 +1482,22 @@ def verify_build_outputs(
                 f"Chain query bounds ({ch['qStart']}, {ch['qEnd']}, {ch['qSize']}) != (0, {len(pan_up)}, {len(pan_up)})",
             )
 
-        chrom_offsets = offsets_by_chrom.get(ref_chrom, [])
-        offset_by_ref_start = {
-            int(r["ref_start"]): r for r in chrom_offsets if "ref_start" in r
-        }
+        if is_large_offsets:
+            co = compact_offsets_by_chrom.get(ref_chrom)
+            offset_by_ref_start = {}
+        else:
+            co = None
+            chrom_offsets = offsets_by_chrom.get(ref_chrom, [])
+            offset_by_ref_start = {
+                int(r["ref_start"]): r for r in chrom_offsets if "ref_start" in r
+            }
 
         t_cur = ch["tStart"]
         q_cur = ch["qStart"]
-        ref_to_pan_map: dict[int, int] = {}
         seen_dq_boundaries: dict[int, int] = {}
+        blk_t_starts: list[int] = []
+        blk_t_ends: list[int] = []
+        blk_q_starts: list[int] = []
 
         for b_idx, (size, dt, dq) in enumerate(blocks):
             if size <= 0:
@@ -1006,23 +1520,39 @@ def verify_build_outputs(
                 )
 
             all_computed_blocks.append((t_cur, t_cur + size, dq))
-            for k in range(size):
-                ref_to_pan_map[t_cur + k] = q_cur + k
+            blk_t_starts.append(t_cur)
+            blk_t_ends.append(t_cur + size)
+            blk_q_starts.append(q_cur)
 
             boundary_ref = t_cur + size
             if boundary_ref < len(ref_up):
-                if boundary_ref not in offset_by_ref_start:
-                    _err(
-                        "INV3",
-                        f"Chain block boundary at ref={boundary_ref} does not match any step ref_start in offsets.tsv",
-                    )
-                else:
-                    s_ins = int(offset_by_ref_start[boundary_ref]["slot_ins_len"])
-                    if dq != s_ins or dq <= 0:
+                if co is not None:
+                    pos_b = int(np.searchsorted(co.r_s, boundary_ref, side="left"))
+                    if pos_b >= int(co.r_s.shape[0]) or int(co.r_s[pos_b]) != boundary_ref:
                         _err(
                             "INV3",
-                            f"Chain dq={dq} at ref={boundary_ref} disagrees with slot_ins_len={s_ins}",
+                            f"Chain block boundary at ref={boundary_ref} does not match any step ref_start in offsets.tsv",
                         )
+                    else:
+                        s_ins = int(co.slot_ins[pos_b])
+                        if dq != s_ins or dq <= 0:
+                            _err(
+                                "INV3",
+                                f"Chain dq={dq} at ref={boundary_ref} disagrees with slot_ins_len={s_ins}",
+                            )
+                else:
+                    if boundary_ref not in offset_by_ref_start:
+                        _err(
+                            "INV3",
+                            f"Chain block boundary at ref={boundary_ref} does not match any step ref_start in offsets.tsv",
+                        )
+                    else:
+                        s_ins = int(offset_by_ref_start[boundary_ref]["slot_ins_len"])
+                        if dq != s_ins or dq <= 0:
+                            _err(
+                                "INV3",
+                                f"Chain dq={dq} at ref={boundary_ref} disagrees with slot_ins_len={s_ins}",
+                            )
                 seen_dq_boundaries[boundary_ref] = dq
             else:
                 if dq != 0:
@@ -1037,32 +1567,76 @@ def verify_build_outputs(
         if q_cur != ch["qEnd"]:
             _err("INV3", f"Chain q_cur={q_cur} != qEnd={ch['qEnd']}")
 
-        for srow in chrom_offsets:
-            r_s = int(srow["ref_start"])
-            r_e = int(srow["ref_end"])
-            p_s = int(srow["pan_start"])
-            p_e = int(srow["pan_end"])
-            s_ins = int(srow["slot_ins_len"])
-            if s_ins > 0 and seen_dq_boundaries.get(r_s) != s_ins:
-                _err(
-                    "INV3",
-                    f"Step at ref_start={r_s} has slot_ins_len={s_ins} missing or mismatched in chain blocks",
-                )
-            if ref_to_pan_map.get(r_s) != p_s or ref_to_pan_map.get(r_e - 1) != p_e - 1:
-                _err(
-                    "INV3",
-                    f"Coordinate mismatch between chain and offsets at step ref[{r_s}:{r_e})",
-                )
+        blk_ts_arr = np.asarray(blk_t_starts, dtype=np.int64)
+        blk_te_arr = np.asarray(blk_t_ends, dtype=np.int64)
+        blk_qs_arr = np.asarray(blk_q_starts, dtype=np.int64)
 
-        if len(ref_to_pan_map) == len(ref_up) and len(ref_up) > 0:
+        def _map_ref_pos_via_chain(r_pos: int) -> int | None:
+            if int(blk_te_arr.shape[0]) == 0:
+                return None
+            idx_b = int(np.searchsorted(blk_te_arr, r_pos, side="right"))
+            if idx_b < int(blk_te_arr.shape[0]) and int(blk_ts_arr[idx_b]) <= r_pos < int(blk_te_arr[idx_b]):
+                return int(blk_qs_arr[idx_b]) + (r_pos - int(blk_ts_arr[idx_b]))
+            return None
+
+        if co is not None:
+            pos_slots = np.flatnonzero(co.slot_ins > 0).tolist()
+            for s_i in pos_slots:
+                r_s_val = int(co.r_s[s_i])
+                s_ins_val = int(co.slot_ins[s_i])
+                if seen_dq_boundaries.get(r_s_val) != s_ins_val:
+                    _err(
+                        "INV3",
+                        f"Step at ref_start={r_s_val} has slot_ins_len={s_ins_val} missing or mismatched in chain blocks",
+                    )
+            if int(blk_te_arr.shape[0]) > 0 and t_cur == len(ref_up):
+                idx_s = np.clip(
+                    np.searchsorted(blk_te_arr, co.r_s, side="right"),
+                    0,
+                    int(blk_te_arr.shape[0]) - 1,
+                )
+                mapped_ps = blk_qs_arr[idx_s] + (co.r_s - blk_ts_arr[idx_s])
+                idx_e = np.clip(
+                    np.searchsorted(blk_te_arr, co.r_e - 1, side="right"),
+                    0,
+                    int(blk_te_arr.shape[0]) - 1,
+                )
+                mapped_pe = blk_qs_arr[idx_e] + ((co.r_e - 1) - blk_ts_arr[idx_e])
+                if not (
+                    bool(np.array_equal(mapped_ps, co.p_s))
+                    and bool(np.array_equal(mapped_pe, co.p_e - 1))
+                ):
+                    _err("INV3", "Coordinate mismatch between chain and offsets")
+        else:
+            for srow in chrom_offsets:
+                r_s = int(srow["ref_start"])
+                r_e = int(srow["ref_end"])
+                p_s = int(srow["pan_start"])
+                p_e = int(srow["pan_end"])
+                s_ins = int(srow["slot_ins_len"])
+                if s_ins > 0 and seen_dq_boundaries.get(r_s) != s_ins:
+                    _err(
+                        "INV3",
+                        f"Step at ref_start={r_s} has slot_ins_len={s_ins} missing or mismatched in chain blocks",
+                    )
+                if (
+                    _map_ref_pos_via_chain(r_s) != p_s
+                    or _map_ref_pos_via_chain(r_e - 1) != p_e - 1
+                ):
+                    _err(
+                        "INV3",
+                        f"Coordinate mismatch between chain and offsets at step ref[{r_s}:{r_e})",
+                    )
+
+        if t_cur == len(ref_up) and len(ref_up) > 0:
             rng = random.Random(12345)
             sample_positions = [0, len(ref_up) - 1] + [
                 rng.randrange(len(ref_up))
                 for _ in range(min(25, len(ref_up)))
             ]
             for r_pos in sample_positions:
-                p_chain = ref_to_pan_map[r_pos]
-                if pan_up[p_chain] != ref_up[r_pos]:
+                p_chain = _map_ref_pos_via_chain(r_pos)
+                if p_chain is None or pan_up[p_chain] != ref_up[r_pos]:
                     _err(
                         "INV3",
                         f"Spot-check base mismatch at ref={r_pos}: pan[{p_chain}] != ref[{r_pos}]",
@@ -1075,7 +1649,7 @@ def verify_build_outputs(
                 f"Chain # block footer metadata does not match chain blocks: {comment_blocks} != {all_computed_blocks}",
             )
 
-    if comment_steps:
+    if comment_steps and not is_large_offsets:
         expected_steps = [
             (
                 int(r["ref_step"]),
@@ -1257,16 +1831,62 @@ def verify_build_outputs(
                 anchor_u,
                 anchor_v,
             ) in regions_seen.items():
-                chrom_offsets = offsets_by_chrom.get(chrom, [])
-                if not chrom_offsets:
-                    continue
-                offset_by_ref_start = {
-                    int(r["ref_start"]): r for r in chrom_offsets
-                }
-                offset_by_ref_end = {
-                    int(r["ref_end"]): r for r in chrom_offsets
-                }
-                ref_total_len = int(chrom_offsets[-1]["ref_end"])
+                if is_large_offsets:
+                    co = compact_offsets_by_chrom.get(chrom)
+                    if co is None or int(co.step_idx.shape[0]) == 0:
+                        continue
+                    ref_total_len = int(co.r_e[-1])
+
+                    def _find_by_ref_end(re_val: int) -> tuple[str, str, int] | None:
+                        idx_f = int(np.searchsorted(co.r_e, re_val, side="left"))
+                        if idx_f < int(co.r_e.shape[0]) and int(co.r_e[idx_f]) == re_val:
+                            return (
+                                str(int(co.step_idx[idx_f])),
+                                str(co.nids[idx_f]),
+                                int(co.slot_ins[idx_f]),
+                            )
+                        return None
+
+                    def _find_by_ref_start(rs_val: int) -> tuple[str, str, int] | None:
+                        idx_f = int(np.searchsorted(co.r_s, rs_val, side="left"))
+                        if idx_f < int(co.r_s.shape[0]) and int(co.r_s[idx_f]) == rs_val:
+                            return (
+                                str(int(co.step_idx[idx_f])),
+                                str(co.nids[idx_f]),
+                                int(co.slot_ins[idx_f]),
+                            )
+                        return None
+                else:
+                    chrom_offsets = offsets_by_chrom.get(chrom, [])
+                    if not chrom_offsets:
+                        continue
+                    offset_by_ref_start_c = {
+                        int(r["ref_start"]): r for r in chrom_offsets
+                    }
+                    offset_by_ref_end_c = {
+                        int(r["ref_end"]): r for r in chrom_offsets
+                    }
+                    ref_total_len = int(chrom_offsets[-1]["ref_end"])
+
+                    def _find_by_ref_end(re_val: int) -> tuple[str, str, int] | None:
+                        r_row = offset_by_ref_end_c.get(re_val)
+                        if r_row is None:
+                            return None
+                        return (
+                            r_row["ref_step"],
+                            r_row["node_id"],
+                            int(r_row["slot_ins_len"]),
+                        )
+
+                    def _find_by_ref_start(rs_val: int) -> tuple[str, str, int] | None:
+                        r_row = offset_by_ref_start_c.get(rs_val)
+                        if r_row is None:
+                            return None
+                        return (
+                            r_row["ref_step"],
+                            r_row["node_id"],
+                            int(r_row["slot_ins_len"]),
+                        )
 
                 if anchor_u in ("VIRTUAL_START", ".") or r_s == 0:
                     if r_s != 0:
@@ -1276,9 +1896,9 @@ def verify_build_outputs(
                         )
                 else:
                     u_clean = anchor_u.rstrip("+-")
-                    if r_s not in offset_by_ref_end or (
-                        offset_by_ref_end[r_s]["ref_step"] != anchor_u
-                        and offset_by_ref_end[r_s]["node_id"] != u_clean
+                    u_info = _find_by_ref_end(r_s)
+                    if u_info is None or (
+                        u_info[0] != anchor_u and u_info[1] != u_clean
                     ):
                         _err(
                             "CEN",
@@ -1287,9 +1907,9 @@ def verify_build_outputs(
 
                 if anchor_v not in ("L", "END", "VIRTUAL_END", "."):
                     v_clean = anchor_v.rstrip("+-")
-                    if r_e not in offset_by_ref_start or (
-                        offset_by_ref_start[r_e]["ref_step"] != anchor_v
-                        and offset_by_ref_start[r_e]["node_id"] != v_clean
+                    v_info = _find_by_ref_start(r_e)
+                    if v_info is None or (
+                        v_info[0] != anchor_v and v_info[1] != v_clean
                     ):
                         _err(
                             "CEN",
@@ -1327,15 +1947,14 @@ def verify_build_outputs(
                     )
 
                 if cen_events_for_reg:
-                    if r_e not in offset_by_ref_start:
+                    v_mount_info = _find_by_ref_start(r_e)
+                    if v_mount_info is None:
                         _err(
                             "CEN",
                             f"CEN_ISLAND mounted at ref_end={r_e} which is missing from offsets.tsv",
                         )
                     else:
-                        slot_ins_len = int(
-                            offset_by_ref_start[r_e]["slot_ins_len"]
-                        )
+                        slot_ins_len = v_mount_info[2]
                         cen_ev_ids = {ev["event_id"] for ev in cen_events_for_reg}
                         cen_pieces = [
                             ins

@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import collections
-from typing import AbstractSet, Literal, Mapping, Sequence
+from typing import AbstractSet, Any, Literal, Mapping, Sequence
+
+import numpy as np
 
 from panflat.gfa_io import spell_steps
 from panflat.models import (
     BuildConfig,
     CNVCall,
+    CompactNodeStore,
+    CompactRefNodeSet,
+    CompactVisitCounts,
     CycleFoldResult,
     DeviationSegment,
     GFAGraph,
     InputContractError,
     InversionNormalizationResult,
+    LazyProjectedAnchorSequence,
+    LazyProvenanceTuple,
+    LazyStepTuple,
     PathFragment,
     ProjectedAnchor,
     ReverseChainRecord,
@@ -47,21 +55,63 @@ def build_backbone_anchor_map(
             f"Invalid backbone slice bounds [{lo}, {eff_hi}) for backbone of length {n_steps}"
         )
 
-    counts: collections.Counter[str] = collections.Counter()
+    if isinstance(backbone_steps, LazyStepTuple):
+        b_codes = backbone_steps._codes[lo:eff_hi]
+        if int(b_codes.shape[0]) == 0:
+            return {}
+        b_nids = np.abs(b_codes)
+        u_nids, first_idx, counts = np.unique(
+            b_nids, return_index=True, return_counts=True
+        )
+        uniq_mask = counts == 1
+        out_map: dict[str, tuple[int, Literal["+", "-"]]] = {}
+        for nid_val, rel_idx in zip(
+            u_nids[uniq_mask].tolist(), first_idx[uniq_mask].tolist()
+        ):
+            c = int(b_codes[rel_idx])
+            out_map[str(nid_val)] = (lo + int(rel_idx), "+" if c > 0 else "-")
+        return out_map
+
+    counts_c: collections.Counter[str] = collections.Counter()
     first_hit: dict[str, tuple[int, Literal["+", "-"]]] = {}
     for rank_idx in range(lo, eff_hi):
         st = backbone_steps[rank_idx]
         if not _is_full_step(st):
             continue
-        counts[st.node_id] += 1
+        counts_c[st.node_id] += 1
         if st.node_id not in first_hit:
             first_hit[st.node_id] = (rank_idx, st.orient)
 
     return {
         node_id: first_hit[node_id]
-        for node_id, cnt in counts.items()
+        for node_id, cnt in counts_c.items()
         if cnt == 1
     }
+
+
+def _get_lazy_backbone_anchor_arrays(
+    backbone: LazyStepTuple,
+    max_nid: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build and cache `(nid_to_rank, nid_to_sign)` on full `backbone` `LazyStepTuple`."""
+    cached = backbone._anchor_cache
+    if cached is not None and cached[0] == max_nid:
+        return cached[1], cached[2]
+
+    b_codes = backbone._codes
+    b_nids = np.abs(b_codes)
+    counts = np.bincount(b_nids, minlength=max_nid + 1)
+    nid_to_rank = np.full(max_nid + 1, -1, dtype=np.int32)
+    nid_to_sign = np.zeros(max_nid + 1, dtype=np.int8)
+    uniq_step_mask = counts[b_nids] == 1
+    uniq_step_indices = np.flatnonzero(uniq_step_mask).astype(np.int32)
+    uniq_nids = b_nids[uniq_step_indices]
+    nid_to_rank[uniq_nids] = uniq_step_indices
+    nid_to_sign[uniq_nids] = np.where(
+        b_codes[uniq_step_indices] > 0, 1, -1
+    ).astype(np.int8)
+    backbone._anchor_cache = (max_nid, nid_to_rank, nid_to_sign)
+    return nid_to_rank, nid_to_sign
 
 
 def project_step_tuples_onto_backbone(
@@ -95,7 +145,7 @@ def project_steps_onto_backbone(
     *,
     provenance: Sequence[StepProvenance] | None = None,
     backbone_steps: Sequence[Step] | None = None,
-) -> list[ProjectedAnchor]:
+) -> Sequence[ProjectedAnchor]:
     """
     §3.1–§3.2 (F7): Project branch steps onto unique full-step anchors in `backbone_steps[lo:hi)`.
 
@@ -159,22 +209,32 @@ def project_steps_onto_backbone(
         )
 
     if resolved_branch_prov is None:
-        # Synthesize contiguous 0-based provenance when called via Form 4
-        synth_prov: list[StepProvenance] = []
-        cur_pos = 0
-        for st in resolved_branch_steps:
-            slen = st.step_len(resolved_nodes)
-            synth_prov.append(
-                StepProvenance(
-                    src_hap=" synthetic#1",
-                    src_path="synthetic#1#ctg",
-                    src_start=cur_pos,
-                    src_end=cur_pos + slen,
-                    src_strand="+",
-                )
+        if isinstance(resolved_branch_steps, LazyStepTuple) and isinstance(
+            resolved_nodes, CompactNodeStore
+        ):
+            resolved_branch_prov = LazyProvenanceTuple(
+                src_hap=" synthetic#1",
+                src_path="synthetic#1#ctg",
+                base_offset=0,
+                orig_codes=resolved_branch_steps._codes,
+                node_lens=resolved_nodes._node_lens,
             )
-            cur_pos += slen
-        resolved_branch_prov = synth_prov
+        else:
+            synth_prov: list[StepProvenance] = []
+            cur_pos = 0
+            for st in resolved_branch_steps:
+                slen = st.step_len(resolved_nodes)
+                synth_prov.append(
+                    StepProvenance(
+                        src_hap=" synthetic#1",
+                        src_path="synthetic#1#ctg",
+                        src_start=cur_pos,
+                        src_end=cur_pos + slen,
+                        src_strand="+",
+                    )
+                )
+                cur_pos += slen
+            resolved_branch_prov = synth_prov
 
     if len(resolved_branch_steps) != len(resolved_branch_prov):
         raise InputContractError(
@@ -182,20 +242,116 @@ def project_steps_onto_backbone(
             f"branch_provenance length ({len(resolved_branch_prov)})"
         )
 
-    anchor_map = build_backbone_anchor_map(resolved_backbone, lo=eff_lo, hi=eff_hi)
+    n_b_total = len(resolved_backbone)
+    eff_hi_val = n_b_total if eff_hi is None else eff_hi
+    if eff_lo < 0 or eff_hi_val > n_b_total or eff_lo > eff_hi_val:
+        raise InputContractError(
+            f"Invalid backbone slice bounds [{eff_lo}, {eff_hi_val}) for backbone of length {n_b_total}"
+        )
+
+    # Fast vectorized path when branch, backbone, and nodes are compact NumPy-backed
+    if (
+        isinstance(resolved_branch_steps, LazyStepTuple)
+        and isinstance(resolved_backbone, LazyStepTuple)
+        and isinstance(resolved_nodes, CompactNodeStore)
+        and len(resolved_nodes._extra) == 0
+    ):
+        br_codes = resolved_branch_steps._codes
+        if int(br_codes.shape[0]) == 0 or eff_lo >= eff_hi_val:
+            return []
+
+        max_nid = resolved_nodes._max_nid
+        if eff_lo == 0 and eff_hi_val == n_b_total and n_b_total > 10_000:
+            nid_to_rank, nid_to_sign = _get_lazy_backbone_anchor_arrays(
+                resolved_backbone, max_nid
+            )
+            br_nids = np.abs(br_codes)
+            ranks = nid_to_rank[br_nids]
+            hit_mask = ranks >= 0
+            branch_step_idx = np.flatnonzero(hit_mask).astype(np.int32)
+            if int(branch_step_idx.shape[0]) == 0:
+                return []
+            rank_in_b = ranks[branch_step_idx]
+            hit_codes = br_codes[branch_step_idx]
+            hit_nids = br_nids[branch_step_idx]
+            b_signs = nid_to_sign[hit_nids]
+            br_signs = np.where(hit_codes > 0, 1, -1).astype(np.int8)
+            rel_sign = np.where(br_signs == b_signs, 1, -1).astype(np.int8)
+            weights = resolved_nodes._node_lens[hit_nids]
+        else:
+            b_codes = resolved_backbone._codes[eff_lo:eff_hi_val]
+            b_nids = np.abs(b_codes)
+            u_nids, first_idx, counts = np.unique(
+                b_nids, return_index=True, return_counts=True
+            )
+            uniq_mask = counts == 1
+            uniq_b_nids = u_nids[uniq_mask]
+            if int(uniq_b_nids.shape[0]) == 0:
+                return []
+            uniq_rel_idx = first_idx[uniq_mask]
+            uniq_ranks = (eff_lo + uniq_rel_idx).astype(np.int32)
+            uniq_b_signs = np.where(b_codes[uniq_rel_idx] > 0, 1, -1).astype(np.int8)
+
+            br_nids = np.abs(br_codes)
+            pos = np.searchsorted(uniq_b_nids, br_nids)
+            n_u = int(uniq_b_nids.shape[0])
+            hit_mask = (pos < n_u) & (
+                uniq_b_nids[np.minimum(pos, n_u - 1)] == br_nids
+            )
+            branch_step_idx = np.flatnonzero(hit_mask).astype(np.int32)
+            if int(branch_step_idx.shape[0]) == 0:
+                return []
+            hit_pos = pos[branch_step_idx]
+            rank_in_b = uniq_ranks[hit_pos]
+            b_signs = uniq_b_signs[hit_pos]
+            hit_codes = br_codes[branch_step_idx]
+            hit_nids = br_nids[branch_step_idx]
+            br_signs = np.where(hit_codes > 0, 1, -1).astype(np.int8)
+            rel_sign = np.where(br_signs == b_signs, 1, -1).astype(np.int8)
+            weights = resolved_nodes._node_lens[hit_nids]
+
+        n_hits = int(branch_step_idx.shape[0])
+        if n_hits > 100_000:
+            hit_cnts = np.bincount(hit_nids)
+            dup_nids = np.flatnonzero(hit_cnts > 1)
+        elif n_hits > 1:
+            s_nids = np.sort(hit_nids)
+            dup_nids = np.unique(s_nids[:-1][s_nids[1:] == s_nids[:-1]])
+        else:
+            dup_nids = np.empty(0, dtype=np.int32)
+
+        has_mh = int(dup_nids.shape[0]) > 0
+        mh_tuple = (
+            tuple(sorted(str(x) for x in dup_nids.tolist())) if has_mh else ()
+        )
+        lazy_seq = LazyProjectedAnchorSequence(
+            branch_step_idx=branch_step_idx,
+            rank_in_b=rank_in_b,
+            rel_sign=rel_sign,
+            weights=weights,
+            steps=resolved_branch_steps,
+            provenance=resolved_branch_prov,
+            multi_hit_nids=mh_tuple,
+            has_multi_hit=has_mh,
+        )
+        if n_hits <= 5_000:
+            return list(lazy_seq)
+        return lazy_seq
+
+    anchor_map = build_backbone_anchor_map(resolved_backbone, lo=eff_lo, hi=eff_hi_val)
     anchors: list[ProjectedAnchor] = []
     for idx, (st, prov) in enumerate(zip(resolved_branch_steps, resolved_branch_prov)):
         if not _is_full_step(st):
             continue
         if st.node_id not in anchor_map:
             continue
-        rank_in_b, b_orient = anchor_map[st.node_id]
+        rank_in_b_val, b_orient = anchor_map[st.node_id]
         rel_orient: Literal["+", "-"] = "+" if st.orient == b_orient else "-"
         weight = st.step_len(resolved_nodes)
         anchors.append(
             ProjectedAnchor(
                 branch_step_idx=idx,
-                rank_in_b=rank_in_b,
+                rank_in_b=rank_in_b_val,
                 rel_orient=rel_orient,
                 node_id=st.node_id,
                 weight=weight,
@@ -232,16 +388,28 @@ def orient_contig_top_level(
         graph.ref_fragment.steps,
         graph.nodes,
     )
-    forward_bp = sum(a.weight for a in anchors if a.rel_orient == "+")
-    reverse_bp = sum(a.weight for a in anchors if a.rel_orient == "-")
+    if isinstance(anchors, LazyProjectedAnchorSequence):
+        forward_bp = int(anchors.weights[anchors.rel_sign > 0].sum(dtype=np.int64))
+        reverse_bp = int(anchors.weights[anchors.rel_sign < 0].sum(dtype=np.int64))
+    else:
+        forward_bp = sum(a.weight for a in anchors if a.rel_orient == "+")
+        reverse_bp = sum(a.weight for a in anchors if a.rel_orient == "-")
 
     if reverse_bp <= forward_bp:
         return fragment
 
-    flipped_steps = tuple(
-        st.flipped(len(graph.nodes[st.node_id])) for st in reversed(fragment.steps)
-    )
-    flipped_prov = tuple(pr.flipped() for pr in reversed(fragment.provenance))
+    if isinstance(fragment.steps, LazyStepTuple) and isinstance(
+        fragment.provenance, LazyProvenanceTuple
+    ):
+        flipped_steps: Any = fragment.steps.flipped_all()
+        flipped_prov: Any = fragment.provenance.flipped_contig()
+    else:
+        flipped_steps = tuple(
+            st.flipped(st.step_len(graph.nodes) if not st.is_partial else len(graph.nodes[st.node_id]))
+            for st in reversed(fragment.steps)
+        )
+        flipped_prov = tuple(pr.flipped() for pr in reversed(fragment.provenance))
+
     return PathFragment(
         sample=fragment.sample,
         hap=fragment.hap,
@@ -273,19 +441,63 @@ def _extract_contiguous_nonref_slices(
         tuple[tuple[Step, ...], tuple[StepProvenance, ...], StepProvenance, str]
     ] = []
     n = len(steps)
-    i = 0
-    while i < n:
-        if steps[i].node_id in global_ref_nodes:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and steps[j].node_id not in global_ref_nodes:
-            j += 1
+    if n == 0:
+        return results
 
+    if isinstance(steps, LazyStepTuple) and isinstance(
+        global_ref_nodes, CompactRefNodeSet
+    ):
+        codes = steps._codes
+        nids = np.abs(codes)
+        ref_mask = global_ref_nodes._mask[nids]
+        nonref_indices = np.flatnonzero(~ref_mask)
+        if int(nonref_indices.shape[0]) == 0:
+            return results
+        gaps = np.flatnonzero(np.diff(nonref_indices) > 1)
+        run_starts = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+        run_ends = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+        run_starts[0] = nonref_indices[0]
+        if int(gaps.shape[0]) > 0:
+            run_starts[1:] = nonref_indices[gaps + 1]
+            run_ends[:-1] = nonref_indices[gaps] + 1
+        run_ends[-1] = nonref_indices[-1] + 1
+        run_pairs = list(zip(run_starts.tolist(), run_ends.tolist()))
+    else:
+        run_pairs = []
+        i = 0
+        while i < n:
+            if steps[i].node_id in global_ref_nodes:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and steps[j].node_id not in global_ref_nodes:
+                j += 1
+            run_pairs.append((i, j))
+            i = j
+
+    for i, j in run_pairs:
         run_steps = steps[i:j]
         run_prov = provenance[i:j]
 
-        # Group adjacent steps in run_steps that merge into a single contiguous StepProvenance
+        if isinstance(run_prov, LazyProvenanceTuple) and not run_prov.has_internal_discontinuity():
+            if run_prov.total_bp() < min_sv_len:
+                continue
+            det_steps = (
+                run_steps.detach()
+                if isinstance(run_steps, LazyStepTuple)
+                else run_steps
+            )
+            det_prov = run_prov.detach()
+            sub_steps = tuple(det_steps) if len(det_steps) <= 64 else det_steps
+            sub_provs = tuple(det_prov) if len(det_prov) <= 64 else det_prov
+            seq_str = spell_steps(det_steps, nodes)
+            merged_list = merge_contiguous_provenance(det_prov, seq_str)
+            if merged_list:
+                merged_prov, merged_seq = merged_list[0]
+                if merged_prov.length >= min_sv_len:
+                    results.append((sub_steps, sub_provs, merged_prov, merged_seq))
+            continue
+
         grp_start = 0
         while grp_start < len(run_steps):
             grp_end = grp_start + 1
@@ -319,8 +531,6 @@ def _extract_contiguous_nonref_slices(
                     results.append((sub_steps, sub_provs, merged_prov, merged_seq))
             grp_start = grp_end
 
-        i = j
-
     return results
 
 
@@ -333,24 +543,6 @@ def normalize_inversions_top_level(
 ) -> InversionNormalizationResult:
     """
     §3.3.1–§3.3.2 (F9, T6, T7, T8, T24): Top-level reverse chain detection & inversion normalization.
-
-    1. Projects `fragment` onto `graph.ref_fragment.steps`.
-    2. Identifies maximal contiguous runs `R` of projected anchors with `rel_orient == "-"`
-       and strictly decreasing `rank_in_b` (`r_1 > r_2 > ... > r_k`), allowing non-anchor
-       steps in between and including single-anchor (`k = 1`) runs.
-    3. Finds nearest preceding (`L`) and succeeding (`F`) forward anchors (`rel_orient == "+"`)
-       on the same fragment, and checks rank-interval overlap `[rmin_i, rmax_i]` across all
-       reverse chains on the fragment.
-    4. Classifies each chain using the §3.3.2 4-row table:
-       - Conflict -> `INV_CONFLICT` (`normalized = False`)
-       - Missing `L` or `F` (no conflict) -> `INV_EDGE` (`normalized = False`)
-       - `rank(L) < rmin` and `rank(F) > rmax` (no conflict) -> `INV` (`normalized = True`)
-       - Otherwise (no conflict) -> `INV_DISPLACED` (`normalized = True`)
-    5. Normalizes `INV` and `INV_DISPLACED` chains by reversing the closed branch step
-       interval `[branch_start_idx, branch_end_idx]` and flipping each step's sign and
-       each provenance entry's `src_strand` (preserving pre-flip `src_start..src_end`).
-    6. Routes novel global non-reference runs (`>= config.min_sv_len`) inside unnormalized
-       chains (`INV_EDGE`, `INV_CONFLICT`) to `UnresolvedRecord` (`export_to_fasta = True`).
     """
     anchors = project_steps_onto_backbone(
         fragment.steps,
@@ -366,62 +558,111 @@ def normalize_inversions_top_level(
             unnormalized_branch_ranges=(),
         )
 
-    # Step 1: Extract maximal strictly decreasing relative-reverse anchor runs R
-    raw_runs: list[list[ProjectedAnchor]] = []
-    idx = 0
-    n_anc = len(anchors)
-    while idx < n_anc:
-        if anchors[idx].rel_orient != "-":
+    if isinstance(anchors, LazyProjectedAnchorSequence):
+        b_idxs = anchors.branch_step_idx
+        ranks = anchors.rank_in_b
+        signs = anchors.rel_sign
+        minus_pos = np.flatnonzero(signs < 0)
+        if int(minus_pos.shape[0]) == 0:
+            return InversionNormalizationResult(
+                normalized_fragment=fragment,
+                chains=(),
+                unresolved_records=(),
+                unnormalized_branch_ranges=(),
+            )
+        m_list = minus_pos.tolist()
+        raw_run_bounds: list[tuple[int, int, int, int]] = []
+        i_m = 0
+        n_m = len(m_list)
+        while i_m < n_m:
+            s_anc = m_list[i_m]
+            e_anc = s_anc
+            while (
+                i_m + 1 < n_m
+                and m_list[i_m + 1] == e_anc + 1
+                and int(ranks[m_list[i_m + 1]]) < int(ranks[e_anc])
+            ):
+                e_anc = m_list[i_m + 1]
+                i_m += 1
+            raw_run_bounds.append(
+                (
+                    int(b_idxs[s_anc]),
+                    int(b_idxs[e_anc]),
+                    int(ranks[e_anc]),
+                    int(ranks[s_anc]),
+                )
+            )
+            i_m += 1
+
+        plus_mask = signs > 0
+        plus_b_idxs = b_idxs[plus_mask]
+        plus_ranks = ranks[plus_mask]
+        n_plus = int(plus_b_idxs.shape[0])
+
+        chain_bounds: list[tuple[int, int, int, int, int | None, int | None, int, int]] = []
+        for b_start, b_end, rmin, rmax in raw_run_bounds:
+            ref_start = graph.ref_step_ranges[rmin][0]
+            ref_end = graph.ref_step_ranges[rmax][1]
+            l_pos = int(np.searchsorted(plus_b_idxs, b_start, side="left")) - 1
+            left_flank = int(plus_ranks[l_pos]) if l_pos >= 0 else None
+            r_pos = int(np.searchsorted(plus_b_idxs, b_end, side="right"))
+            right_flank = int(plus_ranks[r_pos]) if r_pos < n_plus else None
+            chain_bounds.append(
+                (b_start, b_end, rmin, rmax, left_flank, right_flank, ref_start, ref_end)
+            )
+    else:
+        raw_runs: list[list[ProjectedAnchor]] = []
+        idx = 0
+        n_anc = len(anchors)
+        while idx < n_anc:
+            if anchors[idx].rel_orient != "-":
+                idx += 1
+                continue
+            run = [anchors[idx]]
+            while (
+                idx + 1 < n_anc
+                and anchors[idx + 1].rel_orient == "-"
+                and anchors[idx + 1].rank_in_b < anchors[idx].rank_in_b
+            ):
+                run.append(anchors[idx + 1])
+                idx += 1
+            raw_runs.append(run)
             idx += 1
-            continue
-        run = [anchors[idx]]
-        while (
-            idx + 1 < n_anc
-            and anchors[idx + 1].rel_orient == "-"
-            and anchors[idx + 1].rank_in_b < anchors[idx].rank_in_b
-        ):
-            run.append(anchors[idx + 1])
-            idx += 1
-        raw_runs.append(run)
-        idx += 1
 
-    if not raw_runs:
-        return InversionNormalizationResult(
-            normalized_fragment=fragment,
-            chains=(),
-            unresolved_records=(),
-            unnormalized_branch_ranges=(),
-        )
+        if not raw_runs:
+            return InversionNormalizationResult(
+                normalized_fragment=fragment,
+                chains=(),
+                unresolved_records=(),
+                unnormalized_branch_ranges=(),
+            )
 
-    # Precompute forward anchors in branch order for L / F lookup
-    plus_anchors = [a for a in anchors if a.rel_orient == "+"]
+        plus_anchors = [a for a in anchors if a.rel_orient == "+"]
+        chain_bounds = []
+        for run in raw_runs:
+            b_start = run[0].branch_step_idx
+            b_end = run[-1].branch_step_idx
+            rmin = run[-1].rank_in_b
+            rmax = run[0].rank_in_b
+            ref_start = graph.ref_step_ranges[rmin][0]
+            ref_end = graph.ref_step_ranges[rmax][1]
 
-    # Step 2 & 3: Compute bounds, L, F, conflicts, and 4-row classification
-    chain_bounds: list[tuple[int, int, int, int, int | None, int | None, int, int]] = []
-    for run in raw_runs:
-        b_start = run[0].branch_step_idx
-        b_end = run[-1].branch_step_idx
-        rmin = run[-1].rank_in_b
-        rmax = run[0].rank_in_b
-        ref_start = graph.ref_step_ranges[rmin][0]
-        ref_end = graph.ref_step_ranges[rmax][1]
+            left_flank = None
+            for pa in plus_anchors:
+                if pa.branch_step_idx < b_start:
+                    left_flank = pa.rank_in_b
+                else:
+                    break
 
-        left_flank: int | None = None
-        for pa in plus_anchors:
-            if pa.branch_step_idx < b_start:
-                left_flank = pa.rank_in_b
-            else:
-                break
+            right_flank = None
+            for pa in plus_anchors:
+                if pa.branch_step_idx > b_end:
+                    right_flank = pa.rank_in_b
+                    break
 
-        right_flank: int | None = None
-        for pa in plus_anchors:
-            if pa.branch_step_idx > b_end:
-                right_flank = pa.rank_in_b
-                break
-
-        chain_bounds.append(
-            (b_start, b_end, rmin, rmax, left_flank, right_flank, ref_start, ref_end)
-        )
+            chain_bounds.append(
+                (b_start, b_end, rmin, rmax, left_flank, right_flank, ref_start, ref_end)
+            )
 
     n_chains = len(chain_bounds)
     classifications: list[
@@ -444,20 +685,39 @@ def normalize_inversions_top_level(
             classifications.append(("INV_DISPLACED", True))
 
     # Step 4: Normalize INV and INV_DISPLACED closed intervals [b_start, b_end]
-    work_steps = list(fragment.steps)
-    work_prov = list(fragment.provenance)
-    for i in range(n_chains):
-        cls_name, is_norm = classifications[i]
-        if not is_norm:
-            continue
-        b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
-        s = b_start
-        e = b_end + 1
-        work_steps[s:e] = [
-            st.flipped(len(graph.nodes[st.node_id]))
-            for st in reversed(work_steps[s:e])
-        ]
-        work_prov[s:e] = [pr.flipped() for pr in reversed(work_prov[s:e])]
+    if isinstance(fragment.steps, LazyStepTuple) and isinstance(
+        fragment.provenance, LazyProvenanceTuple
+    ):
+        flipped_ivs: list[tuple[int, int]] = []
+        work_codes = fragment.steps._codes.copy()
+        for i in range(n_chains):
+            _, is_norm = classifications[i]
+            if not is_norm:
+                continue
+            b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
+            s = b_start
+            e = b_end + 1
+            work_codes[s:e] = -work_codes[s:e][::-1]
+            flipped_ivs.append((s, e))
+        norm_steps: Any = LazyStepTuple(work_codes)
+        norm_prov: Any = fragment.provenance.with_flipped_intervals(flipped_ivs)
+    else:
+        work_steps = list(fragment.steps)
+        work_prov = list(fragment.provenance)
+        for i in range(n_chains):
+            _, is_norm = classifications[i]
+            if not is_norm:
+                continue
+            b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
+            s = b_start
+            e = b_end + 1
+            work_steps[s:e] = [
+                st.flipped(len(graph.nodes[st.node_id]))
+                for st in reversed(work_steps[s:e])
+            ]
+            work_prov[s:e] = [pr.flipped() for pr in reversed(work_prov[s:e])]
+        norm_steps = tuple(work_steps)
+        norm_prov = tuple(work_prov)
 
     normalized_fragment = PathFragment(
         sample=fragment.sample,
@@ -466,43 +726,54 @@ def normalize_inversions_top_level(
         seqid=fragment.seqid,
         src_path=fragment.src_path,
         base_offset=fragment.base_offset,
-        steps=tuple(work_steps),
-        provenance=tuple(work_prov),
+        steps=norm_steps,
+        provenance=norm_prov,
         is_w_line=fragment.is_w_line,
         total_len=fragment.total_len,
         is_flipped_contig=fragment.is_flipped_contig,
     )
 
     # Step 5: Handle unnormalized chains (INV_EDGE, INV_CONFLICT)
-    # Identify all forward ('+') anchor positions on normalized_fragment
-    norm_anchors = project_steps_onto_backbone(
-        normalized_fragment.steps,
-        normalized_fragment.provenance,
-        graph.ref_fragment.steps,
-        graph.nodes,
-    )
-    norm_plus_indices = sorted(
-        a.branch_step_idx for a in norm_anchors if a.rel_orient == "+"
-    )
-
-    # Group unnormalized chain indices by their enclosing (prev_plus_idx, next_plus_idx) gap
     gap_to_unnorm_chains: dict[tuple[int, int], list[int]] = collections.defaultdict(list)
-    for i in range(n_chains):
-        if classifications[i][1]:
-            continue
-        b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
-        prev_plus = -1
-        for p_idx in norm_plus_indices:
-            if p_idx < b_start:
-                prev_plus = p_idx
-            else:
-                break
-        next_plus = len(fragment.steps)
-        for p_idx in norm_plus_indices:
-            if p_idx > b_end:
-                next_plus = p_idx
-                break
-        gap_to_unnorm_chains[(prev_plus, next_plus)].append(i)
+    if any(not is_norm for _, is_norm in classifications):
+        norm_anchors = project_steps_onto_backbone(
+            normalized_fragment.steps,
+            normalized_fragment.provenance,
+            graph.ref_fragment.steps,
+            graph.nodes,
+        )
+        if isinstance(norm_anchors, LazyProjectedAnchorSequence):
+            norm_plus_arr = norm_anchors.branch_step_idx[norm_anchors.rel_sign > 0]
+            n_np = int(norm_plus_arr.shape[0])
+            for i in range(n_chains):
+                if classifications[i][1]:
+                    continue
+                b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
+                lp = int(np.searchsorted(norm_plus_arr, b_start, side="left")) - 1
+                prev_plus = int(norm_plus_arr[lp]) if lp >= 0 else -1
+                rp = int(np.searchsorted(norm_plus_arr, b_end, side="right"))
+                next_plus = int(norm_plus_arr[rp]) if rp < n_np else len(fragment.steps)
+                gap_to_unnorm_chains[(prev_plus, next_plus)].append(i)
+        else:
+            norm_plus_indices = sorted(
+                a.branch_step_idx for a in norm_anchors if a.rel_orient == "+"
+            )
+            for i in range(n_chains):
+                if classifications[i][1]:
+                    continue
+                b_start, b_end = chain_bounds[i][0], chain_bounds[i][1]
+                prev_plus = -1
+                for p_idx in norm_plus_indices:
+                    if p_idx < b_start:
+                        prev_plus = p_idx
+                    else:
+                        break
+                next_plus = len(fragment.steps)
+                for p_idx in norm_plus_indices:
+                    if p_idx > b_end:
+                        next_plus = p_idx
+                        break
+                gap_to_unnorm_chains[(prev_plus, next_plus)].append(i)
 
     unnormalized_branch_ranges: list[tuple[int, int]] = []
     unresolved_records: list[UnresolvedRecord] = []
@@ -589,56 +860,77 @@ def normalize_inversions_top_level(
     )
 
 
-def compute_weighted_lis(
-    anchors: Sequence[ProjectedAnchor],
-    total_unique_anchors_in_b: int | None = None,
-) -> tuple[list[ProjectedAnchor], bool]:
+def _solve_fenwick_lis_block(
+    b_indices: Sequence[int] | np.ndarray,
+    ranks: Sequence[int] | np.ndarray,
+    weights: Sequence[int] | np.ndarray,
+) -> list[int]:
     """
-    §3.4.1 (F10): Node-length-weighted strictly increasing LIS on relative-forward anchors.
-
-    - `multi_hit` is True iff any anchor (`rank_in_b` / `node_id`) appears more than once
-      in `anchors` (across both `+` and `-` visits).
-    - Filters to `rel_orient == "+"` anchors sorted by ascending `branch_step_idx`.
-    - Finds a strictly rank-increasing subsequence (`r_1 < r_2 < ... < r_m`) maximizing
-      total node base weight `sum(a.weight)`.
-    - Tie-breaker: among chains achieving maximum weight, selects the one with the
-      lexicographically smallest tuple of `branch_step_idx` values `(idx_1, idx_2, ...)`.
+    Exact Fenwick-tree weighted strictly increasing LIS on a block of forward anchors,
+    with monotone unique-rank run contraction and LCA lexicographical `branch_step_idx` tie-breaking.
+    Returns selected 0-based relative indices within the block.
     """
-    del total_unique_anchors_in_b
-    if not anchors:
-        return [], False
-
-    rank_counts = collections.Counter(a.rank_in_b for a in anchors)
-    node_counts = collections.Counter(a.node_id for a in anchors)
-    multi_hit = any(c > 1 for c in rank_counts.values()) or any(
-        c > 1 for c in node_counts.values()
-    )
-
-    forward_anchors = sorted(
-        (a for a in anchors if a.rel_orient == "+"),
-        key=lambda a: a.branch_step_idx,
-    )
-    n = len(forward_anchors)
+    n = len(ranks)
     if n == 0:
-        return [], multi_hit
+        return []
+    if n == 1:
+        return [0]
 
-    sorted_ranks = sorted({a.rank_in_b for a in forward_anchors})
-    u_len = len(sorted_ranks)
-    rank_to_cid = {r: idx + 1 for idx, r in enumerate(sorted_ranks)}
+    b_arr = np.asarray(b_indices, dtype=np.int64)
+    r_arr = np.asarray(ranks, dtype=np.int64)
+    w_arr = np.asarray(weights, dtype=np.int64)
 
-    dp_weight: list[int] = [0] * n
-    parent: list[int] = [-1] * n
-    first_step_idx: list[int] = [0] * n
+    u_ranks, inv_cid_raw, counts = np.unique(
+        r_arr, return_inverse=True, return_counts=True
+    )
+    inv_cid = inv_cid_raw.reshape(-1)
+
+    can_fuse = (
+        (counts[inv_cid[:-1]] == 1)
+        & (counts[inv_cid[1:]] == 1)
+        & (inv_cid[1:] == inv_cid[:-1] + 1)
+        & (w_arr[:-1] > 0)
+        & (w_arr[1:] > 0)
+        & (b_arr[1:] > b_arr[:-1])
+    )
+
+    run_starts_list: list[int] | None = None
+    run_ends_list: list[int] | None = None
+
+    if bool(np.any(can_fuse)):
+        split_pos = np.flatnonzero(~can_fuse) + 1
+        n_runs = int(split_pos.shape[0]) + 1
+        if n_runs == 1:
+            return list(range(n))
+        run_starts = np.empty(n_runs, dtype=np.int32)
+        run_ends = np.empty(n_runs, dtype=np.int32)
+        run_starts[0] = 0
+        run_starts[1:] = split_pos
+        run_ends[:-1] = split_pos
+        run_ends[-1] = n
+
+        b_idx_list = b_arr[run_starts].tolist()
+        w_list = np.add.reduceat(w_arr, run_starts).tolist()
+        u_run_ranks, run_inv_raw = np.unique(
+            r_arr[run_starts], return_inverse=True
+        )
+        cid_list = (run_inv_raw.reshape(-1) + 1).tolist()
+        u_len = int(u_run_ranks.shape[0])
+        m = n_runs
+        run_starts_list = run_starts.tolist()
+        run_ends_list = run_ends.tolist()
+    else:
+        b_idx_list = b_arr.tolist()
+        w_list = w_arr.tolist()
+        cid_list = (inv_cid + 1).tolist()
+        u_len = int(u_ranks.shape[0])
+        m = n
+
+    dp_weight: list[int] = [0] * m
+    parent: list[int] = [-1] * m
+    depth: list[int] = [0] * m
+    first_step_idx: list[int] = [0] * m
     bit_best: list[int | None] = [None] * (u_len + 1)
-
-    def _reconstruct_indices(end_idx: int) -> tuple[int, ...]:
-        seq_indices: list[int] = []
-        cur = end_idx
-        while cur != -1:
-            seq_indices.append(forward_anchors[cur].branch_step_idx)
-            cur = parent[cur]
-        seq_indices.reverse()
-        return tuple(seq_indices)
 
     def _is_better(idx_a: int, idx_b: int) -> bool:
         if idx_a == idx_b:
@@ -651,7 +943,22 @@ def compute_weighted_lis(
         f_b = first_step_idx[idx_b]
         if f_a != f_b:
             return f_a < f_b
-        return _reconstruct_indices(idx_a) < _reconstruct_indices(idx_b)
+        da = depth[idx_a]
+        db = depth[idx_b]
+        ca = idx_a
+        cb = idx_b
+        while da > db:
+            ca = parent[ca]
+            da -= 1
+        while db > da:
+            cb = parent[cb]
+            db -= 1
+        if ca == cb:
+            return depth[idx_a] < depth[idx_b]
+        while parent[ca] != parent[cb]:
+            ca = parent[ca]
+            cb = parent[cb]
+        return b_idx_list[ca] < b_idx_list[cb]
 
     def _bit_query(max_cid: int) -> int | None:
         best: int | None = None
@@ -672,30 +979,136 @@ def compute_weighted_lis(
                 bit_best[idx] = elem_idx
             idx += idx & -idx
 
-    for j, anc in enumerate(forward_anchors):
-        cid = rank_to_cid[anc.rank_in_b]
+    for j in range(m):
+        cid = cid_list[j]
         best_prev = _bit_query(cid - 1)
+        w_j = w_list[j]
         if best_prev is None:
-            dp_weight[j] = anc.weight
+            dp_weight[j] = w_j
             parent[j] = -1
-            first_step_idx[j] = anc.branch_step_idx
+            depth[j] = 1
+            first_step_idx[j] = b_idx_list[j]
         else:
-            dp_weight[j] = dp_weight[best_prev] + anc.weight
+            dp_weight[j] = dp_weight[best_prev] + w_j
             parent[j] = best_prev
+            depth[j] = depth[best_prev] + 1
             first_step_idx[j] = first_step_idx[best_prev]
         _bit_update(cid, j)
 
     overall_best = _bit_query(u_len)
     if overall_best is None:
-        return [], multi_hit
+        return []
 
-    chain: list[ProjectedAnchor] = []
+    chosen_runs: list[int] = []
     cur_idx = overall_best
     while cur_idx != -1:
-        chain.append(forward_anchors[cur_idx])
+        chosen_runs.append(cur_idx)
         cur_idx = parent[cur_idx]
-    chain.reverse()
-    return chain, multi_hit
+    chosen_runs.reverse()
+
+    if run_starts_list is not None and run_ends_list is not None:
+        chosen: list[int] = []
+        for r_i in chosen_runs:
+            chosen.extend(range(run_starts_list[r_i], run_ends_list[r_i]))
+        return chosen
+    return chosen_runs
+
+
+def compute_weighted_lis(
+    anchors: Sequence[ProjectedAnchor],
+    total_unique_anchors_in_b: int | None = None,
+) -> tuple[Sequence[ProjectedAnchor], bool]:
+    """
+    §3.4.1 (F10): Node-length-weighted strictly increasing LIS on relative-forward anchors.
+
+    - `multi_hit` is True iff any anchor (`rank_in_b` / `node_id`) appears more than once
+      in `anchors` (across both `+` and `-` visits).
+    - Filters to `rel_orient == "+"` anchors sorted by ascending `branch_step_idx`.
+    - Finds a strictly rank-increasing subsequence (`r_1 < r_2 < ... < r_m`) maximizing
+      total node base weight `sum(a.weight)`.
+    - Tie-breaker: among chains achieving maximum weight, selects the one with the
+      lexicographically smallest tuple of `branch_step_idx` values `(idx_1, idx_2, ...)`.
+    """
+    del total_unique_anchors_in_b
+    if not anchors:
+        return [], False
+
+    if isinstance(anchors, LazyProjectedAnchorSequence):
+        multi_hit = anchors.has_multi_hit
+        fwd_indices = np.flatnonzero(anchors.rel_sign > 0).astype(np.int32)
+        n = int(fwd_indices.shape[0])
+        if n == 0:
+            return [], multi_hit
+
+        fwd_b_idx = anchors.branch_step_idx[fwd_indices]
+        # Ensure sorted by ascending branch_step_idx
+        if n > 1 and not bool(np.all(fwd_b_idx[:-1] <= fwd_b_idx[1:])):
+            order = np.argsort(fwd_b_idx, kind="mergesort")
+            fwd_indices = fwd_indices[order]
+            fwd_b_idx = fwd_b_idx[order]
+
+        fwd_ranks = anchors.rank_in_b[fwd_indices]
+        fwd_weights = anchors.weights[fwd_indices]
+
+        if n == 1:
+            res_seq = anchors.subseq_by_indices(fwd_indices)
+            return list(res_seq), multi_hit
+
+        pref_max = np.maximum.accumulate(fwd_ranks)
+        suff_min = np.minimum.accumulate(fwd_ranks[::-1])[::-1]
+        is_cut = pref_max[:-1] < suff_min[1:]
+
+        if bool(np.all(is_cut)):
+            chosen_anc_indices = fwd_indices
+        else:
+            in_chain = np.ones(n, dtype=bool)
+            not_cut = np.flatnonzero(~is_cut)
+            gaps = np.flatnonzero(np.diff(not_cut) > 1)
+            blk_starts = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+            blk_ends = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+            blk_starts[0] = not_cut[0]
+            if int(gaps.shape[0]) > 0:
+                blk_starts[1:] = not_cut[gaps + 1]
+                blk_ends[:-1] = not_cut[gaps] + 2
+            blk_ends[-1] = not_cut[-1] + 2
+
+            for bs, be in zip(blk_starts.tolist(), blk_ends.tolist()):
+                in_chain[bs:be] = False
+                chosen_rel = _solve_fenwick_lis_block(
+                    fwd_b_idx[bs:be],
+                    fwd_ranks[bs:be],
+                    fwd_weights[bs:be],
+                )
+                for rel_i in chosen_rel:
+                    in_chain[bs + rel_i] = True
+
+            chosen_anc_indices = fwd_indices[np.flatnonzero(in_chain)]
+
+        res_seq = anchors.subseq_by_indices(chosen_anc_indices)
+        if len(res_seq) <= 5_000:
+            return list(res_seq), multi_hit
+        return res_seq, multi_hit
+
+    rank_counts = collections.Counter(a.rank_in_b for a in anchors)
+    node_counts = collections.Counter(a.node_id for a in anchors)
+    multi_hit = any(c > 1 for c in rank_counts.values()) or any(
+        c > 1 for c in node_counts.values()
+    )
+
+    forward_anchors = sorted(
+        (a for a in anchors if a.rel_orient == "+"),
+        key=lambda a: a.branch_step_idx,
+    )
+    n = len(forward_anchors)
+    if n == 0:
+        return [], multi_hit
+
+    chosen_indices = _solve_fenwick_lis_block(
+        [a.branch_step_idx for a in forward_anchors],
+        [a.rank_in_b for a in forward_anchors],
+        [a.weight for a in forward_anchors],
+    )
+    return [forward_anchors[idx] for idx in chosen_indices], multi_hit
 
 
 def extract_deviations(
@@ -711,20 +1124,18 @@ def extract_deviations(
 ) -> list[DeviationSegment]:
     """
     §3.4.2 & §3.5 (F11, T15): Extract deviation segments `D(a, b)` between adjacent main-chain anchors.
-
-    - Compares open branch step slice `fragment.steps[a.branch_step_idx + 1 : b.branch_step_idx]`
-      against `backbone_steps[a.rank_in_b + 1 : b.rank_in_b]`, emitting a `DeviationSegment`
-      only when they differ (`T15`: identical repeat traversal emits no deviation).
-    - Skips intervals that overlap `unnormalized_branch_ranges`.
-    - Handles top-level unanchored contig ends (`is_top_level=True`) vs recursive subproblem
-      logical `START`/`END` boundaries (`is_top_level=False`).
     """
     eff_hi = len(backbone_steps) if hi is None else hi
     provided_anchors = (
         all_projected_anchors if all_projected_anchors is not None else all_anchors
     )
-    if provided_anchors is not None:
+    if isinstance(provided_anchors, LazyProjectedAnchorSequence):
+        multi_hit_sorted = provided_anchors.multi_hit_nids
+        multi_hit_set = set(multi_hit_sorted)
+    elif provided_anchors is not None:
         anchor_counts = collections.Counter(a.node_id for a in provided_anchors)
+        multi_hit_set = {nid for nid, cnt in anchor_counts.items() if cnt > 1}
+        multi_hit_sorted = tuple(sorted(multi_hit_set))
     else:
         anchor_map = build_backbone_anchor_map(backbone_steps, lo=lo, hi=eff_hi)
         anchor_counts = collections.Counter(
@@ -732,7 +1143,12 @@ def extract_deviations(
             for st in fragment.steps
             if _is_full_step(st) and st.node_id in anchor_map
         )
-    multi_hit_set = {nid for nid, cnt in anchor_counts.items() if cnt > 1}
+        multi_hit_set = {nid for nid, cnt in anchor_counts.items() if cnt > 1}
+        multi_hit_sorted = tuple(sorted(multi_hit_set))
+
+    fast_mh_tuple: tuple[str, ...] | None = (
+        (multi_hit_sorted[0],) if len(multi_hit_sorted) > 64 else None
+    )
 
     def _overlaps_unnormalized(b_start: int, b_end: int) -> bool:
         if not unnormalized_branch_ranges:
@@ -752,8 +1168,10 @@ def extract_deviations(
         br_steps: Sequence[Step],
         b_steps: Sequence[Step],
     ) -> tuple[str, ...]:
-        if not multi_hit_set:
+        if not multi_hit_sorted:
             return ()
+        if fast_mh_tuple is not None:
+            return fast_mh_tuple
         touched: set[str] = set()
         if left_anc is not None and left_anc.node_id in multi_hit_set:
             touched.add(left_anc.node_id)
@@ -766,11 +1184,12 @@ def extract_deviations(
             if _is_full_step(st) and st.node_id in multi_hit_set:
                 touched.add(st.node_id)
         if not touched:
-            touched = set(multi_hit_set)
+            return multi_hit_sorted
         return tuple(sorted(touched))
 
     deviations: list[DeviationSegment] = []
     n_frag = len(fragment.steps)
+    use_lazy_b_slice = isinstance(backbone_steps, LazyStepTuple)
 
     if is_top_level:
         if not main_chain:
@@ -822,37 +1241,99 @@ def extract_deviations(
             )
 
         # Internal anchored pairs
-        for k in range(len(main_chain) - 1):
-            a_left = main_chain[k]
-            a_right = main_chain[k + 1]
-            b_start = a_left.branch_step_idx + 1
-            b_end = a_right.branch_step_idx
-            if _overlaps_unnormalized(b_start, b_end):
-                continue
-            br_steps = fragment.steps[b_start:b_end]
-            br_prov = fragment.provenance[b_start:b_end]
-            b_steps = tuple(
-                backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b]
-            )
-            if br_steps != b_steps:
-                deviations.append(
-                    DeviationSegment(
-                        hap_id=fragment.hap_id,
-                        src_path=fragment.src_path,
-                        left_anchor_rank=a_left.rank_in_b,
-                        right_anchor_rank=a_right.rank_in_b,
-                        branch_start_idx=b_start,
-                        branch_end_idx=b_end,
-                        branch_steps=br_steps,
-                        branch_provenance=br_prov,
-                        backbone_steps=b_steps,
-                        multi_hit_nodes=_local_multi_hit_nodes(
-                            a_left, a_right, br_steps, b_steps
-                        ),
-                        is_unanchored_start=False,
-                        is_unanchored_end=False,
+        if (
+            isinstance(main_chain, LazyProjectedAnchorSequence)
+            and isinstance(fragment.steps, LazyStepTuple)
+            and isinstance(backbone_steps, LazyStepTuple)
+        ):
+            mc_b = main_chain.branch_step_idx
+            mc_r = main_chain.rank_in_b
+            if int(mc_b.shape[0]) > 1:
+                b_starts = mc_b[:-1] + 1
+                b_ends = mc_b[1:]
+                r_starts = mc_r[:-1] + 1
+                r_ends = mc_r[1:]
+                b_lens = b_ends - b_starts
+                r_lens = r_ends - r_starts
+                diff_mask = (b_lens != r_lens) | (b_lens > 0)
+                one_step = (b_lens == 1) & (r_lens == 1)
+                if bool(np.any(one_step)):
+                    one_idx = np.flatnonzero(one_step)
+                    same_one = (
+                        fragment.steps._codes[b_starts[one_idx]]
+                        == backbone_steps._codes[r_starts[one_idx]]
                     )
+                    diff_mask[one_idx[same_one]] = False
+
+                for k in np.flatnonzero(diff_mask).tolist():
+                    b_start = int(b_starts[k])
+                    b_end = int(b_ends[k])
+                    if _overlaps_unnormalized(b_start, b_end):
+                        continue
+                    r_left = int(mc_r[k])
+                    r_right = int(mc_r[k + 1])
+                    br_steps = fragment.steps[b_start:b_end]
+                    b_steps: Any = backbone_steps[r_left + 1 : r_right]
+                    if br_steps != b_steps:
+                        br_prov = fragment.provenance[b_start:b_end]
+                        if fast_mh_tuple is not None:
+                            mh_nodes = fast_mh_tuple
+                        elif not multi_hit_sorted:
+                            mh_nodes = ()
+                        else:
+                            mh_nodes = _local_multi_hit_nodes(
+                                main_chain[k], main_chain[k + 1], br_steps, b_steps
+                            )
+                        deviations.append(
+                            DeviationSegment(
+                                hap_id=fragment.hap_id,
+                                src_path=fragment.src_path,
+                                left_anchor_rank=r_left,
+                                right_anchor_rank=r_right,
+                                branch_start_idx=b_start,
+                                branch_end_idx=b_end,
+                                branch_steps=br_steps,
+                                branch_provenance=br_prov,
+                                backbone_steps=b_steps,
+                                multi_hit_nodes=mh_nodes,
+                                is_unanchored_start=False,
+                                is_unanchored_end=False,
+                            )
+                        )
+        else:
+            for k in range(len(main_chain) - 1):
+                a_left = main_chain[k]
+                a_right = main_chain[k + 1]
+                b_start = a_left.branch_step_idx + 1
+                b_end = a_right.branch_step_idx
+                if _overlaps_unnormalized(b_start, b_end):
+                    continue
+                br_steps = fragment.steps[b_start:b_end]
+                br_prov = fragment.provenance[b_start:b_end]
+                b_steps = (
+                    backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b]
+                    if use_lazy_b_slice
+                    else tuple(backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b])
                 )
+                if br_steps != b_steps:
+                    deviations.append(
+                        DeviationSegment(
+                            hap_id=fragment.hap_id,
+                            src_path=fragment.src_path,
+                            left_anchor_rank=a_left.rank_in_b,
+                            right_anchor_rank=a_right.rank_in_b,
+                            branch_start_idx=b_start,
+                            branch_end_idx=b_end,
+                            branch_steps=br_steps,
+                            branch_provenance=br_prov,
+                            backbone_steps=b_steps,
+                            multi_hit_nodes=_local_multi_hit_nodes(
+                                a_left, a_right, br_steps, b_steps
+                            ),
+                            is_unanchored_start=False,
+                            is_unanchored_end=False,
+                        )
+                    )
 
         # Unanchored end suffix after main_chain[-1]
         last_anc = main_chain[-1]
@@ -886,7 +1367,11 @@ def extract_deviations(
     if not main_chain:
         br_steps = fragment.steps[0:n_frag]
         br_prov = fragment.provenance[0:n_frag]
-        b_steps = tuple(backbone_steps[lo:eff_hi])
+        b_steps = (
+            backbone_steps[lo:eff_hi]
+            if use_lazy_b_slice
+            else tuple(backbone_steps[lo:eff_hi])
+        )
         if br_steps != b_steps:
             deviations.append(
                 DeviationSegment(
@@ -912,7 +1397,11 @@ def extract_deviations(
     first_anc = main_chain[0]
     br_start_steps = fragment.steps[0 : first_anc.branch_step_idx]
     br_start_prov = fragment.provenance[0 : first_anc.branch_step_idx]
-    b_start_steps = tuple(backbone_steps[lo : first_anc.rank_in_b])
+    b_start_steps: Any = (
+        backbone_steps[lo : first_anc.rank_in_b]
+        if use_lazy_b_slice
+        else tuple(backbone_steps[lo : first_anc.rank_in_b])
+    )
     if br_start_steps != b_start_steps:
         deviations.append(
             DeviationSegment(
@@ -939,9 +1428,15 @@ def extract_deviations(
         a_right = main_chain[k + 1]
         b_start = a_left.branch_step_idx + 1
         b_end = a_right.branch_step_idx
+        if b_start == b_end and a_left.rank_in_b + 1 == a_right.rank_in_b:
+            continue
         br_steps = fragment.steps[b_start:b_end]
         br_prov = fragment.provenance[b_start:b_end]
-        b_steps = tuple(backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b])
+        b_steps = (
+            backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b]
+            if use_lazy_b_slice
+            else tuple(backbone_steps[a_left.rank_in_b + 1 : a_right.rank_in_b])
+        )
         if br_steps != b_steps:
             deviations.append(
                 DeviationSegment(
@@ -967,7 +1462,11 @@ def extract_deviations(
     b_start = last_anc.branch_step_idx + 1
     br_end_steps = fragment.steps[b_start:n_frag]
     br_end_prov = fragment.provenance[b_start:n_frag]
-    b_end_steps = tuple(backbone_steps[last_anc.rank_in_b + 1 : eff_hi])
+    b_end_steps: Any = (
+        backbone_steps[last_anc.rank_in_b + 1 : eff_hi]
+        if use_lazy_b_slice
+        else tuple(backbone_steps[last_anc.rank_in_b + 1 : eff_hi])
+    )
     if br_end_steps != b_end_steps:
         deviations.append(
             DeviationSegment(
@@ -999,15 +1498,6 @@ def fold_tandem_cycles(
 ) -> CycleFoldResult:
     """
     §3.4.3 (F12, T17): Greedy left-to-right tandem repeat cycle folding on global non-reference tokens.
-
-    - Only full steps (`is_partial == False`) whose `node_id not in global_ref_nodes` can
-      participate in a repeat period `s[i : i + p]`.
-    - At each index `i`, finds the smallest `p >= 1` such that `s[i : i + p] == s[i + p : i + 2*p]`
-      and all steps in `s[i : i + 2*p]` are eligible.
-    - Counts `k >= 2` consecutive complete repeats of period `p` starting at `i`.
-    - Keeps `min(k, max_copy)` copies; if `k > max_copy`, deletes copies `max_copy + 1 .. k`,
-      records their provenance in `deleted_intervals`, and records a split index in
-      `piece_boundaries` if any subsequent step is emitted after the deletion.
     """
     if len(steps) != len(provenance):
         raise InputContractError(
@@ -1030,6 +1520,27 @@ def fold_tandem_cycles(
     ]
     tokens = [st.token for st in steps]
 
+    # Index positions of each eligible token so we only test periods p where tokens[i] == tokens[i + p]
+    pos_by_tok: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    for idx_t, tok in enumerate(tokens):
+        if is_eligible[idx_t]:
+            pos_by_tok[tok].append(idx_t)
+
+    # Fast return when no eligible token appears >= 2 times
+    if all(len(plist) < 2 for plist in pos_by_tok.values()):
+        return CycleFoldResult(
+            folded_steps=tuple(steps),
+            folded_provenance=tuple(provenance),
+            piece_boundaries=(),
+            deleted_intervals=(),
+        )
+
+    non_elig_prefix = [0] * (n + 1)
+    for idx_e in range(n):
+        non_elig_prefix[idx_e + 1] = non_elig_prefix[idx_e] + (
+            0 if is_eligible[idx_e] else 1
+        )
+
     folded_steps: list[Step] = []
     folded_prov: list[StepProvenance] = []
     piece_boundaries: list[int] = []
@@ -1039,13 +1550,22 @@ def fold_tandem_cycles(
     i = 0
     while i < n:
         found_p: int | None = None
-        max_p = (n - i) // 2
-        for p in range(1, max_p + 1):
-            if all(is_eligible[i + offset] for offset in range(2 * p)) and (
-                tokens[i : i + p] == tokens[i + p : i + 2 * p]
-            ):
-                found_p = p
-                break
+        if is_eligible[i]:
+            max_p = (n - i) // 2
+            occ_list = pos_by_tok.get(tokens[i], ())
+            if len(occ_list) >= 2:
+                for next_pos in occ_list:
+                    if next_pos <= i:
+                        continue
+                    p = next_pos - i
+                    if p > max_p:
+                        break
+                    if (
+                        non_elig_prefix[i + 2 * p] == non_elig_prefix[i]
+                        and tokens[i : i + p] == tokens[i + p : i + 2 * p]
+                    ):
+                        found_p = p
+                        break
 
         if found_p is None:
             if pending_break and len(folded_steps) > 0:
@@ -1060,8 +1580,9 @@ def fold_tandem_cycles(
         k = 2
         while i + (k + 1) * p <= n:
             base = i + k * p
-            if all(is_eligible[base + offset] for offset in range(p)) and (
-                tokens[base : base + p] == tokens[i : i + p]
+            if (
+                non_elig_prefix[base + p] == non_elig_prefix[base]
+                and tokens[base : base + p] == tokens[i : i + p]
             ):
                 k += 1
             else:
@@ -1099,7 +1620,11 @@ def canonical_rotation(
         return ()
     tok_tuple = tuple((str(nid), str(orient)) for nid, orient in tokens)
     m = len(tok_tuple)
-    return min(tok_tuple[r:] + tok_tuple[:r] for r in range(m))
+    if m == 1:
+        return tok_tuple
+    min_tok = min(tok_tuple)
+    cand_indices = [r for r, t in enumerate(tok_tuple) if t == min_tok]
+    return min(tok_tuple[r:] + tok_tuple[:r] for r in cand_indices)
 
 
 def _extract_full_period(
@@ -1116,19 +1641,37 @@ def _extract_full_period(
     - If `steps` has no internal tandem repeat anywhere, returns `(canonical_rotation(tokens), 1)`
       so a 1-copy side can be compared against a `k >= 2` copy side.
     """
-    if not steps or any(not _is_full_step(st) for st in steps):
+    n = len(steps)
+    if n == 0:
+        return None
+    if not isinstance(steps, LazyStepTuple) and any(
+        not _is_full_step(st) for st in steps
+    ):
         return None
 
     tokens = tuple(st.token for st in steps)
-    n = len(tokens)
+
+    # Index positions of each token to avoid O(n^2) scans when tokens are distinct
+    pos_by_tok: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    for idx_t, tok in enumerate(tokens):
+        pos_by_tok[tok].append(idx_t)
+
+    if len(pos_by_tok) == n:
+        # All tokens are distinct -> no tandem repeat anywhere
+        return canonical_rotation(tokens), 1
 
     # Check if a tandem repeat starts at i = 0
     max_p = n // 2
     found_p: int | None = None
-    for p in range(1, max_p + 1):
-        if tokens[0:p] == tokens[p : 2 * p]:
-            found_p = p
-            break
+    first_occ = pos_by_tok[tokens[0]]
+    if len(first_occ) >= 2:
+        for next_pos in first_occ[1:]:
+            p = next_pos
+            if p > max_p:
+                break
+            if tokens[0:p] == tokens[p : 2 * p]:
+                found_p = p
+                break
 
     if found_p is not None:
         p = found_p
@@ -1139,12 +1682,24 @@ def _extract_full_period(
             return canonical_rotation(tokens[0:p]), k
         return None
 
-    # Ensure there is no tandem repeat starting at i > 0 (which would mean a non-repeat prefix)
-    for i in range(1, n):
-        rem_max_p = (n - i) // 2
-        for p in range(1, rem_max_p + 1):
-            if tokens[i : i + p] == tokens[i + p : i + 2 * p]:
-                return None
+    # Ensure there is no tandem repeat starting at i > 0 (only check tokens appearing >= 2 times)
+    for occ_list in pos_by_tok.values():
+        if len(occ_list) < 2:
+            continue
+        m_occ = len(occ_list)
+        for a_idx in range(m_occ - 1):
+            i = occ_list[a_idx]
+            if i == 0:
+                continue
+            rem_max_p = (n - i) // 2
+            if rem_max_p < 1:
+                break
+            for b_idx in range(a_idx + 1, m_occ):
+                p = occ_list[b_idx] - i
+                if p > rem_max_p:
+                    break
+                if tokens[i : i + p] == tokens[i + p : i + 2 * p]:
+                    return None
 
     return canonical_rotation(tokens), 1
 
@@ -1157,18 +1712,29 @@ def detect_canonical_cnv(
 ) -> CNVCall | None:
     """
     §3.4.4 (F13, T10): Pre-folding canonical period CNV detector.
-
-    - Runs greedy minimal period detection on `ref_steps` (`B(a,b)`) and `alt_steps` (`D(a,b)`)
-      without restricting to non-reference nodes (partial steps `is_partial=True` excluded).
-    - Supports `k = 1` vs `k >= 2` when the 1-copy side matches a cyclic rotation of the
-      multi-copy unit `U`.
-    - Normalizes both repeat units to `canonical_u = canonical_rotation(U)`.
-    - Emits `CNVCall` iff both sides share the same `canonical_u`, at least one side has
-      `k >= 2`, `k_ref != k_alt`, and `abs(k_alt - k_ref) * unit_bp >= min_sv_len`.
     """
+    if not ref_steps or not alt_steps:
+        return None
+
+    if isinstance(ref_steps, LazyStepTuple) and isinstance(alt_steps, LazyStepTuple):
+        r_codes = ref_steps._codes
+        a_codes = alt_steps._codes
+        # Fast filter: both sides must share the exact same set of signed step codes,
+        # and at least one side must have length >= 2 with a repeated code.
+        if int(r_codes.shape[0]) < 2 and int(a_codes.shape[0]) < 2:
+            return None
+        r_u, r_cnt = np.unique(r_codes, return_counts=True)
+        a_u, a_cnt = np.unique(a_codes, return_counts=True)
+        if not bool(np.array_equal(r_u, a_u)):
+            return None
+        if int(r_cnt.max()) < 2 and int(a_cnt.max()) < 2:
+            return None
+
     ref_period = _extract_full_period(ref_steps)
+    if ref_period is None:
+        return None
     alt_period = _extract_full_period(alt_steps)
-    if ref_period is None or alt_period is None:
+    if alt_period is None:
         return None
 
     u_ref, k_ref = ref_period
@@ -1180,7 +1746,10 @@ def detect_canonical_cnv(
     if k_ref == k_alt:
         return None
 
-    unit_bp = sum(len(nodes[nid]) for nid, _ in u_ref)
+    if hasattr(nodes, "node_len"):
+        unit_bp = sum(int(nodes.node_len(nid)) for nid, _ in u_ref)  # type: ignore[attr-defined]
+    else:
+        unit_bp = sum(len(nodes[nid]) for nid, _ in u_ref)
     delta_bp = abs(k_alt - k_ref) * unit_bp
     if delta_bp < min_sv_len:
         return None
@@ -1194,10 +1763,18 @@ def detect_canonical_cnv(
     )
 
 
-def compute_raw_visit_counts(steps: Sequence[Step]) -> dict[str, int]:
+def compute_raw_visit_counts(steps: Sequence[Step]) -> Mapping[str, int]:
     """Return raw visit counts per node_id across full steps in `steps` (§3.7)."""
+    if isinstance(steps, LazyStepTuple) and len(steps) > 50_000:
+        nids = np.abs(steps._codes)
+        cnts = np.bincount(nids)
+        multi_nids = np.flatnonzero(cnts >= 2).astype(np.int32)
+        multi_counts = cnts[multi_nids].astype(np.int32)
+        return CompactVisitCounts(multi_nids=multi_nids, multi_counts=multi_counts)
+
     counts: collections.Counter[str] = collections.Counter()
     for st in steps:
         if _is_full_step(st):
             counts[st.node_id] += 1
     return dict(counts)
+

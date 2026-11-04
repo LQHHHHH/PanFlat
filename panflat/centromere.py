@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import collections
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Sequence
+from typing import AbstractSet, Any, Literal, Mapping, Sequence
 
 import mappy
+import numpy as np
 
 from panflat.gfa_io import parse_bed, spell_steps, validate_build_config
 from panflat.models import (
@@ -16,9 +17,12 @@ from panflat.models import (
     CentromerePartitionResult,
     CentromereRegion,
     CentromereRow,
+    CompactRefNodeSet,
     GFAGraph,
     InsertionSlotBlock,
     InvariantViolationError,
+    LazyProvenanceTuple,
+    LazyStepTuple,
     PathFragment,
     Piece,
     Step,
@@ -65,19 +69,6 @@ def delimit_centromere_regions(
 ) -> tuple[list[CentromereRegion], list[str]]:
     """
     §3.8.1 (F21, C2, C5): Delimit centromere regions from `--centromere-bed`.
-
-    1. Validates configuration and resolves `config.effective_centromere_mode`.
-       Returns `([], [])` when effective mode is `"off"`.
-    2. Parses BED intervals and merges overlapping or touching (`next_start <= cur_end`)
-       input intervals, preserving all original BED IDs.
-    3. Expands each interval `[s, e)` outward to the nearest unique reference steps `u`
-       (`ref_end(u) <= s`) and `v` (`ref_start(v) >= e`), giving `[ref_end(u), ref_start(v))`.
-    4. Iteratively merges expanded intervals that overlap or touch (`curr.ref_start <= prev.ref_end`)
-       and re-selects outer anchors `(u, v)` until all regions are strictly disjoint.
-    5. When `u` or `v` is missing on the reference chromosome, uses `0` (`VIRTUAL_START`)
-       or `L` (`VIRTUAL_END`) as a reference-only virtual boundary, logs `CEN_ANCHOR_NOT_FOUND`,
-       forces `effective_mode = "bypass"`, and sets `expanded_to_whole_chromosome = True`
-       when both flanks are missing.
     """
     validate_build_config(config)
     eff_mode = config.effective_centromere_mode
@@ -107,24 +98,41 @@ def delimit_centromere_regions(
         else:
             merged_bed.append((s, e, [bid]))
 
-    unique_ref_steps = sorted(graph.unique_ref_step_by_node.values())
+    if graph._nid_to_ref_rank is not None and graph._ref_cum_offsets is not None:
+        uniq_steps_arr = np.sort(
+            graph._nid_to_ref_rank[graph._nid_to_ref_rank >= 0]
+        )
+        uniq_starts = graph._ref_cum_offsets[uniq_steps_arr]
+        uniq_ends = graph._ref_cum_offsets[uniq_steps_arr + 1]
+    else:
+        uniq_steps_arr = None
+        uniq_starts = None
+        uniq_ends = None
+        unique_ref_steps = sorted(graph.unique_ref_step_by_node.values())
 
     def _expand_interval(
         bed_s: int,
         bed_e: int,
     ) -> tuple[int | None, int | None, int, int]:
-        u_step: int | None = None
-        for r_idx in unique_ref_steps:
-            if graph.ref_step_ranges[r_idx][1] <= bed_s:
-                u_step = r_idx
-            else:
-                break
+        if uniq_steps_arr is not None and uniq_starts is not None and uniq_ends is not None:
+            n_u = int(uniq_steps_arr.shape[0])
+            u_pos = int(np.searchsorted(uniq_ends, bed_s, side="right")) - 1
+            u_step = int(uniq_steps_arr[u_pos]) if u_pos >= 0 else None
+            v_pos = int(np.searchsorted(uniq_starts, bed_e, side="left"))
+            v_step = int(uniq_steps_arr[v_pos]) if v_pos < n_u else None
+        else:
+            u_step = None
+            for r_idx in unique_ref_steps:
+                if graph.ref_step_ranges[r_idx][1] <= bed_s:
+                    u_step = r_idx
+                else:
+                    break
 
-        v_step: int | None = None
-        for r_idx in unique_ref_steps:
-            if graph.ref_step_ranges[r_idx][0] >= bed_e:
-                v_step = r_idx
-                break
+            v_step = None
+            for r_idx in unique_ref_steps:
+                if graph.ref_step_ranges[r_idx][0] >= bed_e:
+                    v_step = r_idx
+                    break
 
         eff_start = graph.ref_step_ranges[u_step][1] if u_step is not None else 0
         eff_end = graph.ref_step_ranges[v_step][0] if v_step is not None else ref_len
@@ -224,8 +232,12 @@ def _slice_path_fragment(
     """Return a sub-fragment covering `frag.steps[start_idx:end_idx]`."""
     sub_steps = frag.steps[start_idx:end_idx]
     sub_prov = frag.provenance[start_idx:end_idx]
-    total_len = sum(p.length for p in sub_prov)
-    base_offset = min((p.src_start for p in sub_prov), default=frag.base_offset)
+    if isinstance(sub_prov, LazyProvenanceTuple):
+        total_len = sub_prov.total_bp()
+        base_offset = sub_prov.min_src_start() if len(sub_prov) > 0 else frag.base_offset
+    else:
+        total_len = sum(p.length for p in sub_prov)
+        base_offset = min((p.src_start for p in sub_prov), default=frag.base_offset)
     return PathFragment(
         sample=frag.sample,
         hap=frag.hap,
@@ -241,10 +253,18 @@ def _slice_path_fragment(
     )
 
 
+def _prov_min_start_max_end(
+    prov: Sequence[StepProvenance],
+) -> tuple[int, int]:
+    if isinstance(prov, LazyProvenanceTuple):
+        return prov.min_src_start(), prov.max_src_end()
+    return min(p.src_start for p in prov), max(p.src_end for p in prov)
+
+
 @dataclass(frozen=True)
 class _NonRefRun:
-    steps: tuple[Step, ...]
-    prov: tuple[StepProvenance, ...]
+    steps: tuple[Step, ...] | Any
+    prov: tuple[StepProvenance, ...] | Any
     seq: str
     src_hap: str
     src_path: str
@@ -257,7 +277,7 @@ def _extract_nonref_runs(
     steps: Sequence[Step],
     provenance: Sequence[StepProvenance],
     nodes: Mapping[str, str],
-    global_ref_nodes: frozenset[str],
+    global_ref_nodes: AbstractSet[str],
 ) -> list[_NonRefRun]:
     """
     Extract maximal contiguous runs of global non-reference steps (`node_id not in global_ref_nodes`),
@@ -265,17 +285,62 @@ def _extract_nonref_runs(
     """
     runs: list[_NonRefRun] = []
     n = len(steps)
-    i = 0
-    while i < n:
-        if steps[i].node_id in global_ref_nodes:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and steps[j].node_id not in global_ref_nodes:
-            j += 1
+    if n == 0:
+        return runs
 
+    if isinstance(steps, LazyStepTuple) and isinstance(
+        global_ref_nodes, CompactRefNodeSet
+    ):
+        codes = steps._codes
+        nids = np.abs(codes)
+        ref_mask = global_ref_nodes._mask[nids]
+        nonref_indices = np.flatnonzero(~ref_mask)
+        if int(nonref_indices.shape[0]) == 0:
+            return runs
+        gaps = np.flatnonzero(np.diff(nonref_indices) > 1)
+        run_starts = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+        run_ends = np.empty(int(gaps.shape[0]) + 1, dtype=np.int32)
+        run_starts[0] = nonref_indices[0]
+        if int(gaps.shape[0]) > 0:
+            run_starts[1:] = nonref_indices[gaps + 1]
+            run_ends[:-1] = nonref_indices[gaps] + 1
+        run_ends[-1] = nonref_indices[-1] + 1
+        run_pairs = list(zip(run_starts.tolist(), run_ends.tolist()))
+    else:
+        run_pairs = []
+        i = 0
+        while i < n:
+            if steps[i].node_id in global_ref_nodes:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and steps[j].node_id not in global_ref_nodes:
+                j += 1
+            run_pairs.append((i, j))
+            i = j
+
+    for i, j in run_pairs:
         raw_steps = steps[i:j]
         raw_prov = provenance[i:j]
+
+        if isinstance(raw_prov, LazyProvenanceTuple) and not raw_prov.has_internal_discontinuity():
+            sub_seq = spell_steps(raw_steps, nodes)
+            merged = merge_contiguous_provenance(raw_prov, sub_seq)
+            if merged:
+                m_prov, m_seq = merged[0]
+                runs.append(
+                    _NonRefRun(
+                        steps=raw_steps,
+                        prov=raw_prov,
+                        seq=m_seq,
+                        src_hap=m_prov.src_hap,
+                        src_path=m_prov.src_path,
+                        src_start=m_prov.src_start,
+                        src_end=m_prov.src_end,
+                        src_strand=m_prov.src_strand,
+                    )
+                )
+            continue
 
         grp_s = 0
         while grp_s < len(raw_steps):
@@ -320,7 +385,6 @@ def _extract_nonref_runs(
                 )
             grp_s = grp_e
 
-        i = j
     return runs
 
 
@@ -332,15 +396,7 @@ def partition_fragments_by_centromere(
 ) -> CentromerePartitionResult:
     """
     §3.8.1–§3.8.2 (F21, F22, C3, C4, C5, C14):
-    - Classifies each `(region_id, hap_id)` across all haplotypes in `graph.all_haplotypes`
-      as `complete`, `gapped`, `ambiguous`, `partial`, or `unmapped` (`ambiguous` priority).
-    - Computes `l_ref`, `l_path` (counting revisits without deduplication), and `length_ratio`.
-    - Slices localizable traversals at `(u, v)` into outer `normal_fragments` (retaining `u` on
-      the left sub-fragment and `v` on the right sub-fragment).
-    - Detects boundary-ambiguous jumps on remaining sub-fragments whose reference span intersects
-      `[ref_end(u), ref_start(v))` (or pure insertions strictly inside `(ref_end(u), ref_start(v))`),
-      routing their novel non-reference sequences to `boundary_ambiguous_records` (`CEN_BOUNDARY_AMBIGUOUS`)
-      and splitting the sub-fragments so the normal pipeline never crosses the centromere region.
+    Partition oriented fragments at centromere region anchors `(u, v)`.
     """
     alt_oriented = [
         f for f in oriented_fragments if f.src_path != graph.ref_fragment.src_path
@@ -363,8 +419,11 @@ def partition_fragments_by_centromere(
 
     hap_slices: dict[tuple[str, str], CentromereHapSlice] = {}
     claimed_source_intervals: set[tuple[str, int, int]] = set()
-    # Map id(frag) -> list of (u_idx, v_idx) cuts to remove open interior (u_idx, v_idx)
     clean_cuts_by_frag: dict[int, list[tuple[int, int]]] = collections.defaultdict(list)
+
+    is_lazy_ref = isinstance(graph.ref_fragment.steps, LazyStepTuple) and (
+        graph._node_lens is not None
+    )
 
     for reg in regions:
         l_ref = reg.ref_end - reg.ref_start
@@ -400,23 +459,46 @@ def partition_fragments_by_centromere(
         r_inner_end = (
             len(graph.ref_fragment.steps) if v_ref_step is None else v_ref_step
         )
-        outside_ref_nodes = {
-            graph.ref_fragment.steps[idx].node_id
-            for idx in range(len(graph.ref_fragment.steps))
-            if idx < r_inner_start or idx >= r_inner_end
-        }
-        internal_only_ref_nodes = (
-            {
+
+        if is_lazy_ref:
+            ref_nids = np.abs(graph.ref_fragment.steps._codes)
+            max_nid_len = int(graph._node_lens.shape[0])
+            outside_mask = np.zeros(max_nid_len, dtype=bool)
+            if r_inner_start > 0:
+                outside_mask[ref_nids[:r_inner_start]] = True
+            if r_inner_end < int(ref_nids.shape[0]):
+                outside_mask[ref_nids[r_inner_end:]] = True
+            internal_only_mask = np.zeros(max_nid_len, dtype=bool)
+            if r_inner_start < r_inner_end:
+                internal_only_mask[ref_nids[r_inner_start:r_inner_end]] = True
+            internal_only_mask &= ~outside_mask
+            outside_ref_nodes: AbstractSet[str] = CompactRefNodeSet(outside_mask)
+            internal_only_ref_nodes: AbstractSet[str] = CompactRefNodeSet(
+                internal_only_mask
+            )
+            u_nid_int = int(u_node) if (u_node is not None and u_node.isdigit()) else -1
+            v_nid_int = int(v_node) if (v_node is not None and v_node.isdigit()) else -1
+        else:
+            outside_mask = None
+            internal_only_mask = None
+            u_nid_int = -1
+            v_nid_int = -1
+            outside_ref_nodes = {
                 graph.ref_fragment.steps[idx].node_id
-                for idx in range(r_inner_start, r_inner_end)
+                for idx in range(len(graph.ref_fragment.steps))
+                if idx < r_inner_start or idx >= r_inner_end
             }
-            - outside_ref_nodes
-        )
+            internal_only_ref_nodes = (
+                {
+                    graph.ref_fragment.steps[idx].node_id
+                    for idx in range(r_inner_start, r_inner_end)
+                }
+                - outside_ref_nodes
+            )
 
         for hap_id in graph.all_haplotypes:
             hap_frags = frags_by_hap.get(hap_id, [])
 
-            # Special case: reference haplotype when virtual boundary is used on one or both flanks
             if (
                 hap_id == graph.ref_fragment.hap_id
                 and len(hap_frags) == 1
@@ -459,23 +541,40 @@ def partition_fragments_by_centromere(
             any_internal_hit = False
 
             for frag in hap_frags:
-                u_hits = [
-                    i
-                    for i, st in enumerate(frag.steps)
-                    if _is_full_step(st) and u_node is not None and st.node_id == u_node
-                ]
-                v_hits = [
-                    i
-                    for i, st in enumerate(frag.steps)
-                    if _is_full_step(st) and v_node is not None and st.node_id == v_node
-                ]
+                if is_lazy_ref and isinstance(frag.steps, LazyStepTuple):
+                    f_nids = np.abs(frag.steps._codes)
+                    u_hits = (
+                        np.flatnonzero(f_nids == u_nid_int).tolist()
+                        if u_nid_int > 0
+                        else []
+                    )
+                    v_hits = (
+                        np.flatnonzero(f_nids == v_nid_int).tolist()
+                        if v_nid_int > 0
+                        else []
+                    )
+                    assert internal_only_mask is not None
+                    if bool(np.any(internal_only_mask[f_nids])):
+                        any_internal_hit = True
+                else:
+                    u_hits = [
+                        i
+                        for i, st in enumerate(frag.steps)
+                        if _is_full_step(st) and u_node is not None and st.node_id == u_node
+                    ]
+                    v_hits = [
+                        i
+                        for i, st in enumerate(frag.steps)
+                        if _is_full_step(st) and v_node is not None and st.node_id == v_node
+                    ]
+                    if any(
+                        _is_full_step(st) and st.node_id in internal_only_ref_nodes
+                        for st in frag.steps
+                    ):
+                        any_internal_hit = True
+
                 total_u_hits += len(u_hits)
                 total_v_hits += len(v_hits)
-                if any(
-                    _is_full_step(st) and st.node_id in internal_only_ref_nodes
-                    for st in frag.steps
-                ):
-                    any_internal_hit = True
 
                 is_valid = (
                     u_ref_step is not None
@@ -520,7 +619,7 @@ def partition_fragments_by_centromere(
                 frag: PathFragment,
                 u_hits: list[int],
                 v_hits: list[int],
-                extra_slices: list[tuple[tuple[Step, ...], tuple[StepProvenance, ...]]],
+                extra_slices: list[tuple[Any, Any]],
             ) -> None:
                 if len(u_hits) == 1 and len(v_hits) == 0:
                     u_i = u_hits[0]
@@ -566,8 +665,7 @@ def partition_fragments_by_centromere(
                             sub_pr = frag.provenance[left_bound + 1 : last_int]
                             if sub_st:
                                 extra_slices.append((sub_st, sub_pr))
-                                s_start = min(p.src_start for p in sub_pr)
-                                s_end = max(p.src_end for p in sub_pr)
+                                s_start, s_end = _prov_min_start_max_end(sub_pr)
                                 claimed_source_intervals.add(
                                     (frag.src_path, s_start, s_end)
                                 )
@@ -619,8 +717,7 @@ def partition_fragments_by_centromere(
                             sub_pr = frag.provenance[first_int + 1 : right_bound]
                             if sub_st:
                                 extra_slices.append((sub_st, sub_pr))
-                                s_start = min(p.src_start for p in sub_pr)
-                                s_end = max(p.src_end for p in sub_pr)
+                                s_start, s_end = _prov_min_start_max_end(sub_pr)
                                 claimed_source_intervals.add(
                                     (frag.src_path, s_start, s_end)
                                 )
@@ -630,14 +727,13 @@ def partition_fragments_by_centromere(
                                 )
 
             if is_ambiguous:
-                extra_slices: list[tuple[tuple[Step, ...], tuple[StepProvenance, ...]]] = []
+                extra_slices: list[tuple[Any, Any]] = []
                 for frag, u_i, v_i in valid_traversals:
                     s_steps = frag.steps[u_i + 1 : v_i]
                     s_prov = frag.provenance[u_i + 1 : v_i]
                     if s_steps:
                         extra_slices.append((s_steps, s_prov))
-                        s_start = min(p.src_start for p in s_prov)
-                        s_end = max(p.src_end for p in s_prov)
+                        s_start, s_end = _prov_min_start_max_end(s_prov)
                         claimed_source_intervals.add((frag.src_path, s_start, s_end))
                     if frag.src_path != graph.ref_fragment.src_path:
                         clean_cuts_by_frag[id(frag)].append((u_i, v_i))
@@ -646,25 +742,42 @@ def partition_fragments_by_centromere(
                     if not any(frag is vt[0] for vt in valid_traversals):
                         _collect_single_side_slice(frag, u_hits, v_hits, extra_slices)
 
-                # Also check fragments with multiple u/v hits for bracketed internal intervals
                 for frag in hap_frags:
                     if any(frag is vt[0] for vt in valid_traversals):
                         continue
-                    uv_indices = [
-                        idx
-                        for idx, st in enumerate(frag.steps)
-                        if _is_full_step(st)
-                        and ((u_node is not None and st.node_id == u_node) or (v_node is not None and st.node_id == v_node))
-                    ]
+                    if is_lazy_ref and isinstance(frag.steps, LazyStepTuple):
+                        f_nids = np.abs(frag.steps._codes)
+                        uv_mask = np.zeros(int(f_nids.shape[0]), dtype=bool)
+                        if u_nid_int > 0:
+                            uv_mask |= f_nids == u_nid_int
+                        if v_nid_int > 0:
+                            uv_mask |= f_nids == v_nid_int
+                        uv_indices = np.flatnonzero(uv_mask).tolist()
+                    else:
+                        uv_indices = [
+                            idx
+                            for idx, st in enumerate(frag.steps)
+                            if _is_full_step(st)
+                            and (
+                                (u_node is not None and st.node_id == u_node)
+                                or (v_node is not None and st.node_id == v_node)
+                            )
+                        ]
                     for k in range(len(uv_indices) - 1):
                         i_a, i_b = uv_indices[k], uv_indices[k + 1]
                         if i_a + 1 < i_b:
                             sub_st = frag.steps[i_a + 1 : i_b]
-                            if not any(st.node_id in outside_ref_nodes for st in sub_st):
+                            if is_lazy_ref and isinstance(sub_st, LazyStepTuple):
+                                assert outside_mask is not None
+                                has_out = bool(np.any(outside_mask[np.abs(sub_st._codes)]))
+                            else:
+                                has_out = any(
+                                    st.node_id in outside_ref_nodes for st in sub_st
+                                )
+                            if not has_out:
                                 sub_pr = frag.provenance[i_a + 1 : i_b]
                                 extra_slices.append((sub_st, sub_pr))
-                                s_start = min(p.src_start for p in sub_pr)
-                                s_end = max(p.src_end for p in sub_pr)
+                                s_start, s_end = _prov_min_start_max_end(sub_pr)
                                 claimed_source_intervals.add(
                                     (frag.src_path, s_start, s_end)
                                 )
@@ -700,8 +813,7 @@ def partition_fragments_by_centromere(
                 l_path = len(inner_seq)
 
                 if inner_prov:
-                    src_start = min(p.src_start for p in inner_prov)
-                    src_end = max(p.src_end for p in inner_prov)
+                    src_start, src_end = _prov_min_start_max_end(inner_prov)
                     src_strand: Literal["+", "-"] = inner_prov[0].src_strand
                     if src_start < src_end:
                         claimed_source_intervals.add(
@@ -824,19 +936,64 @@ def partition_fragments_by_centromere(
     amb_counter = 1
 
     for sub_frag in stage1_subfrags:
-        anc_positions = [
-            (idx, graph.unique_ref_step_by_node[st.node_id])
-            for idx, st in enumerate(sub_frag.steps)
-            if _is_full_step(st) and st.node_id in graph.unique_ref_step_by_node
-        ]
-        if len(anc_positions) < 2:
-            normal_fragments.append(sub_frag)
-            continue
+        if (
+            isinstance(sub_frag.steps, LazyStepTuple)
+            and graph._nid_to_ref_rank is not None
+            and graph._ref_cum_offsets is not None
+        ):
+            sf_nids = np.abs(sub_frag.steps._codes)
+            sf_ranks = graph._nid_to_ref_rank[sf_nids]
+            hit_pos = np.flatnonzero(sf_ranks >= 0).astype(np.int32)
+            if int(hit_pos.shape[0]) < 2:
+                normal_fragments.append(sub_frag)
+                continue
+            hit_ranks = sf_ranks[hit_pos]
+            r_lo_arr = np.minimum(hit_ranks[:-1], hit_ranks[1:])
+            r_hi_arr = np.maximum(hit_ranks[:-1], hit_ranks[1:])
+            cum_off = graph._ref_cum_offsets
+            span_s_arr = cum_off[r_lo_arr]
+            # Wait: graph.ref_step_ranges[r_lo][1] is cum_off[r_lo + 1]!
+            span_s_arr = cum_off[r_lo_arr + 1]
+            span_e_arr = cum_off[r_hi_arr]
+            crossed_mask = np.zeros(int(r_lo_arr.shape[0]), dtype=bool)
+            non_eq = r_lo_arr < r_hi_arr
+            for reg in regions:
+                cond_interval = (span_s_arr < span_e_arr) & (
+                    np.maximum(span_s_arr, reg.ref_start)
+                    < np.minimum(span_e_arr, reg.ref_end)
+                )
+                cond_point = (span_s_arr >= span_e_arr) & (
+                    (reg.ref_start < span_s_arr) & (span_s_arr < reg.ref_end)
+                )
+                crossed_mask |= non_eq & (cond_interval | cond_point)
+            cand_k_list = np.flatnonzero(crossed_mask).tolist()
+            anc_positions_lazy: tuple[np.ndarray, np.ndarray] | None = (
+                hit_pos,
+                hit_ranks,
+            )
+            anc_positions: list[tuple[int, int]] = []
+        else:
+            anc_positions_lazy = None
+            anc_positions = [
+                (idx, graph.unique_ref_step_by_node[st.node_id])
+                for idx, st in enumerate(sub_frag.steps)
+                if _is_full_step(st) and st.node_id in graph.unique_ref_step_by_node
+            ]
+            if len(anc_positions) < 2:
+                normal_fragments.append(sub_frag)
+                continue
+            cand_k_list = list(range(len(anc_positions) - 1))
 
         amb_cuts: list[tuple[int, int]] = []
-        for k in range(len(anc_positions) - 1):
-            idx_a, r_a = anc_positions[k]
-            idx_b, r_b = anc_positions[k + 1]
+        for k in cand_k_list:
+            if anc_positions_lazy is not None:
+                idx_a = int(anc_positions_lazy[0][k])
+                r_a = int(anc_positions_lazy[1][k])
+                idx_b = int(anc_positions_lazy[0][k + 1])
+                r_b = int(anc_positions_lazy[1][k + 1])
+            else:
+                idx_a, r_a = anc_positions[k]
+                idx_b, r_b = anc_positions[k + 1]
             r_lo, r_hi = min(r_a, r_b), max(r_a, r_b)
             if r_lo == r_hi:
                 continue
@@ -850,7 +1007,6 @@ def partition_fragments_by_centromere(
                         crossed_reg = reg
                         break
                 else:
-                    # Pure insertion at span_start == span_end: only strictly inside (ref_start, ref_end) is ambiguous
                     if reg.ref_start < span_start < reg.ref_end:
                         crossed_reg = reg
                         break
