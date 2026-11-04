@@ -3,3 +3,15 @@ panflat.md
 panflat_v1_final.md
 *.bak.md
 *.pre_*.md
+.agents/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.coverage

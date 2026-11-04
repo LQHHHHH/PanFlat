@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panflat"
+version = "1.0.0"
+description = "PanFlat v1: Path-Relative Recursive Linearizer for PGGB Pangenome Graphs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "mappy",
+    "edlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+panflat = "panflat.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["panflat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
