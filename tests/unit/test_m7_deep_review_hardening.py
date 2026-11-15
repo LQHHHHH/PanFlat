@@ -2939,3 +2939,673 @@ def test_m7_29_r2_d9_d10_d11_d12_fasta_gfa_strictness_merged_cen_gff_keying_and_
     Path(f"{merged_d11}.centromere.tsv").unlink()
     rep_cen_missing = verify_build_outputs(merged_d11, comb_gfa, comb_fa)
     assert not rep_cen_missing.passed and not rep_cen_missing.centromere_passed
+
+
+def test_m7_30_p1_1_gff_gene_multi_isoform_sv_status_union_without_sibling_bleed(
+    tmp_path: Path,
+) -> None:
+    """Task 1.1 (§4 rule 4): Parent `gene` container unions `sv_status` across alternatively spliced
+    child isoforms (`mRNA`/`transcript`) in canonical order (`intronic_insertion`, `utr_insertion`,
+    `cds_split_by_insertion`), while leaf isoforms remain isolated against shared-exon bleed.
+    Covers:
+    1. Shared-exon gene (`g_shared`): `tx_s1` CDS split + `tx_s2` 5'-UTR insertion -> `g_shared` has
+       `utr_insertion,cds_split_by_insertion`.
+    2. Cassette-exon skipping gene (`g_cassette`): `tx_c1` CDS split + `tx_c2` intronic insertion ->
+       `g_cassette` has `intronic_insertion,cds_split_by_insertion`.
+    3. Triple-role gene (`g_triple`): `tx_t1` intronic + `tx_t2` UTR + `tx_t3` CDS at the same insertion
+       point -> `g_triple` has `intronic_insertion,utr_insertion,cds_split_by_insertion`.
+    """
+    # Reference layout (990 bp total across 9 nodes):
+    # Gene 1 (g_shared): [0, 330) -> n1 [0, 90), n2 [90, 180), intr1 [180, 240), n3 [240, 330); INS1 at 90
+    # Gene 2 (g_cassette): [330, 660) -> n4 [330, 420), intr2a [420, 450), cas_a [450, 495), cas_b [495, 540),
+    #                      intr2b [540, 570), n5 [570, 660); INS2 at 495
+    # Gene 3 (g_triple): [660, 990) -> n6 [660, 750), intr3a [750, 780), tri_a [780, 825), tri_b [825, 870),
+    #                    intr3b [870, 900), n7 [900, 990); INS3 at 825
+    n1 = "ATG" + ("GCT" * 29)  # 90 bp
+    n2 = ("GCT" * 29) + "TAA"  # 90 bp
+    intr1 = make_complex_seq(60, seed=9901)
+    n3 = "ATG" + ("CTG" * 28) + "TAA"  # 90 bp
+
+    n4 = "ATG" + ("CAG" * 29)  # 90 bp
+    intr2a = make_complex_seq(30, seed=9902)
+    cas_a = "GAC" * 15  # 45 bp
+    cas_b = "GAC" * 15  # 45 bp
+    intr2b = make_complex_seq(30, seed=9903)
+    n5 = ("CAG" * 29) + "TGA"  # 90 bp
+
+    n6 = "ATG" + ("TCC" * 29)  # 90 bp
+    intr3a = make_complex_seq(30, seed=9904)
+    tri_a = "AAG" * 15  # 45 bp
+    tri_b = "AAG" * 15  # 45 bp
+    intr3b = make_complex_seq(30, seed=9905)
+    n7 = ("TCC" * 29) + "TAG"  # 90 bp
+
+    ins1 = make_complex_seq(90, seed=9911)
+    ins2 = make_complex_seq(90, seed=9912)
+    ins3 = make_complex_seq(90, seed=9913)
+
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    for nid, seq in [
+        ("n1", n1),
+        ("n2", n2),
+        ("intr1", intr1),
+        ("n3", n3),
+        ("n4", n4),
+        ("intr2a", intr2a),
+        ("cas_a", cas_a),
+        ("cas_b", cas_b),
+        ("intr2b", intr2b),
+        ("n5", n5),
+        ("n6", n6),
+        ("intr3a", intr3a),
+        ("tri_a", tri_a),
+        ("tri_b", tri_b),
+        ("intr3b", intr3b),
+        ("n7", n7),
+        ("ins1", ins1),
+        ("ins2", ins2),
+        ("ins3", ins3),
+    ]:
+        b.add_node(nid, seq)
+
+    b.set_ref_path(
+        "Ref#1#Chr01",
+        [
+            "n1+",
+            "n2+",
+            "intr1+",
+            "n3+",
+            "n4+",
+            "intr2a+",
+            "cas_a+",
+            "cas_b+",
+            "intr2b+",
+            "n5+",
+            "n6+",
+            "intr3a+",
+            "tri_a+",
+            "tri_b+",
+            "intr3b+",
+            "n7+",
+        ],
+    )
+    b.add_path(
+        "Alt#1#Chr01",
+        [
+            "n1+",
+            "ins1+",
+            "n2+",
+            "intr1+",
+            "n3+",
+            "n4+",
+            "intr2a+",
+            "cas_a+",
+            "ins2+",
+            "cas_b+",
+            "intr2b+",
+            "n5+",
+            "n6+",
+            "intr3a+",
+            "tri_a+",
+            "ins3+",
+            "tri_b+",
+            "intr3b+",
+            "n7+",
+        ],
+    )
+
+    gff_lines = [
+        # Gene 1: shared exon 1..180 (CDS in tx_s1, 5'-UTR in tx_s2)
+        "Chr01\tsrc\tgene\t1\t330\t.\t+\t.\tID=g_shared",
+        "Chr01\tsrc\tmRNA\t1\t330\t.\t+\t.\tID=tx_s1;Parent=g_shared",
+        "Chr01\tsrc\tmRNA\t1\t330\t.\t+\t.\tID=tx_s2;Parent=g_shared",
+        "Chr01\tsrc\texon\t1\t180\t.\t+\t.\tID=ex_s1;Parent=tx_s1,tx_s2",
+        "Chr01\tsrc\texon\t241\t330\t.\t+\t.\tID=ex_s2;Parent=tx_s1,tx_s2",
+        "Chr01\tsrc\tCDS\t1\t180\t.\t+\t0\tID=cds_s1;Parent=tx_s1",
+        "Chr01\tsrc\tthree_prime_UTR\t241\t330\t.\t+\t.\tID=utr_s1;Parent=tx_s1",
+        "Chr01\tsrc\tfive_prime_UTR\t1\t180\t.\t+\t.\tID=utr_s2;Parent=tx_s2",
+        "Chr01\tsrc\tCDS\t241\t330\t.\t+\t0\tID=cds_s2;Parent=tx_s2",
+        # Gene 2: cassette exon 451..540 included in tx_c1 (CDS) and skipped in tx_c2 (intronic)
+        "Chr01\tsrc\tgene\t331\t660\t.\t+\t.\tID=g_cassette",
+        "Chr01\tsrc\tmRNA\t331\t660\t.\t+\t.\tID=tx_c1;Parent=g_cassette",
+        "Chr01\tsrc\tmRNA\t331\t660\t.\t+\t.\tID=tx_c2;Parent=g_cassette",
+        "Chr01\tsrc\texon\t331\t420\t.\t+\t.\tID=ex_c1;Parent=tx_c1,tx_c2",
+        "Chr01\tsrc\texon\t451\t540\t.\t+\t.\tID=ex_cas;Parent=tx_c1",
+        "Chr01\tsrc\texon\t571\t660\t.\t+\t.\tID=ex_c3;Parent=tx_c1,tx_c2",
+        "Chr01\tsrc\tCDS\t331\t420\t.\t+\t0\tID=cds_c1a;Parent=tx_c1",
+        "Chr01\tsrc\tCDS\t451\t540\t.\t+\t0\tID=cds_cas;Parent=tx_c1",
+        "Chr01\tsrc\tCDS\t571\t660\t.\t+\t0\tID=cds_c1b;Parent=tx_c1",
+        "Chr01\tsrc\tCDS\t331\t420\t.\t+\t0\tID=cds_c2a;Parent=tx_c2",
+        "Chr01\tsrc\tCDS\t571\t660\t.\t+\t0\tID=cds_c2b;Parent=tx_c2",
+        # Gene 3: 3 isoforms (tx_t1 skips 781..870 -> intronic; tx_t2 uses 781..870 as UTR; tx_t3 uses 781..870 as CDS)
+        "Chr01\tsrc\tgene\t661\t990\t.\t+\t.\tID=g_triple",
+        "Chr01\tsrc\tmRNA\t661\t990\t.\t+\t.\tID=tx_t1;Parent=g_triple",
+        "Chr01\tsrc\tmRNA\t661\t990\t.\t+\t.\tID=tx_t2;Parent=g_triple",
+        "Chr01\tsrc\tmRNA\t661\t990\t.\t+\t.\tID=tx_t3;Parent=g_triple",
+        "Chr01\tsrc\texon\t661\t750\t.\t+\t.\tID=ex_t1;Parent=tx_t1,tx_t2,tx_t3",
+        "Chr01\tsrc\texon\t781\t870\t.\t+\t.\tID=ex_tri;Parent=tx_t2,tx_t3",
+        "Chr01\tsrc\texon\t901\t990\t.\t+\t.\tID=ex_t3;Parent=tx_t1,tx_t2,tx_t3",
+        "Chr01\tsrc\tCDS\t661\t750\t.\t+\t0\tID=cds_t1a;Parent=tx_t1",
+        "Chr01\tsrc\tCDS\t901\t990\t.\t+\t0\tID=cds_t1b;Parent=tx_t1",
+        "Chr01\tsrc\tfive_prime_UTR\t661\t750\t.\t+\t.\tID=utr_t2a;Parent=tx_t2",
+        "Chr01\tsrc\tfive_prime_UTR\t781\t870\t.\t+\t.\tID=utr_t2b;Parent=tx_t2",
+        "Chr01\tsrc\tCDS\t901\t990\t.\t+\t0\tID=cds_t2c;Parent=tx_t2",
+        "Chr01\tsrc\tCDS\t661\t750\t.\t+\t0\tID=cds_t3a;Parent=tx_t3",
+        "Chr01\tsrc\tCDS\t781\t870\t.\t+\t0\tID=cds_t3b;Parent=tx_t3",
+        "Chr01\tsrc\tCDS\t901\t990\t.\t+\t0\tID=cds_t3c;Parent=tx_t3",
+    ]
+    b.gff_lines.extend(gff_lines)
+
+    inputs = b.write("p1_1_gff_union")
+    _, bundle = run_build(inputs, extra_args=["--ref-gff", str(inputs.gff_path)])
+    assert bundle is not None
+    rep = verify_build_outputs(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        ref_gff_path=inputs.gff_path,
+    )
+    assert rep.passed and rep.invariant_3_passed
+
+    assert bundle.lifted_gff_rows is not None
+    by_id = {
+        r["attributes"]["ID"]: r["attributes"]
+        for r in bundle.lifted_gff_rows
+        if r["type"] in ("gene", "mRNA")
+    }
+
+    # Leaf isoforms stay strictly isolated (no shared-exon sibling bleed!)
+    assert by_id["tx_s1"]["sv_status"] == "cds_split_by_insertion"
+    assert by_id["tx_s2"]["sv_status"] == "utr_insertion"
+    assert by_id["tx_c1"]["sv_status"] == "cds_split_by_insertion"
+    assert by_id["tx_c2"]["sv_status"] == "intronic_insertion"
+    assert by_id["tx_t1"]["sv_status"] == "intronic_insertion"
+    assert by_id["tx_t2"]["sv_status"] == "utr_insertion"
+    assert by_id["tx_t3"]["sv_status"] == "cds_split_by_insertion"
+
+    # Parent genes union all child isoforms' sv_status in canonical §4 order!
+    assert by_id["g_shared"]["sv_status"] == "utr_insertion,cds_split_by_insertion"
+    assert by_id["g_shared"]["sv_id"] == "Chr01_INS_1"
+    assert by_id["g_cassette"]["sv_status"] == "intronic_insertion,cds_split_by_insertion"
+    assert by_id["g_cassette"]["sv_id"] == "Chr01_INS_2"
+    assert (
+        by_id["g_triple"]["sv_status"]
+        == "intronic_insertion,utr_insertion,cds_split_by_insertion"
+    )
+    assert by_id["g_triple"]["sv_id"] == "Chr01_INS_3"
+
+
+def test_m7_31_p1_2_multiallelic_ins_per_allele_tag_isolation(tmp_path: Path) -> None:
+    """Task 1.2 (§3.4.1, §3.5, §3.6.6, §5.1–5.2): Multi-allelic `INS` `alleles` tags
+    (`partial_content=1`, `repeat_residual=1`, `multi_hit=1`) are strictly isolated per allele
+    instead of broadcast across all alleles in `G(a, b)`.
+    Covers:
+    1. Independent heterologous alleles at `(r1, r2)`:
+       - `CleanA#1`: clean 600 bp insertion (zero extra tags)
+       - `PartialB#1`: 650 bp unique + 1550 bp low-complexity satellite tail -> `partial_content=1` only
+       - `MultiHitC#1`: 520 bp node visited at two distant loci -> `multi_hit=1` only
+       - `CycleRepE#1`: 310 bp node traversed twice in tandem (`n_cyc+ -> n_cyc+`) -> `repeat_residual=1,multi_hit=1`
+       - `FullMaskD#1`: 1600 bp pure satellite completely masked -> genotype `.` (does not pollute `CleanA#1`)
+    2. Recursive multi-member component (`A+B` vs `A+C_mh`) at `(r2, r3)`:
+       - `CompClean1#1` & `CompClean2#1`: `compA + compB` (secondary backbone, clean) -> zero extra tags
+       - `CompMH3#1`: `compA + compC_mh` (`compC_mh` visited twice globally) -> `multi_hit=1` only on `A+C_mh`!
+    """
+    r1 = make_complex_seq(250, seed=10101)
+    r2 = make_complex_seq(250, seed=10102)
+    r3 = make_complex_seq(250, seed=10103)
+    r4 = make_complex_seq(250, seed=10104)
+
+    seq_clean = make_complex_seq(600, seed=10111)
+    seq_part_head = make_complex_seq(650, seed=10112)
+    seq_part_tail = make_satellite_seq(unit_len=12, total_len=1550, seed=10113)
+    seq_part_combined = seq_part_head + seq_part_tail
+    seq_mh = make_complex_seq(520, seed=10114)
+    sec_m = make_complex_seq(100, seed=10116)
+    sec_b_extra = make_complex_seq(100, seed=10119)
+    sec_u = make_complex_seq(100, seed=10117)
+    sec_novel = make_complex_seq(100, seed=10118)
+    seq_full_mask = make_satellite_seq(unit_len=11, total_len=1600, seed=10115)
+
+    comp_a = make_complex_seq(320, seed=10121)
+    comp_b = make_complex_seq(340, seed=10122)
+    comp_c_mh = make_complex_seq(300, seed=10123)
+
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    for nid, seq in [
+        ("r1", r1),
+        ("r2", r2),
+        ("r3", r3),
+        ("r4", r4),
+        ("n_clean", seq_clean),
+        ("n_partial", seq_part_combined),
+        ("n_mh", seq_mh),
+        ("sec_m", sec_m),
+        ("sec_b_extra", sec_b_extra),
+        ("sec_u", sec_u),
+        ("sec_novel", sec_novel),
+        ("n_full_mask", seq_full_mask),
+        ("compA", comp_a),
+        ("compB", comp_b),
+        ("compC_mh", comp_c_mh),
+    ]:
+        b.add_node(nid, seq)
+
+    b.set_ref_path("Ref#1#Chr01", ["r1+", "r2+", "r3+", "r4+"])
+    b.add_path("CleanA#1#Chr01", ["r1+", "n_clean+", "r2+", "r3+", "r4+"])
+    b.add_path("PartialB#1#Chr01", ["r1+", "n_partial+", "r2+", "r3+", "r4+"])
+    # r2+ is visited twice on MultiHitC#1 so anchor_counts['r2'] == 2 -> §3.4.1 multi_hit=1
+    b.add_path("MultiHitC#1#Chr01", ["r1+", "n_mh+", "r2+", "r3+", "r2+", "r4+"])
+    # B_sec = sec_m+(0) -> sec_b_extra+(1) -> sec_m+(2) -> sec_u+(3) has two copies of sec_m inside [0, 3),
+    # so SecRepE#1's [sec_m+, sec_novel+] before sec_u+ is locally undecomposable -> §3.5 repeat_residual=1
+    b.add_path(
+        "SecBack1#1#Chr01",
+        ["r1+", "sec_m+", "sec_b_extra+", "sec_m+", "sec_u+", "r2+", "r3+", "r4+"],
+    )
+    b.add_path(
+        "SecBack2#1#Chr01",
+        ["r1+", "sec_m+", "sec_b_extra+", "sec_m+", "sec_u+", "r2+", "r3+", "r4+"],
+    )
+    b.add_path(
+        "SecRepE#1#Chr01",
+        ["r1+", "sec_m+", "sec_novel+", "sec_u+", "r2+", "r3+", "r4+"],
+    )
+    b.add_path("FullMaskD#1#Chr01", ["r1+", "n_full_mask+", "r2+", "r3+", "r4+"])
+
+    # Recursive multi-member component at (r2, r3): CompClean1 & CompClean2 carry compA+compB;
+    # CompMH3 carries compA+compC_mh and visits backbone anchor r2+ twice -> multi_hit=1 on CompMH3 only
+    b.add_path("CompClean1#1#Chr01", ["r1+", "r2+", "compA+", "compB+", "r3+", "r4+"])
+    b.add_path("CompClean2#1#Chr01", ["r1+", "r2+", "compA+", "compB+", "r3+", "r4+"])
+    b.add_path(
+        "CompMH3#1#Chr01",
+        ["r1+", "r2+", "compA+", "compC_mh+", "r3+", "r2+", "r4+"],
+    )
+
+    inputs = b.write("p1_2_allele_tags")
+    _, bundle = run_build(inputs)
+    assert bundle is not None
+    assert_all_global_invariants(bundle, inputs.gfa_path, inputs.ref_fa_path)
+
+    ins_by_ref = {
+        int(ev["ref_start"]): ev for ev in bundle.sv_rows if ev["type"] == "INS"
+    }
+    # Locus 1 at ref_start = 250
+    ev_loc1 = ins_by_ref[250]
+    gt_loc1 = bundle.genotypes[ev_loc1["event_id"]]
+    assert gt_loc1["FullMaskD#1"] == "."
+    assert gt_loc1["SecBack1#1"] == gt_loc1["SecBack2#1"]
+    carrier_gts = {
+        gt_loc1["CleanA#1"],
+        gt_loc1["PartialB#1"],
+        gt_loc1["MultiHitC#1"],
+        gt_loc1["SecBack1#1"],
+        gt_loc1["SecRepE#1"],
+    }
+    assert len(carrier_gts) == 5 and not (carrier_gts & {"0", "."})
+
+    allele_map_1 = dict(
+        entry.split(":", 1) for entry in str(ev_loc1["alleles"]).split(";")
+    )
+    clean_meta = allele_map_1[gt_loc1["CleanA#1"]]
+    sec_back_meta = allele_map_1[gt_loc1["SecBack1#1"]]
+    partial_meta = allele_map_1[gt_loc1["PartialB#1"]]
+    mh_meta = allele_map_1[gt_loc1["MultiHitC#1"]]
+    rep_res_meta = allele_map_1[gt_loc1["SecRepE#1"]]
+
+    for clean_m in (clean_meta, sec_back_meta):
+        assert "partial_content=1" not in clean_m
+        assert "repeat_residual=1" not in clean_m
+        assert "multi_hit=1" not in clean_m
+
+    assert "partial_content=1" in partial_meta
+    assert "repeat_residual=1" not in partial_meta
+    assert "multi_hit=1" not in partial_meta
+
+    assert "multi_hit=1" in mh_meta
+    assert "partial_content=1" not in mh_meta
+    assert "repeat_residual=1" not in mh_meta
+
+    assert "repeat_residual=1" in rep_res_meta
+    assert "multi_hit=1" not in rep_res_meta
+    assert "partial_content=1" not in rep_res_meta
+
+    # Locus 2 (recursive component A+B vs A+C_mh) at ref_start = 500
+    ev_loc2 = ins_by_ref[500]
+    gt_loc2 = bundle.genotypes[ev_loc2["event_id"]]
+    assert gt_loc2["CompClean1#1"] == gt_loc2["CompClean2#1"] == "1"
+    assert gt_loc2["CompMH3#1"] == "2"
+
+    allele_map_2 = dict(
+        entry.split(":", 1) for entry in str(ev_loc2["alleles"]).split(";")
+    )
+    assert "multi_hit=1" not in allele_map_2["1"]
+    assert "partial_content=1" not in allele_map_2["1"]
+    assert "repeat_residual=1" not in allele_map_2["1"]
+    assert "multi_hit=1" in allele_map_2["2"]
+
+
+def _shift_bundle_pan_after(prefix: Path, insert_pan_pos: int, extra_n: int) -> None:
+    """Insert `'N' * extra_n` into `{prefix}.pan.fa` at `insert_pan_pos` and shift all downstream
+    coordinates in `offsets.tsv`, `ref_to_pan.chain`, `sv.tsv`, and `inserts.tsv` by `+extra_n`
+    so Global Invariants I, II, and III remain satisfied while mount-point spacer layout is inflated.
+    """
+    # 1. pan.fa
+    pan_lines = Path(f"{prefix}.pan.fa").read_text(encoding="utf-8").splitlines()
+    hdr = pan_lines[0]
+    seq = "".join(pan_lines[1:])
+    new_seq = seq[:insert_pan_pos] + ("N" * extra_n) + seq[insert_pan_pos:]
+    Path(f"{prefix}.pan.fa").write_text(f"{hdr}\n{new_seq}\n", encoding="utf-8")
+
+    # 2. offsets.tsv
+    off_lines = Path(f"{prefix}.offsets.tsv").read_text(encoding="utf-8").splitlines()
+    oh = {k: i for i, k in enumerate(off_lines[0].lstrip("#").split("\t"))}
+    new_off = [off_lines[0]]
+    step_rows_for_chain: list[tuple[int, int, int, int, int, int]] = []
+    for line in off_lines[1:]:
+        cols = line.split("\t")
+        p_s = int(cols[oh["pan_start"]])
+        p_e = int(cols[oh["pan_end"]])
+        s_ins = int(cols[oh["slot_ins_len"]])
+        prev_pe_before = p_s - s_ins
+        if p_s >= insert_pan_pos:
+            p_s += extra_n
+            p_e += extra_n
+            if prev_pe_before <= insert_pan_pos:
+                s_ins += extra_n
+        cols[oh["pan_start"]] = str(p_s)
+        cols[oh["pan_end"]] = str(p_e)
+        cols[oh["slot_ins_len"]] = str(s_ins)
+        new_off.append("\t".join(cols))
+        step_rows_for_chain.append(
+            (
+                int(cols[oh["ref_step"]]),
+                int(cols[oh["ref_start"]]),
+                int(cols[oh["ref_end"]]),
+                p_s,
+                p_e,
+                s_ins,
+            )
+        )
+    Path(f"{prefix}.offsets.tsv").write_text("\n".join(new_off) + "\n", encoding="utf-8")
+
+    # 3. Rebuild consistent ref_to_pan.chain from updated offsets + new_seq len
+    ch_lines = Path(f"{prefix}.ref_to_pan.chain").read_text(encoding="utf-8").splitlines()
+    ch_hdr_parts: list[str] = []
+    for line in ch_lines:
+        if line.startswith("chain "):
+            ch_hdr_parts = line.split()
+            break
+    ch_hdr_parts[8] = str(len(new_seq))
+    ch_hdr_parts[11] = str(step_rows_for_chain[-1][4])
+
+    # Coalesce contiguous zero-slot steps into chain blocks
+    blocks: list[tuple[int, int, int]] = []  # (r_s, r_e, dq_after)
+    cur_rs = step_rows_for_chain[0][1]
+    cur_re = step_rows_for_chain[0][2]
+    for st_idx in range(1, len(step_rows_for_chain)):
+        _, r_s, r_e, _, _, s_ins = step_rows_for_chain[st_idx]
+        if s_ins > 0:
+            blocks.append((cur_rs, cur_re, s_ins))
+            cur_rs = r_s
+            cur_re = r_e
+        else:
+            cur_re = r_e
+    blocks.append((cur_rs, cur_re, 0))
+
+    rebuilt_chain = [" ".join(ch_hdr_parts)]
+    for b_rs, b_re, b_dq in blocks:
+        rebuilt_chain.append(f"# block\t{b_rs}\t{b_re}\t{b_dq}")
+        if b_dq > 0:
+            rebuilt_chain.append(f"{b_re - b_rs}\t0\t{b_dq}")
+        else:
+            rebuilt_chain.append(f"{b_re - b_rs}")
+    for st_tup in step_rows_for_chain:
+        rebuilt_chain.append(
+            f"# step\t{st_tup[0]}\t{st_tup[1]}\t{st_tup[2]}\t{st_tup[3]}\t{st_tup[4]}\t{st_tup[5]}"
+        )
+    Path(f"{prefix}.ref_to_pan.chain").write_text(
+        "\n".join(rebuilt_chain) + "\n\n", encoding="utf-8"
+    )
+
+    # 4. inserts.tsv
+    ins_lines = Path(f"{prefix}.inserts.tsv").read_text(encoding="utf-8").splitlines()
+    new_ins = [ins_lines[0]]
+    ev_spans: dict[str, list[int]] = {}
+    for line in ins_lines[1:]:
+        cols = line.split("\t")
+        ps = int(cols[1])
+        pe = int(cols[2])
+        if ps >= insert_pan_pos:
+            ps += extra_n
+            pe += extra_n
+        cols[1] = str(ps)
+        cols[2] = str(pe)
+        ev_id = cols[3]
+        if ev_id not in ev_spans:
+            ev_spans[ev_id] = [ps, pe]
+        else:
+            ev_spans[ev_id][0] = min(ev_spans[ev_id][0], ps)
+            ev_spans[ev_id][1] = max(ev_spans[ev_id][1], pe)
+        new_ins.append("\t".join(cols))
+    Path(f"{prefix}.inserts.tsv").write_text("\n".join(new_ins) + "\n", encoding="utf-8")
+
+    # 5. sv.tsv
+    sv_lines = Path(f"{prefix}.sv.tsv").read_text(encoding="utf-8").splitlines()
+    new_sv = [sv_lines[0]]
+    for line in sv_lines[1:]:
+        cols = line.split("\t")
+        ev_id = cols[3]
+        if ev_id in ev_spans:
+            cols[1] = str(ev_spans[ev_id][0])
+            cols[2] = str(ev_spans[ev_id][1])
+        else:
+            ps = int(cols[1])
+            pe = int(cols[2])
+            if ps >= insert_pan_pos:
+                cols[1] = str(ps + extra_n)
+                cols[2] = str(pe + extra_n)
+        new_sv.append("\t".join(cols))
+    Path(f"{prefix}.sv.tsv").write_text("\n".join(new_sv) + "\n", encoding="utf-8")
+
+
+def test_m7_32_p1_3_verify_centromere_mount_exact_local_offset_and_stacked_spacer_rejection(
+    tmp_path: Path,
+) -> None:
+    """Task 1.3 (§3.8.4-D & §3.8.5): `verify_build_outputs` enforces exact local offset delta
+    `local_offset_delta == slot_ins_len == cen_bp + normal_ins_bp + expected_spacer_bp` and single
+    non-stacked spacers at centromere mount points, even when all global Invariants I–III are kept
+    consistent and an upstream insertion creates non-zero cumulative offset.
+    """
+    spacer_n = 100
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("r0", make_complex_seq(250, seed=10201))
+    b.add_node("u", make_complex_seq(250, seed=10202))
+    b.add_node("cen_ref", make_complex_seq(400, seed=10203))
+    b.add_node("v", make_complex_seq(250, seed=10204))
+    b.add_node("r_end", make_complex_seq(250, seed=10205))
+    b.add_node("up_ins", make_complex_seq(180, seed=10206))
+    b.add_node("cen_isl", make_complex_seq(620, seed=10207))
+    b.add_node("co_ins", make_complex_seq(210, seed=10208))
+
+    # Ref: r0 [0,250), u [250,500), cen_ref [500,900), v [900,1150), r_end [1150,1400)
+    b.set_ref_path("Ref#1#Chr01", ["r0+", "u+", "cen_ref+", "v+", "r_end+"])
+    # Hap1 carries upstream INS at 250 AND centromere island [500, 900) mounted at 900
+    b.add_path("HapCen#1#Chr01", ["r0+", "up_ins+", "u+", "cen_isl+", "v+", "r_end+"])
+    # Hap2 partial contig starting at cen_ref+ (without u+) carries co-mounted normal INS at (cen_ref, v) -> ref_start(v) = 900
+    b.add_path("HapNorm#1#Chr01", ["cen_ref+", "co_ins+", "v+", "r_end+"])
+    b.add_bed_region(520, 880, "CEN_MAIN")
+
+    inputs = b.write("p1_3_cen_mount")
+    _, bundle = run_build(
+        inputs,
+        extra_args=[
+            "--centromere-mode",
+            "extract-islands",
+            "--centromere-min-island",
+            "500",
+            "--spacer-n",
+            str(spacer_n),
+        ],
+    )
+    assert bundle is not None
+
+    rep_ok = verify_build_outputs(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        centromere_bed_path=inputs.bed_path,
+        spacer_n=spacer_n,
+    )
+    assert rep_ok.passed and rep_ok.centromere_passed
+
+    # Locate the co-mounted normal INS piece at ref=900
+    norm_ev = next(
+        ev for ev in bundle.sv_rows if ev["type"] == "INS" and int(ev["ref_start"]) == 900
+    )
+    norm_piece = next(
+        ins for ins in bundle.inserts if ins["event_id"] == norm_ev["event_id"]
+    )
+    norm_ps = int(norm_piece["pan_start"])
+    norm_pe = int(norm_piece["pan_end"])
+
+    # Tamper A: Inject stacked 2*spacer_n between CEN_ISLAND and co-mounted normal INS
+    import shutil
+
+    t1_dir = tmp_path / "tamper_stacked_between"
+    t1_dir.mkdir()
+    for fp in inputs.out_prefix.parent.glob(f"{inputs.out_prefix.name}.*"):
+        shutil.copy2(fp, t1_dir / fp.name)
+    t1_pref = t1_dir / inputs.out_prefix.name
+    _shift_bundle_pan_after(t1_pref, norm_ps, spacer_n)
+
+    rep_t1 = verify_build_outputs(
+        t1_pref,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        centromere_bed_path=inputs.bed_path,
+        spacer_n=spacer_n,
+    )
+    # Global Invariants I, II, III all pass, ONLY Section 5 exact mount-point check catches it!
+    assert rep_t1.invariant_1_passed
+    assert rep_t1.invariant_2_passed
+    assert rep_t1.invariant_3_passed
+    assert not rep_t1.centromere_passed
+    assert not rep_t1.passed
+
+    # Tamper B: Inject unexpected trailing spacer_n after co-mounted normal INS before anchor v
+    t2_dir = tmp_path / "tamper_trailing_after_norm"
+    t2_dir.mkdir()
+    for fp in inputs.out_prefix.parent.glob(f"{inputs.out_prefix.name}.*"):
+        shutil.copy2(fp, t2_dir / fp.name)
+    t2_pref = t2_dir / inputs.out_prefix.name
+    _shift_bundle_pan_after(t2_pref, norm_pe, spacer_n)
+
+    rep_t2 = verify_build_outputs(
+        t2_pref,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        centromere_bed_path=inputs.bed_path,
+        spacer_n=spacer_n,
+    )
+    assert rep_t2.invariant_1_passed
+    assert rep_t2.invariant_2_passed
+    assert rep_t2.invariant_3_passed
+    assert not rep_t2.centromere_passed
+    assert not rep_t2.passed
+
+
+def test_m7_33_p1_4_unresolved_fa_header_strand_and_verify_tamper_rejection(
+    tmp_path: Path,
+) -> None:
+    """Task 1.4 (§5 & §5.5): `write_build_outputs` and `merge_chromosomes` emit standalone
+    `reason=<...> src=<path>:<start>-<end> strand=<±>` tokens in `{p}.unresolved.fa`, and
+    `verify_build_outputs` rejects tampered `strand=`, `src=`, `reason=`, or orphan FASTA records.
+    """
+    r1 = make_complex_seq(250, seed=10301)
+    r2 = make_complex_seq(250, seed=10302)
+    un_end_seq = make_complex_seq(160, seed=10303)
+    sat_seq = make_satellite_seq(unit_len=12, total_len=1600, seed=10304)
+
+    # Chr01: reversed Alt path so UNANCHORED_END has src_strand='-' after top-level orientation,
+    # plus --dump-repeat-sequences exporting REPEAT_LIKE!
+    b1 = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    b1.add_node("r1", r1)
+    b1.add_node("r2", r2)
+    b1.add_node("un1", un_end_seq)
+    b1.add_node("sat1", sat_seq)
+    b1.set_ref_path("Ref#1#Chr01", ["r1+", "r2+"])
+    # Reversed contig: r2- -> sat1- -> r1- -> un1- (oriented to +: un1+ -> r1+ -> sat1+ -> r2+ with src_strand='-')
+    b1.add_path("RevAlt#1#Chr01", ["r2-", "sat1-", "r1-", "un1-"])
+    in1 = b1.write("p1_4_c1")
+    _, bun1 = run_build(in1, extra_args=["--dump-repeat-sequences"])
+    assert bun1 is not None
+    assert len(bun1.unresolved_fa) == 2
+
+    for exp_id, (hdr_str, _) in bun1.unresolved_fa.items():
+        toks = hdr_str.split()
+        assert toks[0] == exp_id
+        kv = dict(t.split("=", 1) for t in toks[1:])
+        assert kv["strand"] == "-"
+        assert kv["reason"] in ("UNANCHORED_END", "REPEAT_LIKE")
+        assert "(" not in kv["src"] and ":" in kv["src"]
+
+    # Chr02: forward Alt path with '+' strand UNANCHORED_END, then merge Chr01 + Chr02
+    b2 = SyntheticInputBuilder(tmp_path, chrom="Chr02", backbone_prefix="Ref#1#")
+    b2.add_node("c2_r1", make_complex_seq(250, seed=10311))
+    b2.add_node("c2_r2", make_complex_seq(250, seed=10312))
+    b2.add_node("c2_un", make_complex_seq(140, seed=10313))
+    b2.set_ref_path("Ref#1#Chr02", ["c2_r1+", "c2_r2+"])
+    b2.add_path("FwdAlt#1#Chr02", ["c2_un+", "c2_r1+", "c2_r2+"])
+    in2 = b2.write("p1_4_c2")
+    _, bun2 = run_build(in2)
+    assert bun2 is not None
+
+    merged_pref = tmp_path / "p1_4_merged"
+    merge_chromosomes([in1.out_prefix, in2.out_prefix], merged_pref)
+    bun_m = OutputBundle(merged_pref)
+    assert len(bun_m.unresolved_fa) == 3
+    for exp_id, (hdr_str, _) in bun_m.unresolved_fa.items():
+        kv = dict(t.split("=", 1) for t in hdr_str.split()[1:])
+        expected_strand = "-" if exp_id.startswith("Chr01_") else "+"
+        assert kv["strand"] == expected_strand
+        assert "(" not in kv["src"]
+
+    # Verify clean pass on Chr01, then test 4 distinct header/orphan tampers
+    rep_clean = verify_build_outputs(in1.out_prefix, in1.gfa_path, in1.ref_fa_path)
+    assert rep_clean.passed and rep_clean.unresolved_passed
+
+    orig_ufa = Path(f"{in1.out_prefix}.unresolved.fa").read_text(encoding="utf-8")
+
+    # 1. Tamper strand=- -> strand=+
+    Path(f"{in1.out_prefix}.unresolved.fa").write_text(
+        orig_ufa.replace("strand=-", "strand=+", 1), encoding="utf-8"
+    )
+    rep_bad_strand = verify_build_outputs(in1.out_prefix, in1.gfa_path, in1.ref_fa_path)
+    assert not rep_bad_strand.passed and not rep_bad_strand.unresolved_passed
+
+    # 2. Tamper src=... path/range
+    Path(f"{in1.out_prefix}.unresolved.fa").write_text(
+        orig_ufa.replace("src=RevAlt#1#Chr01:", "src=Tampered#1#Chr01:", 1),
+        encoding="utf-8",
+    )
+    rep_bad_src = verify_build_outputs(in1.out_prefix, in1.gfa_path, in1.ref_fa_path)
+    assert not rep_bad_src.passed and not rep_bad_src.unresolved_passed
+
+    # 3. Tamper reason=...
+    Path(f"{in1.out_prefix}.unresolved.fa").write_text(
+        orig_ufa.replace("reason=UNANCHORED_END", "reason=INV_CONFLICT", 1),
+        encoding="utf-8",
+    )
+    rep_bad_reason = verify_build_outputs(in1.out_prefix, in1.gfa_path, in1.ref_fa_path)
+    assert not rep_bad_reason.passed and not rep_bad_reason.unresolved_passed
+
+    # 4. Append orphan FASTA record not in unresolved.tsv
+    Path(f"{in1.out_prefix}.unresolved.fa").write_text(
+        orig_ufa
+        + ">Chr01_UNRES_999 reason=UNANCHORED_END src=RevAlt#1#Chr01:0-10 strand=+\nACGTACGTAC\n",
+        encoding="utf-8",
+    )
+    rep_orphan = verify_build_outputs(in1.out_prefix, in1.gfa_path, in1.ref_fa_path)
+    assert not rep_orphan.passed and not rep_orphan.unresolved_passed
+
+    # Restore clean file
+    Path(f"{in1.out_prefix}.unresolved.fa").write_text(orig_ufa, encoding="utf-8")

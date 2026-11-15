@@ -1333,7 +1333,8 @@ def assert_all_global_invariants(
             f"Invariant III mismatch between chain ({pan_pos_chain}) and offsets ({pan_pos_offset}) at ref {r_pos}"
         )
 
-    # --- Unresolved Provenance Verification ---
+    # --- Unresolved Provenance & FASTA Header Verification ---
+    referenced_exp_ids: dict[str, list[dict[str, Any]]] = {}
     for urow in bundle.unresolved:
         u_len = int(urow["length"])
         u_s, u_e = int(urow["src_start"]), int(urow["src_end"])
@@ -1344,17 +1345,49 @@ def assert_all_global_invariants(
         assert len(u_seq) == u_len
         exp_id = str(urow["exported_fasta_id"])
         if exp_id != ".":
+            referenced_exp_ids.setdefault(exp_id, []).append(urow)
             assert exp_id in bundle.unresolved_fa, f"Exported ID {exp_id} missing from unresolved.fa"
-            _, fa_seq = bundle.unresolved_fa[exp_id]
+            full_hdr, fa_seq = bundle.unresolved_fa[exp_id]
             assert fa_seq.upper() == u_seq, f"Unresolved FASTA sequence mismatch for {exp_id}"
+            hdr_kv: dict[str, str] = {}
+            for tok in full_hdr.split()[1:]:
+                assert "=" in tok, f"Malformed key=value token '{tok}' in unresolved.fa header '{full_hdr}'"
+                k_tok, v_tok = tok.split("=", 1)
+                hdr_kv[k_tok] = v_tok
+            assert hdr_kv.get("src") == f"{urow['src_path']}:{u_s}-{u_e}", (
+                f"unresolved.fa src header mismatch for {exp_id}: {hdr_kv.get('src')}"
+            )
+            assert hdr_kv.get("strand") == str(urow["src_strand"]), (
+                f"unresolved.fa strand header mismatch for {exp_id}: {hdr_kv.get('strand')}"
+            )
+
+    for exp_id, urows_for_id in referenced_exp_ids.items():
+        full_hdr, _ = bundle.unresolved_fa[exp_id]
+        hdr_kv = dict(tok.split("=", 1) for tok in full_hdr.split()[1:] if "=" in tok)
+        valid_reasons = {str(r["reason"]) for r in urows_for_id}
+        assert hdr_kv.get("reason") in valid_reasons, (
+            f"unresolved.fa reason header mismatch for {exp_id}: {hdr_kv.get('reason')} not in {valid_reasons}"
+        )
+    assert set(bundle.unresolved_fa.keys()) == set(referenced_exp_ids.keys()), (
+        f"Orphan/missing FASTA IDs in unresolved.fa: {set(bundle.unresolved_fa.keys())} vs {set(referenced_exp_ids.keys())}"
+    )
 
 
 def assert_centromere_accounting_and_offsets(
     bundle: OutputBundle,
-    spacer_n: int = 100,
+    spacer_n: int | None = None,
 ) -> None:
-    """Verify 27-column centromere.tsv 5-way base accounting and local offset delta at `ref_start(v)`."""
+    """Verify 27-column centromere.tsv 5-way base accounting and exact local offset delta at `ref_start(v)`."""
     assert bundle.centromere_rows is not None, "Expected centromere.tsv to exist"
+    eff_spacer_n = (
+        spacer_n
+        if spacer_n is not None
+        else (
+            int(bundle.summary_kv["spacer_n"])
+            if "spacer_n" in bundle.summary_kv and str(bundle.summary_kv["spacer_n"]).isdigit()
+            else 100
+        )
+    )
     expected_27_cols = [
         "chrom", "region_id", "input_bed_ids", "bed_start", "bed_end",
         "ref_start", "ref_end", "anchor_u", "anchor_v", "mode",
@@ -1367,13 +1400,14 @@ def assert_centromere_accounting_and_offsets(
         f"centromere.tsv columns mismatch:\nExpected: {expected_27_cols}\nActual:   {bundle.centromere_header}"
     )
 
-    regions_seen: dict[str, tuple[int, int, str, str]] = {}
+    regions_seen: dict[tuple[str, str], tuple[int, int, str, str]] = {}
     for row in bundle.centromere_rows:
+        chrom = str(row["chrom"])
         rid = str(row["region_id"])
         r_s, r_e = int(row["ref_start"]), int(row["ref_end"])
         mode = str(row["mode"])
         anchor_v = str(row["anchor_v"])
-        regions_seen[rid] = (r_s, r_e, mode, anchor_v)
+        regions_seen[(chrom, rid)] = (r_s, r_e, mode, anchor_v)
 
         nonref = str(row["nonref_input_bp"])
         if nonref != ".":
@@ -1392,9 +1426,8 @@ def assert_centromere_accounting_and_offsets(
 
     # Check non-overlapping expanded regions per chromosome
     by_chrom: dict[str, list[tuple[int, int, str]]] = {}
-    for rid, (r_s, r_e, _, _) in regions_seen.items():
-        chrom = next(r["chrom"] for r in bundle.centromere_rows if r["region_id"] == rid)
-        by_chrom.setdefault(str(chrom), []).append((r_s, r_e, rid))
+    for (chrom, rid), (r_s, r_e, _, _) in regions_seen.items():
+        by_chrom.setdefault(chrom, []).append((r_s, r_e, rid))
     for chrom, intervals in by_chrom.items():
         intervals.sort()
         for i in range(len(intervals) - 1):
@@ -1402,27 +1435,74 @@ def assert_centromere_accounting_and_offsets(
                 f"Overlapping centromere regions on {chrom}: {intervals[i]} vs {intervals[i+1]}"
             )
 
-    # Verify local offset delta at mount point ref_start(v) when offsets.tsv is present
+    # Verify exact local offset delta at mount point ref_start(v) when offsets.tsv is present (§3.8.5)
     if bundle.offsets:
-        offset_by_ref_start = {int(r["ref_start"]): r for r in bundle.offsets}
-        for rid, (r_s, r_e, mode, anchor_v) in regions_seen.items():
-            if r_e in offset_by_ref_start:
-                step_row = offset_by_ref_start[r_e]
+        offsets_by_chrom: dict[str, list[dict[str, Any]]] = {}
+        for r in bundle.offsets:
+            offsets_by_chrom.setdefault(str(r["chrom"]), []).append(r)
+        for (chrom, rid), (r_s, r_e, mode, anchor_v) in regions_seen.items():
+            chrom_offs = offsets_by_chrom.get(chrom, [])
+            if not chrom_offs:
+                continue
+            ref_total_len = int(chrom_offs[-1]["ref_end"])
+            idx_by_rs = {int(r["ref_start"]): i for i, r in enumerate(chrom_offs)}
+            slot_pan_start: int | None = None
+            slot_pan_end: int | None = None
+            slot_ins_len: int | None = None
+            if r_e == ref_total_len and chrom in bundle.pan_fa:
+                slot_pan_start = int(chrom_offs[-1]["pan_end"])
+                slot_pan_end = len(bundle.pan_fa[chrom])
+                slot_ins_len = slot_pan_end - slot_pan_start
+            elif r_e in idx_by_rs:
+                idx_v = idx_by_rs[r_e]
+                step_row = chrom_offs[idx_v]
                 slot_ins_len = int(step_row["slot_ins_len"])
-                cen_events = [
-                    ev for ev in bundle.sv_rows
-                    if ev["type"] == "CEN_ISLAND" and int(ev["ref_start"]) == r_e
-                ]
-                if cen_events:
-                    cen_pieces = [
+                slot_pan_start = int(chrom_offs[idx_v - 1]["pan_end"]) if idx_v > 0 else 0
+                slot_pan_end = int(step_row["pan_start"])
+
+            cen_events = [
+                ev for ev in bundle.sv_rows
+                if str(ev["chrom"]) == chrom and ev["type"] == "CEN_ISLAND" and int(ev["ref_start"]) == r_e
+            ]
+            if cen_events and slot_ins_len is not None and slot_pan_start is not None and slot_pan_end is not None:
+                local_offset_delta = slot_pan_end - slot_pan_start
+                assert local_offset_delta == slot_ins_len
+                cen_ev_ids = {str(ev["event_id"]) for ev in cen_events}
+                norm_ev_ids = {
+                    str(ev["event_id"])
+                    for ev in bundle.sv_rows
+                    if str(ev["chrom"]) == chrom
+                    and ev["type"] == "INS"
+                    and int(ev["ref_start"]) == r_e
+                    and int(ev["ref_end"]) == r_e
+                }
+                slot_pieces = sorted(
+                    [
                         ins for ins in bundle.inserts
-                        if ins["event_id"] in {ev["event_id"] for ev in cen_events}
-                    ]
-                    cen_bp = sum(int(p["pan_end"]) - int(p["pan_start"]) for p in cen_pieces)
-                    assert slot_ins_len >= cen_bp + 2 * spacer_n, (
-                        f"Mount point at ref={r_e} slot_ins_len ({slot_ins_len}) < "
-                        f"CEN_ISLAND bases ({cen_bp}) + 2*spacer ({2*spacer_n})"
-                    )
+                        if str(ins["chrom"]) == chrom
+                        and str(ins["event_id"]) in (cen_ev_ids | norm_ev_ids)
+                    ],
+                    key=lambda p: (int(p["pan_start"]), int(p["pan_end"])),
+                )
+                cen_bp = sum(
+                    int(p["pan_end"]) - int(p["pan_start"])
+                    for p in slot_pieces
+                    if str(p["event_id"]) in cen_ev_ids
+                )
+                normal_ins_bp = sum(
+                    int(p["pan_end"]) - int(p["pan_start"])
+                    for p in slot_pieces
+                    if str(p["event_id"]) in norm_ev_ids
+                )
+                n_spacers = sum(
+                    1 for i_p, p in enumerate(slot_pieces)
+                    if i_p == 0 or str(p["join_before"]) == "spacer"
+                ) + (1 if normal_ins_bp == 0 else 0)
+                expected_spacer_bp = n_spacers * eff_spacer_n
+                assert local_offset_delta == cen_bp + normal_ins_bp + expected_spacer_bp, (
+                    f"Mount point at ref={r_e} local_offset_delta ({local_offset_delta}) != "
+                    f"cen_bp ({cen_bp}) + normal_ins_bp ({normal_ins_bp}) + spacer_bp ({expected_spacer_bp})"
+                )
 
 
 def _reconstruct_gff_mrna_and_proteins(

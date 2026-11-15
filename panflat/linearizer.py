@@ -1215,6 +1215,7 @@ class ComponentResult:
     partial_content: bool = False
     repeat_residual: bool = False
     multi_hit: bool = False
+    cand_to_flags: dict[str, tuple[bool, bool, bool]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1237,6 +1238,7 @@ class ClusterRepresentative:
     partial_content: bool = False
     repeat_residual: bool = False
     multi_hit: bool = False
+    cand_to_flags: dict[str, tuple[bool, bool, bool]] = field(default_factory=dict)
     aligner: Any | None = None
 
 
@@ -1252,6 +1254,7 @@ class ParallelGroupSolution:
     cand_to_rep_idx: dict[str, int]
     cand_to_nested_sig: dict[str, tuple[tuple[Any, tuple[int, ...]], ...]]
     cand_to_reconstructed_len: dict[str, int]
+    cand_to_flags: dict[str, tuple[bool, bool, bool]] = field(default_factory=dict)
 
 
 def steps_to_pieces(
@@ -1435,6 +1438,14 @@ def _solve_multi_member_component(
                     partial_content=any(occ.partial_content for occ in d.occurrences),
                     repeat_residual=any(occ.repeat_residual for occ in d.occurrences),
                     multi_hit=any(occ.multi_hit for occ in d.occurrences),
+                    cand_to_flags={
+                        occ.candidate_id: (
+                            occ.partial_content,
+                            occ.repeat_residual,
+                            occ.multi_hit,
+                        )
+                        for occ in d.occurrences
+                    },
                 )
             )
         return fallback
@@ -1474,6 +1485,7 @@ def _solve_multi_member_component(
         list[ExtractedCandidate],
     ] = collections.defaultdict(list)
     member_covered_anchors: dict[int, set[int | Literal["START", "END"]]] = {}
+    member_local_flags: dict[int, tuple[bool, bool]] = {}
     extra_repeat_residual = any(
         occ.repeat_residual for d in comp for occ in d.occurrences
     )
@@ -1489,6 +1501,8 @@ def _solve_multi_member_component(
             d.steps, d_ex.provenance, b_steps, graph.nodes, lo=0, hi=n_b
         )
         main_chain, d_mh = compute_weighted_lis(anchors)
+        m_rep_res = False
+        m_mh = bool(d_mh)
         if d_mh:
             extra_multi_hit = True
 
@@ -1556,6 +1570,7 @@ def _solve_multi_member_component(
         for tdev in term_devs:
             if tdev.multi_hit_nodes:
                 extra_multi_hit = True
+                m_mh = True
             raw_blocks = extract_candidate_blocks(
                 dev=tdev,
                 backbone_steps=b_steps,
@@ -1576,6 +1591,7 @@ def _solve_multi_member_component(
             for rb in raw_blocks:
                 if rb.repeat_residual:
                     extra_repeat_residual = True
+                    m_rep_res = True
                 fold_res = fold_tandem_cycles(
                     rb.steps,
                     rb.provenance,
@@ -1601,11 +1617,12 @@ def _solve_multi_member_component(
                         repeat_screened=True,
                         partial_content=parent_occ.partial_content,
                         repeat_residual=rb.repeat_residual or parent_occ.repeat_residual,
-                        multi_hit=rb.multi_hit or parent_occ.multi_hit,
+                        multi_hit=rb.multi_hit or m_mh or parent_occ.multi_hit,
                     )
                     child_group_cands[g_key].append(ext_c)
                     if occ_idx == 0:
                         member_cands_at_group[(m_idx, g_key)].append(ext_c)
+        member_local_flags[m_idx] = (m_rep_res, m_mh)
 
     def _child_group_sort_key(
         g_key: tuple[int | Literal["START"], int | Literal["END"]],
@@ -1663,6 +1680,7 @@ def _solve_multi_member_component(
         str, tuple[tuple[Any, tuple[int, ...]], ...]
     ] = {}
     reconstructed_len_by_cand_id: dict[str, int] = {}
+    cand_flags: dict[str, tuple[bool, bool, bool]] = {}
     rep_used_by_parent_cands: dict[tuple[Any, int], set[str]] = collections.defaultdict(
         set
     )
@@ -1673,11 +1691,18 @@ def _solve_multi_member_component(
             choices_b.append((g_key, (0,)))
         nested_choices_by_cand_id[occ.candidate_id] = tuple(choices_b)
         reconstructed_len_by_cand_id[occ.candidate_id] = len(b_sec.seq)
+        cand_flags[occ.candidate_id] = (
+            occ.partial_content,
+            occ.repeat_residual,
+            occ.multi_hit,
+        )
 
     for m_idx, d in enumerate(m_child):
         cov = member_covered_anchors.get(m_idx, {"START", "END"})
         d_choices: list[tuple[Any, tuple[int, ...]]] = []
         rec_len = len(b_sec.seq)
+        m_rep_res, m_mh = member_local_flags.get(m_idx, (False, False))
+        m_part = False
 
         for g_key, _, _, _, sol in active_child_solutions:
             a_r, b_r = g_key
@@ -1687,6 +1712,17 @@ def _solve_multi_member_component(
                 sub_nested_entries: list[tuple[Any, tuple[int, ...]]] = []
                 rep_len_sum = 0
                 for ch_c in sorted(cands_here, key=lambda x: x.source_order):
+                    ch_part, ch_rep, ch_mh = sol.cand_to_flags.get(
+                        ch_c.candidate_id,
+                        (
+                            ch_c.partial_content,
+                            ch_c.repeat_residual,
+                            ch_c.multi_hit,
+                        ),
+                    )
+                    m_part = m_part or ch_part
+                    m_rep_res = m_rep_res or ch_rep
+                    m_mh = m_mh or ch_mh
                     r_idx = sol.cand_to_rep_idx.get(ch_c.candidate_id, 0)
                     rep_list.append(r_idx)
                     if r_idx > 0:
@@ -1718,6 +1754,11 @@ def _solve_multi_member_component(
             reconstructed_len_by_cand_id[p_occ.candidate_id] = max(
                 len(d.seq), rec_len
             )
+            cand_flags[p_occ.candidate_id] = (
+                p_occ.partial_content or m_part,
+                p_occ.repeat_residual or m_rep_res,
+                p_occ.multi_hit or m_mh,
+            )
 
     if not active_child_solutions:
         b_pieces = tuple(
@@ -1740,6 +1781,7 @@ def _solve_multi_member_component(
                 partial_content=extra_partial_content,
                 repeat_residual=extra_repeat_residual,
                 multi_hit=extra_multi_hit,
+                cand_to_flags=cand_flags,
             )
         ]
 
@@ -1869,6 +1911,7 @@ def _solve_multi_member_component(
             partial_content=extra_partial_content,
             repeat_residual=extra_repeat_residual,
             multi_hit=extra_multi_hit,
+            cand_to_flags=cand_flags,
         )
     ]
 
@@ -1906,6 +1949,7 @@ def solve_parallel_group(
             cand_to_rep_idx={},
             cand_to_nested_sig={},
             cand_to_reconstructed_len={},
+            cand_to_flags={},
         )
 
     # Step 1: Exact deduplication by directed step+slice key
@@ -2022,6 +2066,14 @@ def solve_parallel_group(
                     partial_content=any(occ.partial_content for occ in d.occurrences),
                     repeat_residual=any(occ.repeat_residual for occ in d.occurrences),
                     multi_hit=any(occ.multi_hit for occ in d.occurrences),
+                    cand_to_flags={
+                        occ.candidate_id: (
+                            occ.partial_content,
+                            occ.repeat_residual,
+                            occ.multi_hit,
+                        )
+                        for occ in d.occurrences
+                    },
                 )
             )
         else:
@@ -2063,6 +2115,7 @@ def solve_parallel_group(
 
     rep0_aligner: Any | None = None
     rep0_occurrences: list[ExtractedCandidate] = []
+    rep0_cand_flags: dict[str, tuple[bool, bool, bool]] = {}
     real_reps: list[ClusterRepresentative] = []
 
     for rc in real_comps:
@@ -2078,6 +2131,7 @@ def solve_parallel_group(
                 aligner=rep0_aligner,
             ):
                 rep0_occurrences.extend(rc.member_occurrences)
+                rep0_cand_flags.update(rc.cand_to_flags)
                 continue
 
         merged_into: ClusterRepresentative | None = None
@@ -2116,6 +2170,7 @@ def solve_parallel_group(
                 merged_into.repeat_residual or rc.repeat_residual
             )
             merged_into.multi_hit = merged_into.multi_hit or rc.multi_hit
+            merged_into.cand_to_flags.update(rc.cand_to_flags)
             merged_into.min_hap = min(merged_into.support_haps)
         else:
             real_reps.append(
@@ -2136,6 +2191,7 @@ def solve_parallel_group(
                     partial_content=rc.partial_content,
                     repeat_residual=rc.repeat_residual,
                     multi_hit=rc.multi_hit,
+                    cand_to_flags=dict(rc.cand_to_flags),
                 )
             )
 
@@ -2144,6 +2200,7 @@ def solve_parallel_group(
     for sc in synth_comps:
         if has_rep0 and sc.seq == rep0_seq:
             rep0_occurrences.extend(sc.member_occurrences)
+            rep0_cand_flags.update(sc.cand_to_flags)
             continue
 
         exact_target: ClusterRepresentative | None = None
@@ -2170,6 +2227,7 @@ def solve_parallel_group(
                 exact_target.repeat_residual or sc.repeat_residual
             )
             exact_target.multi_hit = exact_target.multi_hit or sc.multi_hit
+            exact_target.cand_to_flags.update(sc.cand_to_flags)
             exact_target.min_hap = min(exact_target.support_haps)
         else:
             synth_reps.append(
@@ -2190,6 +2248,7 @@ def solve_parallel_group(
                     partial_content=sc.partial_content,
                     repeat_residual=sc.repeat_residual,
                     multi_hit=sc.multi_hit,
+                    cand_to_flags=dict(sc.cand_to_flags),
                 )
             )
 
@@ -2209,11 +2268,16 @@ def solve_parallel_group(
     cand_to_rep_idx: dict[str, int] = {}
     cand_to_nested_sig: dict[str, tuple[tuple[Any, tuple[int, ...]], ...]] = {}
     cand_to_reconstructed_len: dict[str, int] = {}
+    cand_to_flags: dict[str, tuple[bool, bool, bool]] = {}
 
     for occ in rep0_occurrences:
         cand_to_rep_idx[occ.candidate_id] = 0
         cand_to_nested_sig[occ.candidate_id] = ()
         cand_to_reconstructed_len[occ.candidate_id] = len(rep0_seq)
+        cand_to_flags[occ.candidate_id] = rep0_cand_flags.get(
+            occ.candidate_id,
+            (occ.partial_content, occ.repeat_residual, occ.multi_hit),
+        )
 
     rep0_aligner = None
     for idx_r, rep in enumerate(all_non_backbone, start=1):
@@ -2232,6 +2296,10 @@ def solve_parallel_group(
                     occ.candidate_id, rep.length_bp_no_n
                 )
             )
+            cand_to_flags[occ.candidate_id] = rep.cand_to_flags.get(
+                occ.candidate_id,
+                (occ.partial_content, occ.repeat_residual, occ.multi_hit),
+            )
 
     return ParallelGroupSolution(
         left_anchor_rank=left_anchor_rank,
@@ -2242,6 +2310,7 @@ def solve_parallel_group(
         cand_to_rep_idx=cand_to_rep_idx,
         cand_to_nested_sig=cand_to_nested_sig,
         cand_to_reconstructed_len=cand_to_reconstructed_len,
+        cand_to_flags=cand_to_flags,
     )
 
 
@@ -4290,13 +4359,23 @@ def run_chromosome_pipeline(
                                 or hap_id < sig_exemplar_hap[sig_val]
                             ):
                                 sig_exemplar_hap[sig_val] = hap_id
+                            if ckey in guard_res.contig_had_masked_repeat:
+                                sig_has_partial[sig_val] = True
                             for kc in c_list:
                                 sig_cand_ids[sig_val].add(kc.candidate_id)
-                                if kc.partial_content:
+                                f_part, f_rep, f_mh = sol.cand_to_flags.get(
+                                    kc.candidate_id,
+                                    (
+                                        kc.partial_content,
+                                        kc.repeat_residual,
+                                        kc.multi_hit,
+                                    ),
+                                )
+                                if kc.partial_content or f_part:
                                     sig_has_partial[sig_val] = True
-                                if kc.repeat_residual:
+                                if kc.repeat_residual or f_rep:
                                     sig_has_rep_res[sig_val] = True
-                                if kc.multi_hit:
+                                if kc.multi_hit or f_mh:
                                     sig_has_mh[sig_val] = True
                         elif ckey in guard_res.contig_had_masked_repeat:
                             contig_sig_by_hap[hap_id].append(".")
@@ -4350,16 +4429,6 @@ def run_chromosome_pipeline(
                 else:
                     ins_genotypes[hap_id] = str(sig_to_allele_idx[res_val])  # type: ignore[index]
 
-            group_has_partial = guard_res.has_partial_content or any(
-                r.partial_content for r in sol.non_backbone_reps
-            )
-            group_has_rep_res = any(
-                r.repeat_residual for r in sol.non_backbone_reps
-            )
-            group_has_mh = any(r.multi_hit for r in sol.non_backbone_reps) or any(
-                kc.multi_hit for kc in guard_res.kept_candidates
-            )
-
             allele_entries: list[str] = []
             for s in ordered_sigs:
                 a_idx = sig_to_allele_idx[s]
@@ -4368,11 +4437,11 @@ def run_chromosome_pipeline(
                 ex_h = c_haps[0] if c_haps else sig_exemplar_hap[s]
                 n_h = len(c_haps)
                 tags = ""
-                if sig_has_partial.get(s, False) or group_has_partial:
+                if sig_has_partial.get(s, False):
                     tags += ",partial_content=1"
-                if sig_has_rep_res.get(s, False) or group_has_rep_res:
+                if sig_has_rep_res.get(s, False):
                     tags += ",repeat_residual=1"
-                if sig_has_mh.get(s, False) or group_has_mh:
+                if sig_has_mh.get(s, False):
                     tags += ",multi_hit=1"
                 allele_entries.append(
                     f"{a_idx}:len={a_len},src={ex_h},n={n_h}{tags}"

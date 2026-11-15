@@ -549,10 +549,29 @@ def liftover_gff3_lines(
 
             feat.sv_ids = _dedup_preserve_order(ev_ids)
 
-    # Annotate container features (mRNA, transcript, gene, etc.)
+    # Annotate container features (mRNA, transcript, gene, etc.) bottom-up in post-order
+    # so leaf transcript containers evaluate only their own isoform's CDS/UTR/exon structure
+    # (preventing shared-exon sibling contamination), while higher-level containers (e.g. gene)
+    # union all child isoform statuses (§4 Rule 4: stackable tags).
+    container_postorder: list[_ParsedGFFFeature] = []
+    visited_containers: set[int] = set()
+
+    def _visit_container(c_feat: _ParsedGFFFeature) -> None:
+        if c_feat.row_idx in visited_containers:
+            return
+        visited_containers.add(c_feat.row_idx)
+        if c_feat.feat_id:
+            for ch in children_by_parent.get(c_feat.feat_id, ()):
+                if ch.ftype not in SPLITTABLE_FEATURE_TYPES:
+                    _visit_container(ch)
+        container_postorder.append(c_feat)
+
     for feat in features:
-        if feat.ftype in SPLITTABLE_FEATURE_TYPES:
-            continue
+        if feat.ftype not in SPLITTABLE_FEATURE_TYPES:
+            _visit_container(feat)
+
+    eff_bounds_by_row: dict[int, tuple[int, int]] = {}
+    for feat in container_postorder:
         desc = _get_descendants(feat)
         desc_exons = [d for d in desc if d.ftype == "exon"]
         desc_cds = [d for d in desc if d.ftype == "CDS"]
@@ -562,26 +581,76 @@ def liftover_gff3_lines(
             if d.ftype in ("five_prime_UTR", "three_prime_UTR", "UTR")
         ]
 
+        eff_s0 = min([feat.s0, *(d.s0 for d in desc)]) if desc else feat.s0
+        eff_e0 = max([feat.e0, *(d.e0 for d in desc)]) if desc else feat.e0
+        eff_bounds_by_row[feat.row_idx] = (eff_s0, eff_e0)
+
+        direct_children = (
+            children_by_parent.get(feat.feat_id, ()) if feat.feat_id else ()
+        )
+        child_containers = [
+            ch
+            for ch in direct_children
+            if ch.ftype not in SPLITTABLE_FEATURE_TYPES
+        ]
+        direct_splittable = [
+            ch for ch in direct_children if ch.ftype in SPLITTABLE_FEATURE_TYPES
+        ]
+
         status_set = set()
         ev_ids = []
 
-        eff_s0 = min([feat.s0, *(d.s0 for d in desc)]) if desc else feat.s0
-        eff_e0 = max([feat.e0, *(d.e0 for d in desc)]) if desc else feat.e0
         lo_p = bisect_right(ins_positions, eff_s0)
         hi_p = bisect_left(ins_positions, eff_e0)
         internal_pts = ins_positions[lo_p:hi_p] if lo_p < hi_p else []
-        for p in internal_pts:
-            if any(c.s0 < p < c.e0 for c in desc_cds):
-                status_set.add("cds_split_by_insertion")
-                ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
-            elif any(u.s0 < p < u.e0 for u in desc_utrs) or any(
-                e.s0 < p < e.e0 for e in desc_exons
-            ):
-                status_set.add("utr_insertion")
-                ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
-            elif not any(e.s0 <= p <= e.e0 for e in desc_exons):
-                status_set.add("intronic_insertion")
-                ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+
+        if not child_containers:
+            for p in internal_pts:
+                if any(c.s0 < p < c.e0 for c in desc_cds):
+                    status_set.add("cds_split_by_insertion")
+                    ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+                elif any(u.s0 < p < u.e0 for u in desc_utrs) or any(
+                    e.s0 < p < e.e0 for e in desc_exons
+                ):
+                    status_set.add("utr_insertion")
+                    ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+                elif not any(e.s0 <= p <= e.e0 for e in desc_exons):
+                    status_set.add("intronic_insertion")
+                    ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+        else:
+            for cc in child_containers:
+                status_set.update(cc.sv_statuses)
+                ev_ids.extend(cc.sv_ids)
+
+            if direct_splittable:
+                dir_cds = [d for d in direct_splittable if d.ftype == "CDS"]
+                dir_utrs = [
+                    d
+                    for d in direct_splittable
+                    if d.ftype in ("five_prime_UTR", "three_prime_UTR", "UTR")
+                ]
+                dir_exons = [d for d in direct_splittable if d.ftype == "exon"]
+                for p in internal_pts:
+                    if any(c.s0 < p < c.e0 for c in dir_cds):
+                        status_set.add("cds_split_by_insertion")
+                        ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+                    elif any(u.s0 < p < u.e0 for u in dir_utrs) or any(
+                        e.s0 < p < e.e0 for e in dir_exons
+                    ):
+                        status_set.add("utr_insertion")
+                        ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
+
+            cc_spans = [
+                eff_bounds_by_row.get(cc.row_idx, (cc.s0, cc.e0))
+                for cc in child_containers
+            ]
+            for p in internal_pts:
+                in_any_cc = any(cs < p < ce for cs, ce in cc_spans)
+                if not in_any_cc and not any(
+                    e.s0 <= p <= e.e0 for e in desc_exons
+                ):
+                    status_set.add("intronic_insertion")
+                    ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
 
         for d in desc:
             if d.splice_site_proximal:

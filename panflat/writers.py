@@ -294,9 +294,10 @@ def write_build_outputs(
             ):
                 seen_fasta_ids.add(u.exported_fasta_id)
                 fh.write(
-                    f">{u.exported_fasta_id} region_id={u.region_id} event_id={u.event_id} "
-                    f"src={u.src_path}:{u.src_start}-{u.src_end}({u.src_strand}) "
-                    f"len={u.length} reason={u.reason}\n{u.seq.upper()}\n"
+                    f">{u.exported_fasta_id} reason={u.reason} "
+                    f"src={u.src_path}:{u.src_start}-{u.src_end} strand={u.src_strand} "
+                    f"region_id={u.region_id} event_id={u.event_id} len={u.length}\n"
+                    f"{u.seq.upper()}\n"
                 )
     written["unresolved_fa"] = str(unresolved_fa_path)
 
@@ -849,9 +850,10 @@ def merge_chromosomes(
                         local_fa_remap[fa_key] = mapped_fa_id
                         if orig_exp_id in u_fa:
                             out_ufa_fh.write(
-                                f">{mapped_fa_id} region_id={r['region_id']} event_id={r['event_id']} "
-                                f"src={r['src_path']}:{r['src_start']}-{r['src_end']}({r['src_strand']}) "
-                                f"len={r['length']} reason={r['reason']}\n{u_fa[orig_exp_id].upper()}\n"
+                                f">{mapped_fa_id} reason={r['reason']} "
+                                f"src={r['src_path']}:{r['src_start']}-{r['src_end']} strand={r['src_strand']} "
+                                f"region_id={r['region_id']} event_id={r['event_id']} len={r['length']}\n"
+                                f"{u_fa[orig_exp_id].upper()}\n"
                             )
                     r["exported_fasta_id"] = local_fa_remap[fa_key]
                 out_u_fh.write("\t".join(r[c] for c in UNRESOLVED_HEADER) + "\n")

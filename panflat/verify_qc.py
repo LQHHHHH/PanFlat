@@ -484,6 +484,85 @@ def _parse_fasta_allow_empty(path: Path) -> dict[str, str]:
     return records
 
 
+def _parse_fasta_with_header_kv(
+    path: Path,
+) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Parse FASTA sequences and `key=value` header tokens for `{p}.unresolved.fa` (§5, §5.5)."""
+    if not path.is_file():
+        return {}, {}
+    records: dict[str, str] = {}
+    header_kv: dict[str, dict[str, str]] = {}
+    seen_names: set[str] = set()
+    cur_name: str | None = None
+    cur_has_seq = False
+    chunks: list[str] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur_name is not None:
+                    if not cur_has_seq:
+                        raise InvariantViolationError(
+                            f"Empty sequence for FASTA record '{cur_name}' in '{path}'"
+                        )
+                    records[cur_name] = "".join(chunks)
+                hdr_body = line[1:].strip()
+                if not hdr_body:
+                    raise InvariantViolationError(
+                        f"Empty FASTA header at line {line_no} in '{path}'"
+                    )
+                tokens = hdr_body.split()
+                seq_name = tokens[0]
+                if seq_name in seen_names:
+                    raise InvariantViolationError(
+                        f"Duplicate FASTA sequence name '{seq_name}' in '{path}'"
+                    )
+                seen_names.add(seq_name)
+                kv_map: dict[str, str] = {}
+                for tok in tokens[1:]:
+                    if "=" not in tok:
+                        raise InvariantViolationError(
+                            f"Malformed key=value token '{tok}' in FASTA header for '{seq_name}' in '{path}'"
+                        )
+                    k_tok, v_tok = tok.split("=", 1)
+                    if not k_tok or not v_tok:
+                        raise InvariantViolationError(
+                            f"Empty key or value in token '{tok}' in FASTA header for '{seq_name}' in '{path}'"
+                        )
+                    kv_map[k_tok] = v_tok
+                header_kv[seq_name] = kv_map
+                cur_name = seq_name
+                cur_has_seq = False
+                chunks = []
+            else:
+                if cur_name is None:
+                    raise InvariantViolationError(
+                        f"FASTA sequence data before header at line {line_no} in '{path}'"
+                    )
+                chunk = (
+                    line
+                    if (line.isascii() and line.isalpha())
+                    else "".join(line.split())
+                )
+                if not chunk:
+                    continue
+                if not (chunk.isascii() and chunk.isalpha()):
+                    raise InvariantViolationError(
+                        f"Non-alphabetic characters in FASTA record '{cur_name}' in '{path}'"
+                    )
+                cur_has_seq = True
+                chunks.append(chunk.upper())
+    if cur_name is not None:
+        if not cur_has_seq:
+            raise InvariantViolationError(
+                f"Empty sequence for FASTA record '{cur_name}' in '{path}'"
+            )
+        records[cur_name] = "".join(chunks)
+    return records, header_kv
+
+
 @dataclass(frozen=True)
 class _GFAPathMeta:
     """Lightweight metadata for a GFA `P` path or `W` walk used in `--backbone-prefix` verification."""
@@ -2630,11 +2709,13 @@ def verify_build_outputs(
 
     # 4. Unresolved Provenance & FASTA Check
     unres_fa: dict[str, str] = {}
+    unres_hdr_kv: dict[str, dict[str, str]] = {}
     try:
-        unres_fa = _parse_fasta_allow_empty(unresolved_fa_path)
+        unres_fa, unres_hdr_kv = _parse_fasta_with_header_kv(unresolved_fa_path)
     except Exception as exc:
         _err("UNRES", f"Malformed unresolved.fa '{unresolved_fa_path}': {exc}")
 
+    referenced_exp_ids: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
     for urow in unres_rows:
         try:
             u_s = int(urow["src_start"])
@@ -2667,17 +2748,52 @@ def verify_build_outputs(
 
         exp_id = urow["exported_fasta_id"]
         if exp_id != ".":
+            referenced_exp_ids[exp_id].append(urow)
             if exp_id not in unres_fa:
                 _err(
                     "UNRES",
                     f"Exported FASTA ID '{exp_id}' missing from unresolved.fa",
                 )
-            elif unres_fa[exp_id].upper() != u_seq:
+            else:
+                if unres_fa[exp_id].upper() != u_seq:
+                    _err(
+                        "UNRES",
+                        f"Unresolved FASTA sequence mismatch for '{exp_id}'",
+                    )
+                hdr_kv = unres_hdr_kv.get(exp_id, {})
+                exp_src = f"{urow['src_path']}:{u_s}-{u_e}"
+                exp_strand = urow["src_strand"]
+                if hdr_kv.get("src") != exp_src:
+                    _err(
+                        "UNRES",
+                        f"Unresolved FASTA header src mismatch for '{exp_id}': "
+                        f"got '{hdr_kv.get('src')}', expected '{exp_src}'",
+                    )
+                if hdr_kv.get("strand") != exp_strand:
+                    _err(
+                        "UNRES",
+                        f"Unresolved FASTA header strand mismatch for '{exp_id}': "
+                        f"got '{hdr_kv.get('strand')}', expected '{exp_strand}'",
+                    )
+        checked_unresolved += 1
+
+    for exp_id, urows_for_id in referenced_exp_ids.items():
+        if exp_id in unres_hdr_kv:
+            hdr_reason = unres_hdr_kv[exp_id].get("reason")
+            valid_reasons = {r["reason"] for r in urows_for_id}
+            if hdr_reason not in valid_reasons:
                 _err(
                     "UNRES",
-                    f"Unresolved FASTA sequence mismatch for '{exp_id}'",
+                    f"Unresolved FASTA header reason mismatch for '{exp_id}': "
+                    f"got '{hdr_reason}', expected one of {sorted(valid_reasons)}",
                 )
-        checked_unresolved += 1
+
+    for fa_id in unres_fa:
+        if fa_id not in referenced_exp_ids:
+            _err(
+                "UNRES",
+                f"Orphan FASTA record '{fa_id}' in unresolved.fa not referenced by unresolved.tsv",
+            )
 
     # 5. Centromere Accounting & Local Offset Delta Check
     cen_expected = centromere_bed_path is not None or any(
@@ -2824,21 +2940,27 @@ def verify_build_outputs(
                             )
                         return None
 
-                    def _find_by_ref_start(rs_val: int) -> tuple[str, str, int] | None:
+                    def _find_by_ref_start(
+                        rs_val: int,
+                    ) -> tuple[str, str, int, int, int] | None:
                         idx_f = int(np.searchsorted(co.r_s, rs_val, side="left"))
                         if idx_f < int(co.r_s.shape[0]) and int(co.r_s[idx_f]) == rs_val:
+                            prev_pe = int(co.p_e[idx_f - 1]) if idx_f > 0 else 0
                             return (
                                 str(int(co.step_idx[idx_f])),
                                 str(co.nids[idx_f]),
                                 int(co.slot_ins[idx_f]),
+                                prev_pe,
+                                int(co.p_s[idx_f]),
                             )
                         return None
                 else:
                     chrom_offsets = offsets_by_chrom.get(chrom, [])
                     if not chrom_offsets:
                         continue
-                    offset_by_ref_start_c = {
-                        int(r["ref_start"]): r for r in chrom_offsets
+                    offset_idx_by_ref_start_c = {
+                        int(r["ref_start"]): idx_r
+                        for idx_r, r in enumerate(chrom_offsets)
                     }
                     offset_by_ref_end_c = {
                         int(r["ref_end"]): r for r in chrom_offsets
@@ -2855,14 +2977,24 @@ def verify_build_outputs(
                             int(r_row["slot_ins_len"]),
                         )
 
-                    def _find_by_ref_start(rs_val: int) -> tuple[str, str, int] | None:
-                        r_row = offset_by_ref_start_c.get(rs_val)
-                        if r_row is None:
+                    def _find_by_ref_start(
+                        rs_val: int,
+                    ) -> tuple[str, str, int, int, int] | None:
+                        idx_r = offset_idx_by_ref_start_c.get(rs_val)
+                        if idx_r is None:
                             return None
+                        r_row = chrom_offsets[idx_r]
+                        prev_pe = (
+                            int(chrom_offsets[idx_r - 1]["pan_end"])
+                            if idx_r > 0
+                            else 0
+                        )
                         return (
                             r_row["ref_step"],
                             r_row["node_id"],
                             int(r_row["slot_ins_len"]),
+                            prev_pe,
+                            int(r_row["pan_start"]),
                         )
 
                 if anchor_u in ("VIRTUAL_START", ".") or r_s == 0:
@@ -2923,46 +3055,243 @@ def verify_build_outputs(
                         f"Region {rid} has accepted_source_bp={accepted_bp_by_reg[(chrom, rid)]} but no CEN_ISLAND event at ref_end={r_e}",
                     )
 
-                if cen_events_for_reg:
-                    slot_ins_len: int | None = None
-                    if r_e == ref_total_len and chrom in pan_records:
-                        if is_large_offsets:
-                            co_c = compact_offsets_by_chrom.get(chrom)
-                            last_pe_c = (
-                                int(co_c.p_e[-1])
-                                if co_c is not None and int(co_c.p_e.shape[0]) > 0
-                                else 0
-                            )
-                        else:
-                            c_offs = offsets_by_chrom.get(chrom, [])
-                            last_pe_c = int(c_offs[-1]["pan_end"]) if c_offs else 0
-                        slot_ins_len = len(pan_records[chrom]) - last_pe_c
+                slot_ins_len: int | None = None
+                slot_pan_start: int | None = None
+                slot_pan_end: int | None = None
+                if r_e == ref_total_len and chrom in pan_records:
+                    if is_large_offsets:
+                        co_c = compact_offsets_by_chrom.get(chrom)
+                        last_pe_c = (
+                            int(co_c.p_e[-1])
+                            if co_c is not None and int(co_c.p_e.shape[0]) > 0
+                            else 0
+                        )
                     else:
-                        v_mount_info = _find_by_ref_start(r_e)
-                        if v_mount_info is not None:
-                            slot_ins_len = v_mount_info[2]
+                        c_offs = offsets_by_chrom.get(chrom, [])
+                        last_pe_c = int(c_offs[-1]["pan_end"]) if c_offs else 0
+                    slot_pan_start = last_pe_c
+                    slot_pan_end = len(pan_records[chrom])
+                    slot_ins_len = slot_pan_end - slot_pan_start
+                else:
+                    v_mount_info = _find_by_ref_start(r_e)
+                    if v_mount_info is not None:
+                        slot_ins_len = v_mount_info[2]
+                        slot_pan_start = v_mount_info[3]
+                        slot_pan_end = v_mount_info[4]
 
-                    if slot_ins_len is None:
+                if cen_events_for_reg:
+                    if (
+                        slot_ins_len is None
+                        or slot_pan_start is None
+                        or slot_pan_end is None
+                        or chrom not in pan_records
+                    ):
                         _err(
                             "CEN",
                             f"CEN_ISLAND mounted at ref_end={r_e} which is missing from offsets.tsv",
                         )
                     else:
-                        cen_ev_ids = {ev["event_id"] for ev in cen_events_for_reg}
-                        cen_pieces = [
-                            ins
-                            for ins in ins_by_chrom.get(chrom, ())
-                            if ins["event_id"] in cen_ev_ids
-                        ]
-                        cen_bp = sum(
-                            int(cp["pan_end"]) - int(cp["pan_start"])
-                            for cp in cen_pieces
-                        )
-                        if cen_bp <= 0 or slot_ins_len < cen_bp + 2 * eff_spacer_n:
+                        local_offset_delta = slot_pan_end - slot_pan_start
+                        if local_offset_delta != slot_ins_len:
                             _err(
                                 "CEN",
-                                f"Mount point at ref={r_e} slot_ins_len={slot_ins_len} < cen_bp={cen_bp} + 2*spacer_n={2 * eff_spacer_n}",
+                                f"Mount point at ref={r_e} local_offset_delta={local_offset_delta} "
+                                f"!= slot_ins_len={slot_ins_len}",
                             )
+
+                        cen_ev_ids = {ev["event_id"] for ev in cen_events_for_reg}
+                        norm_ev_ids = {
+                            ev["event_id"]
+                            for ev in sv_rows
+                            if ev["chrom"] == chrom
+                            and ev["type"] == "INS"
+                            and int(ev["ref_start"]) == r_e
+                            and int(ev["ref_end"]) == r_e
+                        }
+                        allowed_ev_ids = cen_ev_ids | norm_ev_ids
+
+                        slot_pieces: list[dict[str, str]] = []
+                        for ins_row in ins_by_chrom.get(chrom, ()):
+                            try:
+                                p_s_i = int(ins_row["pan_start"])
+                                p_e_i = int(ins_row["pan_end"])
+                            except ValueError:
+                                continue
+                            overlaps_slot = (
+                                p_s_i < slot_pan_end and p_e_i > slot_pan_start
+                            )
+                            in_allowed = ins_row["event_id"] in allowed_ev_ids
+                            if overlaps_slot or in_allowed:
+                                if not (
+                                    slot_pan_start <= p_s_i < p_e_i <= slot_pan_end
+                                ):
+                                    _err(
+                                        "CEN",
+                                        f"Mount-slot piece {ins_row['event_id']}:{ins_row['piece']} "
+                                        f"[{p_s_i},{p_e_i}) escapes slot [{slot_pan_start},{slot_pan_end})",
+                                    )
+                                    continue
+                                if not in_allowed:
+                                    _err(
+                                        "CEN",
+                                        f"Unexpected piece {ins_row['event_id']}:{ins_row['piece']} "
+                                        f"inside centromere mount slot [{slot_pan_start},{slot_pan_end}) at ref={r_e}",
+                                    )
+                                    continue
+                                slot_pieces.append(ins_row)
+
+                        slot_pieces.sort(
+                            key=lambda r_p: (
+                                int(r_p["pan_start"]),
+                                int(r_p["pan_end"]),
+                            )
+                        )
+                        cen_bp = sum(
+                            int(cp["pan_end"]) - int(cp["pan_start"])
+                            for cp in slot_pieces
+                            if cp["event_id"] in cen_ev_ids
+                        )
+                        normal_ins_bp = sum(
+                            int(np_r["pan_end"]) - int(np_r["pan_start"])
+                            for np_r in slot_pieces
+                            if np_r["event_id"] in norm_ev_ids
+                        )
+
+                        if cen_bp <= 0 or not slot_pieces:
+                            _err(
+                                "CEN",
+                                f"Mount point at ref={r_e} has no valid CEN_ISLAND bases (cen_bp={cen_bp})",
+                            )
+                        else:
+                            pan_up_c = pan_records[chrom].upper()
+                            seen_norm_piece = False
+                            for idx_sp, sp in enumerate(slot_pieces):
+                                ps_i = int(sp["pan_start"])
+                                ev_i = sp["event_id"]
+                                jb_i = sp["join_before"]
+                                if ev_i in norm_ev_ids:
+                                    seen_norm_piece = True
+                                elif seen_norm_piece:
+                                    _err(
+                                        "CEN",
+                                        f"Mount point at ref={r_e} places CEN_ISLAND piece {ev_i} "
+                                        f"after co-mounted normal INS piece (§3.8.4-D)",
+                                    )
+
+                                if idx_sp == 0:
+                                    lead_gap = ps_i - slot_pan_start
+                                    if jb_i != "spacer" or lead_gap != eff_spacer_n:
+                                        _err(
+                                            "CEN",
+                                            f"Mount point at ref={r_e} leading spacer length={lead_gap} "
+                                            f"(join_before='{jb_i}') != spacer_n={eff_spacer_n}",
+                                        )
+                                    elif (
+                                        pan_up_c[slot_pan_start:ps_i]
+                                        != "N" * eff_spacer_n
+                                    ):
+                                        _err(
+                                            "CEN",
+                                            f"Mount point at ref={r_e} leading gap pan[{slot_pan_start}:{ps_i}] is not all 'N'",
+                                        )
+                                else:
+                                    prev_sp = slot_pieces[idx_sp - 1]
+                                    prev_pe_i = int(prev_sp["pan_end"])
+                                    gap_i = ps_i - prev_pe_i
+                                    if ev_i != prev_sp["event_id"] and jb_i != "spacer":
+                                        _err(
+                                            "CEN",
+                                            f"Mount point at ref={r_e} boundary between {prev_sp['event_id']} "
+                                            f"and {ev_i} must have join_before='spacer', got '{jb_i}'",
+                                        )
+                                    if jb_i == "spacer":
+                                        if gap_i != eff_spacer_n:
+                                            _err(
+                                                "CEN",
+                                                f"Mount point at ref={r_e} inter-piece spacer gap={gap_i} "
+                                                f"before {ev_i}:{sp['piece']} != spacer_n={eff_spacer_n} "
+                                                f"(stacked or missing spacer violates §3.8.4-D)",
+                                            )
+                                        elif (
+                                            pan_up_c[prev_pe_i:ps_i]
+                                            != "N" * eff_spacer_n
+                                        ):
+                                            _err(
+                                                "CEN",
+                                                f"Mount point at ref={r_e} inter-piece gap pan[{prev_pe_i}:{ps_i}] is not all 'N'",
+                                            )
+                                    else:
+                                        if gap_i != 0:
+                                            _err(
+                                                "CEN",
+                                                f"Mount point at ref={r_e} non-spacer join '{jb_i}' "
+                                                f"before {ev_i}:{sp['piece']} has non-zero gap={gap_i}",
+                                            )
+
+                            last_pe_slot = int(slot_pieces[-1]["pan_end"])
+                            trail_gap = slot_pan_end - last_pe_slot
+                            expected_trail_gap = (
+                                eff_spacer_n if normal_ins_bp == 0 else 0
+                            )
+                            if trail_gap != expected_trail_gap:
+                                _err(
+                                    "CEN",
+                                    f"Mount point at ref={r_e} trailing gap={trail_gap} != "
+                                    f"expected={expected_trail_gap} (§3.8.4-D / §3.6.4)",
+                                )
+                            elif (
+                                expected_trail_gap > 0
+                                and pan_up_c[last_pe_slot:slot_pan_end]
+                                != "N" * expected_trail_gap
+                            ):
+                                _err(
+                                    "CEN",
+                                    f"Mount point at ref={r_e} trailing gap pan[{last_pe_slot}:{slot_pan_end}] is not all 'N'",
+                                )
+
+                            n_spacer_joins = sum(
+                                1
+                                for idx_sp, sp in enumerate(slot_pieces)
+                                if idx_sp == 0 or sp["join_before"] == "spacer"
+                            ) + (1 if normal_ins_bp == 0 else 0)
+                            expected_spacer_bp = n_spacer_joins * eff_spacer_n
+                            actual_spacer_bp = (
+                                local_offset_delta - cen_bp - normal_ins_bp
+                            )
+                            expected_total_delta = (
+                                cen_bp + normal_ins_bp + expected_spacer_bp
+                            )
+                            if (
+                                actual_spacer_bp != expected_spacer_bp
+                                or local_offset_delta != expected_total_delta
+                            ):
+                                _err(
+                                    "CEN",
+                                    f"Mount point at ref={r_e} local_offset_delta={local_offset_delta} "
+                                    f"!= cen_bp({cen_bp}) + normal_ins_bp({normal_ins_bp}) + "
+                                    f"spacer_bp({expected_spacer_bp}) (§3.8.5)",
+                                )
+                elif (
+                    slot_ins_len is not None
+                    and slot_pan_start is not None
+                    and slot_pan_end is not None
+                ):
+                    norm_ev_ids_empty_cen = {
+                        ev["event_id"]
+                        for ev in sv_rows
+                        if ev["chrom"] == chrom
+                        and ev["type"] == "INS"
+                        and int(ev["ref_start"]) == r_e
+                        and int(ev["ref_end"]) == r_e
+                    }
+                    if not norm_ev_ids_empty_cen and (
+                        slot_ins_len != 0 or slot_pan_end != slot_pan_start
+                    ):
+                        _err(
+                            "CEN",
+                            f"Region {rid} retained 0 CEN_ISLAND representatives and has no normal INS at "
+                            f"ref={r_e}, but slot_ins_len={slot_ins_len} (delta={slot_pan_end - slot_pan_start}) != 0 (§3.8.4-D)",
+                        )
 
     # 6. Lifted GFF3 Verification (when ref_gff_path and {p}.ref.lifted.gff3 exist)
     if ref_gff_path is not None and Path(ref_gff_path).is_file():

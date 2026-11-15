@@ -3916,3 +3916,378 @@ def test_tier5_m7_14_r2_d7_to_d12_right_nested_merge_gff_remap_isoform_status_an
     Path(f"{t_cen_pref}.centromere.tsv").unlink()
     p_no_cen = run_verify(t_cen_pref, comb_gfa, comb_fa, check=False)
     assert p_no_cen.returncode != 0 and "Traceback" not in p_no_cen.stderr
+
+
+def test_tier5_m7_15_p1_1_and_p1_2_gff_gene_isoform_union_and_per_allele_ins_tags_cli(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI E2E regression for P1 Task 1.1 & Task 1.2:
+    1. Multi-isoform `gene` container unions `sv_status` across child `mRNA`s (`utr_insertion,cds_split_by_insertion`
+       on shared-exon gene; `intronic_insertion,cds_split_by_insertion` on cassette-exon-skipping gene)
+       while keeping sibling `mRNA` `sv_status` isolated.
+    2. Multi-allelic `INS` `alleles` field isolates `partial_content=1`, `repeat_residual=1`, and
+       `multi_hit=1` strictly to affected alleles without polluting co-located clean alleles.
+    """
+    n1 = "ATG" + ("GCT" * 29)  # 90 bp
+    n2 = ("GCT" * 29) + "TAA"  # 90 bp
+    intr1 = make_complex_seq(60, seed=11101)
+    n3 = "ATG" + ("CTG" * 28) + "TAA"  # 90 bp
+
+    n4 = "ATG" + ("CAG" * 29)  # 90 bp
+    intr2a = make_complex_seq(30, seed=11102)
+    cas_a = "GAC" * 15  # 45 bp
+    cas_b = "GAC" * 15  # 45 bp
+    intr2b = make_complex_seq(30, seed=11103)
+    n5 = ("CAG" * 29) + "TGA"  # 90 bp
+
+    clean_ins = make_complex_seq(600, seed=11111)
+    part_ins = make_complex_seq(640, seed=11112) + make_satellite_seq(
+        unit_len=12, total_len=1550, seed=11113
+    )
+    mh_ins = make_complex_seq(520, seed=11114)
+    full_sat = make_satellite_seq(unit_len=11, total_len=1600, seed=11115)
+
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    for nid, seq in [
+        ("n1", n1),
+        ("n2", n2),
+        ("intr1", intr1),
+        ("n3", n3),
+        ("n4", n4),
+        ("intr2a", intr2a),
+        ("cas_a", cas_a),
+        ("cas_b", cas_b),
+        ("intr2b", intr2b),
+        ("n5", n5),
+        ("clean_ins", clean_ins),
+        ("part_ins", part_ins),
+        ("mh_ins", mh_ins),
+        ("full_sat", full_sat),
+    ]:
+        b.add_node(nid, seq)
+
+    b.set_ref_path(
+        "Ref#1#Chr01",
+        ["n1+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+    clean_ins2 = make_complex_seq(580, seed=11116)
+    b.add_node("clean_ins2", clean_ins2)
+    b.add_path(
+        "Clean#1#Chr01",
+        ["n1+", "clean_ins+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "clean_ins2+", "cas_b+", "intr2b+", "n5+"],
+    )
+    b.add_path(
+        "Partial#1#Chr01",
+        ["n1+", "part_ins+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+    # Backbone anchor n2+ visited twice -> §3.4.1 multi_hit=1 on MultiHit#1 at (n1, n2)
+    b.add_path(
+        "MultiHit#1#Chr01",
+        ["n1+", "mh_ins+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n2+", "n5+"],
+    )
+    b.add_path(
+        "FullSat#1#Chr01",
+        ["n1+", "full_sat+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+
+    sec_m = make_complex_seq(100, seed=11117)
+    sec_b_extra = make_complex_seq(100, seed=11120)
+    sec_u = make_complex_seq(100, seed=11118)
+    sec_novel = make_complex_seq(100, seed=11119)
+    b.add_node("sec_m", sec_m)
+    b.add_node("sec_b_extra", sec_b_extra)
+    b.add_node("sec_u", sec_u)
+    b.add_node("sec_novel", sec_novel)
+    b.add_path(
+        "SecBack1#1#Chr01",
+        ["n1+", "sec_m+", "sec_b_extra+", "sec_m+", "sec_u+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+    b.add_path(
+        "SecBack2#1#Chr01",
+        ["n1+", "sec_m+", "sec_b_extra+", "sec_m+", "sec_u+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+    b.add_path(
+        "SecRep#1#Chr01",
+        ["n1+", "sec_m+", "sec_novel+", "sec_u+", "n2+", "intr1+", "n3+", "n4+", "intr2a+", "cas_a+", "cas_b+", "intr2b+", "n5+"],
+    )
+
+    b.gff_lines.extend(
+        [
+            "Chr01\tsrc\tgene\t1\t330\t.\t+\t.\tID=g_shared",
+            "Chr01\tsrc\tmRNA\t1\t330\t.\t+\t.\tID=tx_s1;Parent=g_shared",
+            "Chr01\tsrc\tmRNA\t1\t330\t.\t+\t.\tID=tx_s2;Parent=g_shared",
+            "Chr01\tsrc\texon\t1\t180\t.\t+\t.\tID=ex_s1;Parent=tx_s1,tx_s2",
+            "Chr01\tsrc\texon\t241\t330\t.\t+\t.\tID=ex_s2;Parent=tx_s1,tx_s2",
+            "Chr01\tsrc\tCDS\t1\t180\t.\t+\t0\tID=cds_s1;Parent=tx_s1",
+            "Chr01\tsrc\tthree_prime_UTR\t241\t330\t.\t+\t.\tID=utr_s1;Parent=tx_s1",
+            "Chr01\tsrc\tfive_prime_UTR\t1\t180\t.\t+\t.\tID=utr_s2;Parent=tx_s2",
+            "Chr01\tsrc\tCDS\t241\t330\t.\t+\t0\tID=cds_s2;Parent=tx_s2",
+            "Chr01\tsrc\tgene\t331\t660\t.\t+\t.\tID=g_cassette",
+            "Chr01\tsrc\tmRNA\t331\t660\t.\t+\t.\tID=tx_c1;Parent=g_cassette",
+            "Chr01\tsrc\tmRNA\t331\t660\t.\t+\t.\tID=tx_c2;Parent=g_cassette",
+            "Chr01\tsrc\texon\t331\t420\t.\t+\t.\tID=ex_c1;Parent=tx_c1,tx_c2",
+            "Chr01\tsrc\texon\t451\t540\t.\t+\t.\tID=ex_cas;Parent=tx_c1",
+            "Chr01\tsrc\texon\t571\t660\t.\t+\t.\tID=ex_c3;Parent=tx_c1,tx_c2",
+            "Chr01\tsrc\tCDS\t331\t420\t.\t+\t0\tID=cds_c1a;Parent=tx_c1",
+            "Chr01\tsrc\tCDS\t451\t540\t.\t+\t0\tID=cds_cas;Parent=tx_c1",
+            "Chr01\tsrc\tCDS\t571\t660\t.\t+\t0\tID=cds_c1b;Parent=tx_c1",
+            "Chr01\tsrc\tCDS\t331\t420\t.\t+\t0\tID=cds_c2a;Parent=tx_c2",
+            "Chr01\tsrc\tCDS\t571\t660\t.\t+\t0\tID=cds_c2b;Parent=tx_c2",
+        ]
+    )
+
+    inputs = b.write("cli_p1_1_2")
+    _, bundle = run_build(inputs, extra_args=["--ref-gff", str(inputs.gff_path)])
+    assert bundle is not None
+    assert_all_global_invariants(bundle, inputs.gfa_path, inputs.ref_fa_path)
+    assert_gff3_liftover_integrity(
+        inputs.ref_fa_path, inputs.gff_path, bundle.pan_fa_path, bundle.lifted_gff_path
+    )
+    run_verify(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--ref-gff", str(inputs.gff_path)],
+        check=True,
+    )
+
+    assert bundle.lifted_gff_rows is not None
+    gff_by_id = {
+        r["attributes"]["ID"]: r["attributes"]
+        for r in bundle.lifted_gff_rows
+        if r["type"] in ("gene", "mRNA")
+    }
+    assert gff_by_id["tx_s1"]["sv_status"] == "cds_split_by_insertion"
+    assert gff_by_id["tx_s2"]["sv_status"] == "utr_insertion"
+    assert gff_by_id["g_shared"]["sv_status"] == "utr_insertion,cds_split_by_insertion"
+
+    assert gff_by_id["tx_c1"]["sv_status"] == "cds_split_by_insertion"
+    assert gff_by_id["tx_c2"]["sv_status"] == "intronic_insertion"
+    assert gff_by_id["g_cassette"]["sv_status"] == "intronic_insertion,cds_split_by_insertion"
+
+    ins_by_ref = {int(r["ref_start"]): r for r in bundle.sv_rows if r["type"] == "INS"}
+    ev90 = ins_by_ref[90]
+    gt90 = bundle.genotypes[ev90["event_id"]]
+    assert gt90["FullSat#1"] == "."
+    assert gt90["SecBack1#1"] == gt90["SecBack2#1"]
+    amap90 = dict(e.split(":", 1) for e in str(ev90["alleles"]).split(";"))
+    for clean_gt in (gt90["Clean#1"], gt90["SecBack1#1"]):
+        assert "partial_content=1" not in amap90[clean_gt]
+        assert "repeat_residual=1" not in amap90[clean_gt]
+        assert "multi_hit=1" not in amap90[clean_gt]
+    assert "partial_content=1" in amap90[gt90["Partial#1"]]
+    assert "repeat_residual=1" not in amap90[gt90["Partial#1"]]
+    assert "multi_hit=1" not in amap90[gt90["Partial#1"]]
+    assert "multi_hit=1" in amap90[gt90["MultiHit#1"]]
+    assert "partial_content=1" not in amap90[gt90["MultiHit#1"]]
+    assert "repeat_residual=1" not in amap90[gt90["MultiHit#1"]]
+    assert "repeat_residual=1" in amap90[gt90["SecRep#1"]]
+    assert "multi_hit=1" not in amap90[gt90["SecRep#1"]]
+    assert "partial_content=1" not in amap90[gt90["SecRep#1"]]
+
+
+def test_tier5_m7_16_p1_3_and_p1_4_cen_mount_stacked_spacer_and_unresolved_header_tamper_cli(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI E2E regression for P1 Task 1.3 & Task 1.4:
+    1. `unresolved.fa` FASTA headers include standalone `reason=<...> src=<path>:<start>-<end> strand=<±>`,
+       and `panflat verify` exits non-zero (`1`) when `strand=` or `src=` is tampered.
+    2. C14 co-mounted `CEN_ISLAND` + normal `INS` tampered with a stacked `2 * spacer_n` gap
+       (with all downstream `pan.fa`, `offsets.tsv`, `ref_to_pan.chain`, `sv.tsv`, `inserts.tsv`
+       shifted consistently) is rejected by `panflat verify` (`[CEN]`).
+    """
+    import shutil
+
+    spacer_n = 100
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("r0", make_complex_seq(250, seed=11201))
+    b.add_node("u", make_complex_seq(250, seed=11202))
+    b.add_node("cen_ref", make_complex_seq(400, seed=11203))
+    b.add_node("v", make_complex_seq(250, seed=11204))
+    b.add_node("r_end", make_complex_seq(250, seed=11205))
+    b.add_node("up_ins", make_complex_seq(180, seed=11206))
+    b.add_node("cen_isl", make_complex_seq(620, seed=11207))
+    b.add_node("co_ins", make_complex_seq(210, seed=11208))
+    b.add_node("un_tail", make_complex_seq(150, seed=11209))
+
+    b.set_ref_path("Ref#1#Chr01", ["r0+", "u+", "cen_ref+", "v+", "r_end+"])
+    b.add_path("HapCen#1#Chr01", ["r0+", "up_ins+", "u+", "cen_isl+", "v+", "r_end+"])
+    # Reversed partial contig (omitting u-) so UNANCHORED_END has src_strand='-' AND co-mounted normal INS at ref=900
+    b.add_path("HapNormRev#1#Chr01", ["r_end-", "v-", "co_ins-", "cen_ref-", "un_tail-"])
+    b.add_bed_region(520, 880, "CEN_MAIN")
+
+    inputs = b.write("cli_p1_3_4")
+    _, bundle = run_build(
+        inputs,
+        extra_args=[
+            "--centromere-mode",
+            "extract-islands",
+            "--centromere-min-island",
+            "500",
+            "--spacer-n",
+            str(spacer_n),
+        ],
+    )
+    assert bundle is not None
+    assert_all_global_invariants(bundle, inputs.gfa_path, inputs.ref_fa_path)
+    assert_centromere_accounting_and_offsets(bundle, spacer_n=spacer_n)
+    run_verify(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--centromere-bed", str(inputs.bed_path), "--spacer-n", str(spacer_n)],
+        check=True,
+    )
+
+    # Check standalone `strand=-` in unresolved.fa header
+    assert len(bundle.unresolved_fa) == 1
+    exp_id, (full_hdr, _) = next(iter(bundle.unresolved_fa.items()))
+    hdr_kv = dict(t.split("=", 1) for t in full_hdr.split()[1:])
+    assert hdr_kv["reason"] == "UNANCHORED_END"
+    assert hdr_kv["strand"] == "-"
+    assert "(" not in hdr_kv["src"]
+
+    # Tamper 1: Flip strand=- -> strand=+ in unresolved.fa -> CLI verify must fail with exit code 1
+    t_ufa_dir = tmp_path / "tamper_ufa_hdr"
+    t_ufa_dir.mkdir()
+    for fp in inputs.out_prefix.parent.glob(f"{inputs.out_prefix.name}.*"):
+        shutil.copy2(fp, t_ufa_dir / fp.name)
+    t_ufa_pref = t_ufa_dir / inputs.out_prefix.name
+    ufa_p = Path(f"{t_ufa_pref}.unresolved.fa")
+    ufa_p.write_text(
+        ufa_p.read_text(encoding="utf-8").replace("strand=-", "strand=+", 1),
+        encoding="utf-8",
+    )
+    res_ufa = run_verify(t_ufa_pref, inputs.gfa_path, inputs.ref_fa_path, check=False)
+    assert (
+        res_ufa.returncode == 1
+        and "[UNRES]" in res_ufa.stderr
+        and "Traceback" not in res_ufa.stderr
+    )
+
+    # Tamper 2: Consistently inject stacked 2*spacer_n between CEN_ISLAND and co-mounted normal INS
+    t_cen_dir = tmp_path / "tamper_cen_stacked"
+    t_cen_dir.mkdir()
+    for fp in inputs.out_prefix.parent.glob(f"{inputs.out_prefix.name}.*"):
+        shutil.copy2(fp, t_cen_dir / fp.name)
+    t_cen_pref = t_cen_dir / inputs.out_prefix.name
+
+    norm_ev = next(
+        ev for ev in bundle.sv_rows if ev["type"] == "INS" and int(ev["ref_start"]) == 900
+    )
+    norm_piece = next(
+        ins for ins in bundle.inserts if ins["event_id"] == norm_ev["event_id"]
+    )
+    insert_pos = int(norm_piece["pan_start"])
+
+    # Shift pan.fa, offsets.tsv, ref_to_pan.chain, inserts.tsv, sv.tsv by +spacer_n
+    pan_lines = Path(f"{t_cen_pref}.pan.fa").read_text(encoding="utf-8").splitlines()
+    pan_seq_new = (
+        "".join(pan_lines[1:])[:insert_pos]
+        + ("N" * spacer_n)
+        + "".join(pan_lines[1:])[insert_pos:]
+    )
+    Path(f"{t_cen_pref}.pan.fa").write_text(
+        f"{pan_lines[0]}\n{pan_seq_new}\n", encoding="utf-8"
+    )
+
+    off_lines = Path(f"{t_cen_pref}.offsets.tsv").read_text(encoding="utf-8").splitlines()
+    oh = {k: i for i, k in enumerate(off_lines[0].lstrip("#").split("\t"))}
+    new_off = [off_lines[0]]
+    step_tups: list[tuple[int, int, int, int, int, int]] = []
+    for line in off_lines[1:]:
+        cols = line.split("\t")
+        ps = int(cols[oh["pan_start"]])
+        pe = int(cols[oh["pan_end"]])
+        sins = int(cols[oh["slot_ins_len"]])
+        prev_pe_b = ps - sins
+        if ps >= insert_pos:
+            ps += spacer_n
+            pe += spacer_n
+            if prev_pe_b <= insert_pos:
+                sins += spacer_n
+        cols[oh["pan_start"]] = str(ps)
+        cols[oh["pan_end"]] = str(pe)
+        cols[oh["slot_ins_len"]] = str(sins)
+        new_off.append("\t".join(cols))
+        step_tups.append(
+            (
+                int(cols[oh["ref_step"]]),
+                int(cols[oh["ref_start"]]),
+                int(cols[oh["ref_end"]]),
+                ps,
+                pe,
+                sins,
+            )
+        )
+    Path(f"{t_cen_pref}.offsets.tsv").write_text("\n".join(new_off) + "\n", encoding="utf-8")
+
+    ch_hdr = next(
+        ln.split()
+        for ln in Path(f"{t_cen_pref}.ref_to_pan.chain").read_text(encoding="utf-8").splitlines()
+        if ln.startswith("chain ")
+    )
+    ch_hdr[8] = str(len(pan_seq_new))
+    ch_hdr[11] = str(step_tups[-1][4])
+    blks: list[tuple[int, int, int]] = []
+    c_rs, c_re = step_tups[0][1], step_tups[0][2]
+    for st_i in range(1, len(step_tups)):
+        _, rs_i, re_i, _, _, sins_i = step_tups[st_i]
+        if sins_i > 0:
+            blks.append((c_rs, c_re, sins_i))
+            c_rs, c_re = rs_i, re_i
+        else:
+            c_re = re_i
+    blks.append((c_rs, c_re, 0))
+    ch_out = [" ".join(ch_hdr)]
+    for b_rs, b_re, b_dq in blks:
+        ch_out.append(f"# block\t{b_rs}\t{b_re}\t{b_dq}")
+        ch_out.append(f"{b_re - b_rs}\t0\t{b_dq}" if b_dq > 0 else f"{b_re - b_rs}")
+    for st_t in step_tups:
+        ch_out.append(
+            f"# step\t{st_t[0]}\t{st_t[1]}\t{st_t[2]}\t{st_t[3]}\t{st_t[4]}\t{st_t[5]}"
+        )
+    Path(f"{t_cen_pref}.ref_to_pan.chain").write_text(
+        "\n".join(ch_out) + "\n\n", encoding="utf-8"
+    )
+
+    ins_lines = Path(f"{t_cen_pref}.inserts.tsv").read_text(encoding="utf-8").splitlines()
+    new_ins = [ins_lines[0]]
+    ev_spans: dict[str, list[int]] = {}
+    for line in ins_lines[1:]:
+        cols = line.split("\t")
+        ps, pe = int(cols[1]), int(cols[2])
+        if ps >= insert_pos:
+            ps += spacer_n
+            pe += spacer_n
+        cols[1], cols[2] = str(ps), str(pe)
+        ev_id = cols[3]
+        if ev_id not in ev_spans:
+            ev_spans[ev_id] = [ps, pe]
+        else:
+            ev_spans[ev_id][0] = min(ev_spans[ev_id][0], ps)
+            ev_spans[ev_id][1] = max(ev_spans[ev_id][1], pe)
+        new_ins.append("\t".join(cols))
+    Path(f"{t_cen_pref}.inserts.tsv").write_text("\n".join(new_ins) + "\n", encoding="utf-8")
+
+    sv_lines = Path(f"{t_cen_pref}.sv.tsv").read_text(encoding="utf-8").splitlines()
+    new_sv = [sv_lines[0]]
+    for line in sv_lines[1:]:
+        cols = line.split("\t")
+        if cols[3] in ev_spans:
+            cols[1], cols[2] = str(ev_spans[cols[3]][0]), str(ev_spans[cols[3]][1])
+        new_sv.append("\t".join(cols))
+    Path(f"{t_cen_pref}.sv.tsv").write_text("\n".join(new_sv) + "\n", encoding="utf-8")
+
+    res_cen = run_verify(
+        t_cen_pref,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--centromere-bed", str(inputs.bed_path), "--spacer-n", str(spacer_n)],
+        check=False,
+    )
+    assert (
+        res_cen.returncode == 1
+        and "[CEN]" in res_cen.stderr
+        and "Traceback" not in res_cen.stderr
+    )
