@@ -23,7 +23,6 @@ from panflat.models import (
     CLIArgumentError,
     InputContractError,
     InsertionSlotBlock,
-    PathFragment,
     Piece,
     Step,
     StepProvenance,

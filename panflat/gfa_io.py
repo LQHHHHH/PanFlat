@@ -5,11 +5,12 @@ import collections
 import hashlib
 from pathlib import Path
 import re
-from typing import Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
 from panflat.models import (
+    MAX_COMPACT_NID,
     BuildConfig,
     CLIArgumentError,
     CompactLinkSet,
@@ -24,6 +25,7 @@ from panflat.models import (
     PathFragment,
     Step,
     StepProvenance,
+    is_compact_nid_str,
 )
 
 _REVCOMP_TABLE = str.maketrans(
@@ -35,10 +37,15 @@ _P_STEP_RE = re.compile(r"^([^\s,+\-]+)([+\-])$")
 _W_WALK_RE = re.compile(r"^([><][^><\s]+)+$")
 _W_STEP_RE = re.compile(r"([><])([^><\s]+)")
 
-_FAST_P_SEG_RE = re.compile(r"^[0-9]+[+\-](?:,[0-9]+[+\-])*$")
-_FAST_P_OV_RE = re.compile(r"^(?:0M|\*)(?:,(?:0M|\*))*$")
+_FAST_P_SEG_RE = re.compile(
+    r"^[1-9][0-9]{0,7}[+\-](?:,[1-9][0-9]{0,7}[+\-])*$", re.ASCII
+)
+_FAST_P_OV_RE = re.compile(r"^(?:0M|\*)(?:,(?:0M|\*))*$", re.ASCII)
+_FAST_W_WALK_RE = re.compile(r"^(?:[><][1-9][0-9]{0,7})+$", re.ASCII)
 _DROP_SIGN_TABLE = str.maketrans("", "", "+-")
+_W_SEP_TABLE = str.maketrans("><", ",,")
 _DIGITS_COMMA_BYTES = b"0123456789,"
+_DIGITS_BYTES = b"0123456789"
 
 
 def _flip_orient(orient: str) -> Literal["+", "-"]:
@@ -56,21 +63,8 @@ def revcomp(seq: str) -> str:
 
 def spell_steps(steps: Sequence[Step], nodes: Mapping[str, str]) -> str:
     """Spell the concatenated nucleotide sequence of a sequence of Steps (full or partial)."""
-    if isinstance(steps, LazyStepTuple) and isinstance(nodes, CompactNodeStore):
-        seq_bytes = nodes._seq_bytes
-        offsets = nodes._offsets
-        node_lens = nodes._node_lens
-        max_nid = nodes._max_nid
-        parts_fast: list[str] = []
-        for c in steps._codes.tolist():
-            nid = c if c > 0 else -c
-            if nid < 1 or nid > max_nid or int(node_lens[nid]) <= 0:
-                raise InputContractError(f"Unknown node ID '{nid}' in step walk")
-            s = int(offsets[nid])
-            e = int(offsets[nid + 1])
-            raw = seq_bytes[s:e].decode("ascii")
-            parts_fast.append(raw if c > 0 else revcomp(raw))
-        return "".join(parts_fast)
+    if isinstance(steps, LazyStepTuple):
+        return steps.spell(nodes)
 
     parts: list[str] = []
     for step in steps:
@@ -121,18 +115,8 @@ def parse_fasta(
         if current_keep:
             records[current_name] = "".join(current_chunks)
 
-    is_large_fa = fasta_path.stat().st_size > 10_000_000
     with fasta_path.open("r", encoding="utf-8") as fh:
         for line_no, raw_line in enumerate(fh, start=1):
-            if (
-                is_large_fa
-                and not current_keep
-                and current_name is not None
-                and raw_line[:1] != ">"
-            ):
-                if raw_line.strip():
-                    current_has_seq = True
-                continue
             line = raw_line.strip()
             if not line:
                 continue
@@ -159,16 +143,21 @@ def parse_fasta(
                     raise InputContractError(
                         f"FASTA sequence data before header at line {line_no} in '{path}'"
                     )
-                chunk = "".join(line.split()).upper()
-                if not chunk:
-                    continue
-                if not chunk.isalpha():
-                    raise InputContractError(
-                        f"Non-alphabetic characters in FASTA record '{current_name}' in '{path}'"
-                    )
-                current_has_seq = True
-                if current_keep:
-                    current_chunks.append(chunk)
+                if line.isascii() and line.isalpha():
+                    current_has_seq = True
+                    if current_keep:
+                        current_chunks.append(line.upper())
+                else:
+                    chunk = "".join(line.split())
+                    if not chunk:
+                        continue
+                    if not (chunk.isascii() and chunk.isalpha()):
+                        raise InputContractError(
+                            f"Non-alphabetic characters in FASTA record '{current_name}' in '{path}'"
+                        )
+                    current_has_seq = True
+                    if current_keep:
+                        current_chunks.append(chunk.upper())
 
     if not saw_nonempty_line:
         raise InputContractError(f"FASTA file is empty: '{path}'")
@@ -201,6 +190,7 @@ def _load_reference_fasta_for_fragment(
     first_name: str | None = None
     first_seq: str | None = None
     matched_pansn_seq: str | None = None
+    matched_pansn_count = 0
 
     current_name: str | None = None
     current_chunks: list[str] = []
@@ -209,7 +199,7 @@ def _load_reference_fasta_for_fragment(
     saw_nonempty_line = False
 
     def _flush_current() -> None:
-        nonlocal first_name, first_seq, matched_pansn_seq
+        nonlocal first_name, first_seq, matched_pansn_seq, matched_pansn_count
         if current_name is None:
             return
         if not current_has_seq:
@@ -222,20 +212,11 @@ def _load_reference_fasta_for_fragment(
                 first_name = current_name
                 first_seq = seq_val
             if "#" in current_name and current_name in target_pansn_names:
+                matched_pansn_count += 1
                 matched_pansn_seq = seq_val
 
-    is_large_fa = fasta_path.stat().st_size > 10_000_000
     with fasta_path.open("r", encoding="utf-8") as fh:
         for line_no, raw_line in enumerate(fh, start=1):
-            if (
-                is_large_fa
-                and not current_keep
-                and current_name is not None
-                and raw_line[:1] != ">"
-            ):
-                if raw_line.strip():
-                    current_has_seq = True
-                continue
             line = raw_line.strip()
             if not line:
                 continue
@@ -266,16 +247,21 @@ def _load_reference_fasta_for_fragment(
                     raise InputContractError(
                         f"FASTA sequence data before header at line {line_no} in '{fasta_file_path}'"
                     )
-                chunk = "".join(line.split()).upper()
-                if not chunk:
-                    continue
-                if not chunk.isalpha():
-                    raise InputContractError(
-                        f"Non-alphabetic characters in FASTA record '{current_name}' in '{fasta_file_path}'"
-                    )
-                current_has_seq = True
-                if current_keep:
-                    current_chunks.append(chunk)
+                if line.isascii() and line.isalpha():
+                    current_has_seq = True
+                    if current_keep:
+                        current_chunks.append(line.upper())
+                else:
+                    chunk = "".join(line.split())
+                    if not chunk:
+                        continue
+                    if not (chunk.isascii() and chunk.isalpha()):
+                        raise InputContractError(
+                            f"Non-alphabetic characters in FASTA record '{current_name}' in '{fasta_file_path}'"
+                        )
+                    current_has_seq = True
+                    if current_keep:
+                        current_chunks.append(chunk.upper())
 
     if not saw_nonempty_line:
         raise InputContractError(f"FASTA file is empty: '{fasta_file_path}'")
@@ -289,6 +275,12 @@ def _load_reference_fasta_for_fragment(
         if "#" in first_name and first_name in target_pansn_names:
             return ref_fragment.seqid, first_seq
         return first_name, first_seq
+
+    if matched_pansn_count > 1:
+        raise InputContractError(
+            f"Ambiguous reference FASTA '{fasta_file_path}': found {matched_pansn_count} "
+            f"records matching reference path '{ref_fragment.src_path}'"
+        )
 
     if matched_pansn_seq is not None:
         return ref_fragment.seqid, matched_pansn_seq
@@ -537,34 +529,36 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                 b_parts = raw_bytes_line.rstrip(b"\r\n").split(b"\t")
                 if (
                     len(b_parts) == 3
+                    and 1 <= len(b_parts[1]) <= 8
                     and b_parts[1].isdigit()
                     and b_parts[1][0] != 48
                     and b_parts[2].isalpha()
                 ):
                     nid_int = int(b_parts[1])
-                    if (
-                        (
-                            nid_int < len(node_lens_arr)
-                            and node_lens_arr[nid_int] > 0
-                        )
-                        or nid_int in out_of_order_int_nodes
-                    ):
-                        raise InputContractError(
-                            f"Duplicate S node ID '{nid_int}' at line {line_no}"
-                        )
-                    seq_b = b_parts[2].upper()
-                    if (
-                        nid_int == expected_next_nid
-                        and not out_of_order_int_nodes
-                    ):
-                        seq_buf.extend(seq_b)
-                        node_lens_arr.append(len(seq_b))
-                        expected_next_nid += 1
-                    else:
-                        out_of_order_int_nodes[nid_int] = seq_b
-                    if nid_int > max_int_nid:
-                        max_int_nid = nid_int
-                    continue
+                    if nid_int <= MAX_COMPACT_NID:
+                        if (
+                            (
+                                nid_int < len(node_lens_arr)
+                                and node_lens_arr[nid_int] > 0
+                            )
+                            or nid_int in out_of_order_int_nodes
+                        ):
+                            raise InputContractError(
+                                f"Duplicate S node ID '{nid_int}' at line {line_no}"
+                            )
+                        seq_b = b_parts[2].upper()
+                        if (
+                            nid_int == expected_next_nid
+                            and not out_of_order_int_nodes
+                        ):
+                            seq_buf.extend(seq_b)
+                            node_lens_arr.append(len(seq_b))
+                            expected_next_nid += 1
+                        else:
+                            out_of_order_int_nodes[nid_int] = seq_b
+                        if nid_int > max_int_nid:
+                            max_int_nid = nid_int
+                        continue
             elif first_byte == b"L\t":
                 saw_nonempty_gfa = True
                 b_parts = raw_bytes_line.rstrip(b"\r\n").split(b"\t")
@@ -573,6 +567,8 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     and b_parts[5] == b"0M"
                     and b_parts[2] in (b"+", b"-")
                     and b_parts[4] in (b"+", b"-")
+                    and 1 <= len(b_parts[1]) <= 8
+                    and 1 <= len(b_parts[3]) <= 8
                     and b_parts[1].isdigit()
                     and b_parts[3].isdigit()
                     and b_parts[1][0] != 48
@@ -580,20 +576,21 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                 ):
                     u_int = int(b_parts[1])
                     v_int = int(b_parts[3])
-                    n_l_arr = len(node_lens_arr)
-                    if (
-                        u_int >= n_l_arr
-                        or v_int >= n_l_arr
-                        or node_lens_arr[u_int] <= 0
-                        or node_lens_arr[v_int] <= 0
-                    ):
-                        deferred_int_links.append((line_no, u_int, v_int))
-                    uc = (u_int << 1) | (0 if b_parts[2] == b"+" else 1)
-                    vc = (v_int << 1) | (0 if b_parts[4] == b"+" else 1)
-                    fwd = (uc << 32) | vc
-                    rev = ((vc ^ 1) << 32) | (uc ^ 1)
-                    canon_links_arr.append(fwd if fwd <= rev else rev)
-                    continue
+                    if u_int <= MAX_COMPACT_NID and v_int <= MAX_COMPACT_NID:
+                        n_l_arr = len(node_lens_arr)
+                        if (
+                            u_int >= n_l_arr
+                            or v_int >= n_l_arr
+                            or node_lens_arr[u_int] <= 0
+                            or node_lens_arr[v_int] <= 0
+                        ):
+                            deferred_int_links.append((line_no, u_int, v_int))
+                        uc = (u_int << 1) | (0 if b_parts[2] == b"+" else 1)
+                        vc = (v_int << 1) | (0 if b_parts[4] == b"+" else 1)
+                        fwd = (uc << 32) | vc
+                        rev = ((vc ^ 1) << 32) | (uc ^ 1)
+                        canon_links_arr.append(fwd if fwd <= rev else rev)
+                        continue
 
             stripped_b = raw_bytes_line.strip()
             if not stripped_b:
@@ -632,7 +629,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     raise InputContractError(
                         f"Missing node sequence ('{seq}') for node '{node_id}' at line {line_no}"
                     )
-                if not seq.isalpha():
+                if not (seq.isascii() and seq.isalpha()):
                     raise InputContractError(
                         f"Invalid characters in sequence for node '{node_id}' at line {line_no}"
                     )
@@ -651,7 +648,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                                     f"for node '{node_id}' at line {line_no}"
                                 )
                 seq_up = seq.upper()
-                if node_id.isdigit() and int(node_id) >= 1 and str(int(node_id)) == node_id:
+                if is_compact_nid_str(node_id):
                     nid_int = int(node_id)
                     if (
                         (nid_int < len(node_lens_arr) and node_lens_arr[nid_int] > 0)
@@ -696,12 +693,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                         f"Non-zero or unknown L overlap '{overlap}' at line {line_no} "
                         f"(only '0M' is allowed by §2.1)"
                     )
-                if (
-                    from_id.isdigit()
-                    and to_id.isdigit()
-                    and str(int(from_id)) == from_id
-                    and str(int(to_id)) == to_id
-                ):
+                if is_compact_nid_str(from_id) and is_compact_nid_str(to_id):
                     u_int = int(from_id)
                     v_int = int(to_id)
                     if (
@@ -735,21 +727,46 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
         raise InputContractError(f"GFA file is empty: '{config.gfa}'")
     gfa_sha256 = hasher.hexdigest()
 
-    # Finalize node storage
-    if out_of_order_int_nodes:
-        # Rebuild sequential buffer up to max_int_nid
-        new_seq_buf = bytearray()
-        new_lens = np.zeros(max_int_nid + 1, dtype=np.int32)
+    # Finalize node storage (demoting sparse compact integer IDs to extra_nodes if needed)
+    raw_int_count = (expected_next_nid - 1) + len(out_of_order_int_nodes)
+    extra_links_set: set[tuple[str, str, str, str]] = set()
+    if max_int_nid > max(65_536, 16 * max(1, raw_int_count)):
         cur_off = 0
         for nid in range(1, expected_next_nid):
             slen = node_lens_arr[nid]
-            new_seq_buf.extend(seq_buf[cur_off : cur_off + slen])
-            new_lens[nid] = slen
+            extra_nodes[str(nid)] = seq_buf[cur_off : cur_off + slen].decode("ascii")
             cur_off += slen
-        for nid in sorted(out_of_order_int_nodes.keys()):
-            sb = out_of_order_int_nodes[nid]
-            # Place in sequential order by rebuilding full array
-        # Full rebuild in exact 1..max_int_nid order
+        for nid, sb in out_of_order_int_nodes.items():
+            extra_nodes[str(nid)] = sb.decode("ascii")
+        out_of_order_int_nodes.clear()
+        del seq_buf, node_lens_arr
+
+        for l_no, u_int, v_int in deferred_int_links:
+            if str(u_int) not in extra_nodes:
+                raise InputContractError(
+                    f"L line at line {l_no} references unknown node '{u_int}'"
+                )
+            if str(v_int) not in extra_nodes:
+                raise InputContractError(
+                    f"L line at line {l_no} references unknown node '{v_int}'"
+                )
+        deferred_int_links.clear()
+        for val in canon_links_arr:
+            uc = (val >> 32) & 0xFFFFFFFF
+            vc = val & 0xFFFFFFFF
+            u_id = str(uc >> 1)
+            uo = "-" if (uc & 1) else "+"
+            v_id = str(vc >> 1)
+            vo = "-" if (vc & 1) else "+"
+            extra_links_set.add((u_id, uo, v_id, vo))
+            extra_links_set.add(
+                (v_id, _flip_orient(vo), u_id, _flip_orient(uo))
+            )
+        del canon_links_arr[:]
+        max_int_nid = 0
+        seq_bytes = b""
+        node_lens_np = np.zeros(1, dtype=np.int32)
+    elif out_of_order_int_nodes:
         new_seq_buf = bytearray()
         new_lens = np.zeros(max_int_nid + 1, dtype=np.int32)
         in_order_slices: dict[int, bytes] = {}
@@ -760,11 +777,10 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
             cur_off += slen
         in_order_slices.update(out_of_order_int_nodes)
         out_of_order_int_nodes.clear()
-        for nid in range(1, max_int_nid + 1):
-            sb = in_order_slices.get(nid)
-            if sb is not None:
-                new_seq_buf.extend(sb)
-                new_lens[nid] = len(sb)
+        for nid in sorted(in_order_slices.keys()):
+            sb = in_order_slices[nid]
+            new_seq_buf.extend(sb)
+            new_lens[nid] = len(sb)
         in_order_slices.clear()
         seq_bytes = bytes(new_seq_buf)
         del new_seq_buf, seq_buf, node_lens_arr
@@ -805,7 +821,6 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
             )
     deferred_int_links.clear()
 
-    extra_links_set: set[tuple[str, str, str, str]] = set()
     for l_no, from_id, from_orient, to_id, to_orient in extra_raw_links:
         if from_id not in nodes_store:
             raise InputContractError(
@@ -870,10 +885,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     f"Empty step list in P line '{path_name}' at line {line_no}"
                 )
 
-            if use_fast_int_paths and (
-                (len(seg_str) > 100_000 and seg_str[-1] in "+-")
-                or bool(_FAST_P_SEG_RE.match(seg_str))
-            ):
+            if use_fast_int_paths and bool(_FAST_P_SEG_RE.match(seg_str)):
                 nids = np.fromstring(
                     seg_str.translate(_DROP_SIGN_TABLE), dtype=np.int32, sep=","
                 )
@@ -1056,54 +1068,127 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     f"Malformed walk string '{walk_str}' in W line at line {line_no}"
                 )
 
-            w_steps: list[Step] = []
-            for m in _W_STEP_RE.finditer(walk_str):
-                sym, nid = m.group(1), m.group(2)
-                if nid not in nodes_store:
+            if use_fast_int_paths and bool(_FAST_W_WALK_RE.match(walk_str)):
+                w_nids = np.fromstring(
+                    walk_str[1:].translate(_W_SEP_TABLE), dtype=np.int32, sep=","
+                )
+                w_signs = np.frombuffer(
+                    walk_str.encode("ascii").translate(None, _DIGITS_BYTES),
+                    dtype=np.uint8,
+                )
+                del walk_str
+                if int(w_nids.min()) < 1 or int(w_nids.max()) > max_int_nid:
+                    for nid_val in w_nids.tolist():
+                        if (
+                            nid_val < 1
+                            or nid_val > max_int_nid
+                            or int(node_lens_np[nid_val]) <= 0
+                        ):
+                            raise InputContractError(
+                                f"W line at line {line_no} references unknown node '{nid_val}'"
+                            )
+                w_step_lens = node_lens_np[w_nids]
+                if not bool(np.all(w_step_lens > 0)):
+                    bad_pos = int(np.flatnonzero(w_step_lens <= 0)[0])
                     raise InputContractError(
-                        f"W line at line {line_no} references unknown node '{nid}'"
+                        f"W line at line {line_no} references unknown node '{int(w_nids[bad_pos])}'"
                     )
-                orient: Literal["+", "-"] = "+" if sym == ">" else "-"
-                w_steps.append(Step(node_id=nid, orient=orient))
+                w_codes = np.where(w_signs == 60, -w_nids, w_nids).astype(
+                    np.int32, copy=False
+                )
+                del w_nids, w_signs
+                if int(w_codes.shape[0]) > 1:
+                    bad_idx = links_store.validate_step_codes(w_codes)
+                    if bad_idx >= 0:
+                        u_c = int(w_codes[bad_idx])
+                        v_c = int(w_codes[bad_idx + 1])
+                        u_tok = f"{abs(u_c)}{'+' if u_c > 0 else '-'}"
+                        v_tok = f"{abs(v_c)}{'+' if v_c > 0 else '-'}"
+                        raise InputContractError(
+                            f"Broken link {u_tok} -> {v_tok} in W line at line {line_no}"
+                        )
+                spelled_len = int(w_step_lens.sum(dtype=np.int64))
+                del w_step_lens
+                if end_str != "*":
+                    try:
+                        seq_end = int(end_str)
+                    except ValueError as exc:
+                        raise InputContractError(
+                            f"Invalid seq_end '{end_str}' in W line at line {line_no}"
+                        ) from exc
+                    if seq_end - seq_start != spelled_len:
+                        raise InputContractError(
+                            f"W line coordinate span [{seq_start}, {seq_end}) (length "
+                            f"{seq_end - seq_start}) does not match spelled walk length "
+                            f"{spelled_len} at line {line_no}"
+                        )
+                else:
+                    seq_end = seq_start + spelled_len
 
-            if not w_steps:
-                raise InputContractError(f"Empty walk in W line at line {line_no}")
-
-            for idx in range(len(w_steps) - 1):
-                u, v = w_steps[idx], w_steps[idx + 1]
-                if (u.node_id, u.orient, v.node_id, v.orient) not in links_store:
-                    raise InputContractError(
-                        f"Broken link {u.node_id}{u.orient} -> {v.node_id}{v.orient} "
-                        f"in W line at line {line_no}"
-                    )
-
-            spelled_len = sum(nodes_store.node_len(s.node_id) for s in w_steps)
-            if end_str != "*":
-                try:
-                    seq_end = int(end_str)
-                except ValueError as exc:
-                    raise InputContractError(
-                        f"Invalid seq_end '{end_str}' in W line at line {line_no}"
-                    ) from exc
-                if seq_end - seq_start != spelled_len:
-                    raise InputContractError(
-                        f"W line coordinate span [{seq_start}, {seq_end}) (length "
-                        f"{seq_end - seq_start}) does not match spelled walk length "
-                        f"{spelled_len} at line {line_no}"
-                    )
+                hap_id = f"{sample}#{hap}"
+                pan_name = f"{sample}#{hap}#{seqid}"
+                src_path = f"{pan_name}:{seq_start}-{seq_end}"
+                w_steps_seq: Any = LazyStepTuple(w_codes)
+                provenance: Any = LazyProvenanceTuple(
+                    src_hap=hap_id,
+                    src_path=src_path,
+                    base_offset=seq_start,
+                    orig_codes=w_codes,
+                    node_lens=node_lens_np,
+                    total_bp=spelled_len,
+                )
+                total_len = spelled_len
             else:
-                seq_end = seq_start + spelled_len
+                w_steps: list[Step] = []
+                for m in _W_STEP_RE.finditer(walk_str):
+                    sym, nid = m.group(1), m.group(2)
+                    if nid not in nodes_store:
+                        raise InputContractError(
+                            f"W line at line {line_no} references unknown node '{nid}'"
+                        )
+                    orient: Literal["+", "-"] = "+" if sym == ">" else "-"
+                    w_steps.append(Step(node_id=nid, orient=orient))
 
-            hap_id = f"{sample}#{hap}"
-            pan_name = f"{sample}#{hap}#{seqid}"
-            src_path = f"{pan_name}:{seq_start}-{seq_end}"
-            provenance, total_len = _build_step_provenance(
-                steps=w_steps,
-                nodes=nodes_store,
-                src_hap=hap_id,
-                src_path=src_path,
-                base_offset=seq_start,
-            )
+                if not w_steps:
+                    raise InputContractError(f"Empty walk in W line at line {line_no}")
+
+                for idx in range(len(w_steps) - 1):
+                    u, v = w_steps[idx], w_steps[idx + 1]
+                    if (u.node_id, u.orient, v.node_id, v.orient) not in links_store:
+                        raise InputContractError(
+                            f"Broken link {u.node_id}{u.orient} -> {v.node_id}{v.orient} "
+                            f"in W line at line {line_no}"
+                        )
+
+                spelled_len = sum(nodes_store.node_len(s.node_id) for s in w_steps)
+                if end_str != "*":
+                    try:
+                        seq_end = int(end_str)
+                    except ValueError as exc:
+                        raise InputContractError(
+                            f"Invalid seq_end '{end_str}' in W line at line {line_no}"
+                        ) from exc
+                    if seq_end - seq_start != spelled_len:
+                        raise InputContractError(
+                            f"W line coordinate span [{seq_start}, {seq_end}) (length "
+                            f"{seq_end - seq_start}) does not match spelled walk length "
+                            f"{spelled_len} at line {line_no}"
+                        )
+                else:
+                    seq_end = seq_start + spelled_len
+
+                hap_id = f"{sample}#{hap}"
+                pan_name = f"{sample}#{hap}#{seqid}"
+                src_path = f"{pan_name}:{seq_start}-{seq_end}"
+                provenance, total_len = _build_step_provenance(
+                    steps=w_steps,
+                    nodes=nodes_store,
+                    src_hap=hap_id,
+                    src_path=src_path,
+                    base_offset=seq_start,
+                )
+                w_steps_seq = tuple(w_steps)
+
             frag = PathFragment(
                 sample=sample,
                 hap=hap,
@@ -1111,7 +1196,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                 seqid=seqid,
                 src_path=src_path,
                 base_offset=seq_start,
-                steps=tuple(w_steps),
+                steps=w_steps_seq,
                 provenance=provenance,
                 is_w_line=True,
                 total_len=total_len,
@@ -1119,6 +1204,11 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
             all_fragments.append(frag)
             w_contig_intervals[(hap_id, seqid)].append((seq_start, seq_end, src_path))
 
+            if src_path in p_by_path_name:
+                raise InputContractError(
+                    f"Ambiguous duplicate source interval in both P line '{src_path}' "
+                    f"and W line '{src_path}' (§2.1)"
+                )
             if pan_name in p_by_path_name:
                 p_start, p_end = p_by_path_name[pan_name]
                 if max(p_start, seq_start) < min(p_end, seq_end):
@@ -1147,61 +1237,81 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     f"'{name1}' [{s1}, {e1}) overlaps '{name2}' [{s2}, {e2}) (§2.1)"
                 )
 
-    # 3. Match unique reference path by --backbone-prefix (with PanSN sample-prefix fallback)
+    # 3. Match unique reference path by --backbone-prefix (PanSN-boundary-aware + primary-hap fallback)
     prefix = config.backbone_prefix
     matched_indices: list[int] = []
-    for idx, frag in enumerate(all_fragments):
-        pan_name = f"{frag.sample}#{frag.hap}#{frag.seqid}"
-        if frag.src_path.startswith(prefix) or pan_name.startswith(prefix):
-            matched_indices.append(idx)
-
-    if len(matched_indices) != 1:
-        base_sample = (
-            prefix[:-3]
-            if (
-                len(matched_indices) == 0
-                and (prefix.endswith("#0#") or prefix.endswith("#1#"))
-            )
-            else (prefix if "#" not in prefix else None)
-        )
-        if base_sample is not None:
-            # Sample-name prefix (e.g. 'Pyrar_xinyeli' or 'Pyrar_xinyeli#0#') in a multi-haplotype PanSN GFA:
-            # check if primary haplotype '#1#' (or '#0#' if '#1#' is absent) uniquely identifies 1 path
-            hap1_indices = [
-                idx
-                for idx in range(len(all_fragments))
-                if (
-                    all_fragments[idx].sample == base_sample
-                    or all_fragments[idx].src_path.startswith(
-                        f"{base_sample}#1#"
-                    )
-                )
-                and all_fragments[idx].hap == "1"
-                and (
-                    "#" in all_fragments[idx].src_path
-                    or all_fragments[idx].is_w_line
-                )
-            ]
-            if len(hap1_indices) == 1:
-                matched_indices = hap1_indices
-            elif len(hap1_indices) == 0:
-                hap0_indices = [
+    if prefix.endswith("#"):
+        for idx, frag in enumerate(all_fragments):
+            pan_name = f"{frag.sample}#{frag.hap}#{frag.seqid}"
+            if frag.src_path.startswith(prefix) or pan_name.startswith(prefix):
+                matched_indices.append(idx)
+        if len(matched_indices) == 0 and (
+            prefix.endswith("#0#") or prefix.endswith("#1#")
+        ):
+            base_sample = prefix[:-3]
+            if base_sample and "#" not in base_sample:
+                sample_pansn = [
                     idx
-                    for idx in range(len(all_fragments))
-                    if (
-                        all_fragments[idx].sample == base_sample
-                        or all_fragments[idx].src_path.startswith(
-                            f"{base_sample}#0#"
-                        )
-                    )
-                    and all_fragments[idx].hap == "0"
-                    and (
-                        "#" in all_fragments[idx].src_path
-                        or all_fragments[idx].is_w_line
-                    )
+                    for idx, frag in enumerate(all_fragments)
+                    if ("#" in frag.src_path or frag.is_w_line)
+                    and frag.sample == base_sample
                 ]
-                if len(hap0_indices) == 1:
-                    matched_indices = hap0_indices
+                hap1_indices = [
+                    idx for idx in sample_pansn if all_fragments[idx].hap == "1"
+                ]
+                if len(hap1_indices) == 1:
+                    matched_indices = hap1_indices
+                elif len(hap1_indices) == 0:
+                    hap0_indices = [
+                        idx for idx in sample_pansn if all_fragments[idx].hap == "0"
+                    ]
+                    if len(hap0_indices) == 1:
+                        matched_indices = hap0_indices
+    elif "#" in prefix:
+        for idx, frag in enumerate(all_fragments):
+            pan_name = f"{frag.sample}#{frag.hap}#{frag.seqid}"
+            if (
+                frag.src_path == prefix
+                or pan_name == prefix
+                or frag.src_path.startswith(f"{prefix}#")
+                or pan_name.startswith(f"{prefix}#")
+                or frag.src_path.startswith(f"{prefix}:")
+            ):
+                matched_indices.append(idx)
+    else:
+        for idx, frag in enumerate(all_fragments):
+            if "#" in frag.src_path or frag.is_w_line:
+                if frag.sample == prefix:
+                    matched_indices.append(idx)
+            else:
+                if frag.src_path.startswith(prefix):
+                    matched_indices.append(idx)
+        if len(matched_indices) > 1:
+            exact_matches = [
+                idx
+                for idx in matched_indices
+                if all_fragments[idx].src_path == prefix
+            ]
+            if len(exact_matches) == 1:
+                matched_indices = exact_matches
+            else:
+                pansn_matches = [
+                    idx
+                    for idx in matched_indices
+                    if "#" in all_fragments[idx].src_path or all_fragments[idx].is_w_line
+                ]
+                if len(pansn_matches) == len(matched_indices):
+                    hap1_indices = [
+                        idx for idx in pansn_matches if all_fragments[idx].hap == "1"
+                    ]
+                    if len(hap1_indices) == 1:
+                        matched_indices = hap1_indices
+                    elif len(hap1_indices) == 0:
+                        hap0_indices = [
+                            idx for idx in pansn_matches if all_fragments[idx].hap == "0"
+                        ]
+                        if len(hap0_indices) == 1:
+                            matched_indices = hap0_indices
 
     if len(matched_indices) != 1:
         raise InputContractError(

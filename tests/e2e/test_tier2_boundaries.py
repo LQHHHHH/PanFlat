@@ -12,7 +12,6 @@ from pathlib import Path
 
 from tests.e2e.helpers import (
     InputPaths,
-    OutputBundle,
     SyntheticInputBuilder,
     assert_all_global_invariants,
     assert_centromere_accounting_and_offsets,
@@ -26,10 +25,8 @@ from tests.e2e.helpers import (
     oracle_repeat_mask_intervals,
     revcomp,
     run_build,
-    run_merge,
     run_panflat_cli,
     run_verify,
-    translate_cds,
 )
 
 
@@ -1909,20 +1906,12 @@ def test_f17_boundary_criterion3_unaligned_plus_internal_ins_49bp_merged_vs_50bp
     b.add_node("n1", make_complex_seq(100, seed=435))
     b.add_node("n2", make_complex_seq(100, seed=436))
     b.add_node("n3", make_complex_seq(100, seed=437))
-    core1 = make_complex_seq(400, seed=438)
-    s_ins49 = core1[:200] + make_complex_seq(49, seed=439) + core1[200:]  # 449 bp
-    core2 = make_complex_seq(400, seed=440)
-    s_ins50 = core2[:200] + make_complex_seq(50, seed=441) + core2[200:]  # 450 bp
     # Put longer sequence as R or test S against longer R:
     # Since real sequences are sorted by length DESC, make R longer (460 bp) so S (449/450 bp) aligns to R
     # Or make S shorter than R by adding a 49 bp / 50 bp insertion in S while R has a 60 bp tail elsewhere:
     # Better yet: R is 450 bp (`core1 + tail50`), S is 400 bp (`core1`) -> in S, unaligned_ends + internal_ins == 0!
     # Wait: Criterion 3 checks `unaligned_ends(S) + internal_ins_bp(S) < min-sv-len` where S is the shorter/subsequent candidate compared against existing representative R!
     # So make R = 500 bp, and S = R[:200] + novel_ins(49 or 50 bp) + R[250:] (so len(S) = 449 or 450 bp <= len(R) = 500 bp)!
-    r1 = make_complex_seq(500, seed=438)
-    s1_49 = r1[:200] + make_complex_seq(49, seed=439) + r1[260:]  # len = 200 + 49 + 240 = 489 < 500
-    r2 = make_complex_seq(500, seed=440)
-    s2_50 = r2[:200] + make_complex_seq(50, seed=441) + r2[260:]  # len = 200 + 50 + 240 = 490 < 500
     # Wait: if r1[200:260] is replaced by 49 bp, edlib might align the 49 bp as ~12 matches + 37 mismatches + 11 D!
     # To make S have a pure internal insertion of 49 bp vs 50 bp relative to R while len(S) <= len(R),
     # let R have higher support (2 haplotypes carry R of length 400 bp, 1 haplotype carries S of length 449/450 bp)

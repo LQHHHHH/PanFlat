@@ -8,26 +8,15 @@ import shutil
 import pytest
 
 from panflat.cli import main as cli_main
-from panflat.gfa_io import load_and_validate_inputs, revcomp
 from panflat.gff_liftover import liftover_gff3, liftover_gff3_lines
-from panflat.linearizer import run_chromosome_pipeline
 from panflat.models import (
-    CENTROMERE_TSV_COLUMNS,
-    BuildConfig,
     InputContractError,
     InvariantViolationError,
     StepOffsetRow,
     SVEvent,
 )
-from panflat.verify_qc import (
-    INSERTS_HEADER,
-    OFFSETS_HEADER,
-    SV_HEADER,
-    UNRESOLVED_HEADER,
-    run_qc,
-    verify_build_outputs,
-)
-from panflat.writers import merge_chromosomes, write_build_outputs
+from panflat.verify_qc import verify_build_outputs
+from panflat.writers import merge_chromosomes
 from tests.e2e.helpers import (
     OutputBundle,
     SyntheticInputBuilder,

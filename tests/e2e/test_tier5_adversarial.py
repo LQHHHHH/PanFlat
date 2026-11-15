@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.e2e.helpers import (
+    OutputBundle,
     SyntheticInputBuilder,
     assert_all_global_invariants,
     assert_centromere_accounting_and_offsets,
@@ -24,6 +25,7 @@ from tests.e2e.helpers import (
     mutate_seq_snps,
     revcomp,
     run_build,
+    run_merge,
     run_panflat_cli,
     run_verify,
 )
@@ -797,163 +799,59 @@ def test_tier5_m1m2_14_zero_forward_anchor_unnormalized_contig(tmp_path: Path) -
 # 15. Direct Unit/White-Box Exerciser for Defensive Invariant Guards in M1 & M2
 # ---------------------------------------------------------------------------
 
-def test_tier5_m1m2_15_whitebox_defensive_contract_guards_in_m1_m2() -> None:
-    """Directly exercise defensive contract guards in `models.py`, `gfa_io.py`,
-    `repeat_guard.py`, `normalizer.py`, and `centromere.py` that cannot be reached via
-    valid CLI inputs (e.g., programmatic misuse of internal APIs).
+def test_tier5_m1m2_15_cli_contract_parameter_and_missing_input_guards(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI verification of defensive parameter-range and missing-file contract
+    guards in `panflat build` (corresponding internal Python API guards live in `tests/unit/`).
     """
-    import pytest
-    from panflat.gfa_io import spell_steps
-    from panflat.models import BuildConfig, CLIArgumentError, InputContractError, Step, StepProvenance
-    from panflat.normalizer import (
-        canonical_rotation,
-        detect_canonical_cnv,
-        fold_tandem_cycles,
-        project_steps_onto_backbone,
+    b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("n1", make_complex_seq(120, seed=5901))
+    b.set_ref_path("Ref#1#Chr01", ["n1+"])
+    b.add_bed_region(20, 80, "CEN1")
+    inputs = b.write("cli_guards")
+
+    # Missing GFA / FASTA files fail cleanly with non-zero exit code and zero Python tracebacks
+    res_missing = run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(tmp_path / "nonexistent_panflat_test.gfa"),
+            "--ref-fa",
+            str(inputs.ref_fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(tmp_path / "bad_missing"),
+        ],
+        check=False,
     )
-    from panflat.repeat_guard import (
-        check_similarity_merge,
-        complement_intervals,
-        merge_contiguous_provenance,
-        merge_intervals,
-        parse_cs_to_query_ops,
-        parse_edlib_cigar_to_ops,
-        slice_candidate_by_intervals,
-        subtract_intervals,
-        subtract_reference_intervals_mappy,
-    )
+    assert res_missing.returncode != 0 and "Traceback" not in res_missing.stderr
 
-    # 1. models.py: Step.flipped without full_node_len on partial step, invalid subslice bounds
-    p_step = Step("n1", "+", slice_start=5, slice_end=20, is_partial=True)
-    with pytest.raises(ValueError):
-        p_step.flipped()
-    flipped_p = p_step.flipped(full_node_len=50)
-    assert flipped_p.slice_start == 30 and flipped_p.slice_end == 45
-    with pytest.raises(ValueError):
-        p_step.subslice(-1, 5, full_node_len=50)
-
-    prov = StepProvenance("H#1", "H#1#Chr01", 10, 30, "+")
-    with pytest.raises(ValueError):
-        prov.subslice(5, 3)
-
-    cfg = BuildConfig(
-        gfa="a.gfa",
-        ref_fa="a.fa",
-        backbone_prefix="Ref#",
-        out_prefix="out",
-        centromere_bed="cen.bed",
-        centromere_mode="off",
-        centromere_mode_explicit=False,
-    )
-    assert cfg.effective_centromere_mode == "bypass"
-
-    # 2. gfa_io.py: _flip_orient, spell_steps and validate_build_config error guards
-    from panflat.gfa_io import _flip_orient
-    with pytest.raises(InputContractError):
-        _flip_orient("?")
-    with pytest.raises(InputContractError):
-        spell_steps([Step("missing", "+")], {"n1": "ACGT"})
-    with pytest.raises(InputContractError):
-        spell_steps([Step("n1", "+", slice_start=3, slice_end=2, is_partial=True)], {"n1": "ACGT"})
-
-    from panflat.gfa_io import load_and_validate_inputs, validate_build_config
-    for bad_cfg in [
-        BuildConfig(gfa="a", ref_fa="a", backbone_prefix="  ", out_prefix="o"),
-        BuildConfig(gfa="a", ref_fa="a", backbone_prefix="R#", out_prefix="o", max_jump=0),
-        BuildConfig(gfa="a", ref_fa="a", backbone_prefix="R#", out_prefix="o", max_copy=0),
-        BuildConfig(gfa="a", ref_fa="a", backbone_prefix="R#", out_prefix="o", spacer_n=-1),
-        BuildConfig(gfa="a", ref_fa="a", backbone_prefix="R#", out_prefix="o", threads=0),
+    # Parameter range guards via CLI
+    base = [
+        "build",
+        "--gfa",
+        str(inputs.gfa_path),
+        "--ref-fa",
+        str(inputs.ref_fa_path),
+        "--out-prefix",
+        str(tmp_path / "bad_param"),
+    ]
+    for bad_flags in [
+        ["--backbone-prefix", "   "],
+        ["--backbone-prefix", "Ref#1#", "--max-jump", "0"],
+        ["--backbone-prefix", "Ref#1#", "--max-copy", "0"],
+        ["--backbone-prefix", "Ref#1#", "--spacer-n", "-1"],
+        ["--backbone-prefix", "Ref#1#", "--threads", "0"],
     ]:
-        with pytest.raises(CLIArgumentError):
-            validate_build_config(bad_cfg)
-    with pytest.raises(InputContractError):
-        load_and_validate_inputs(BuildConfig(gfa="/nonexistent_panflat_test.gfa", ref_fa="a", backbone_prefix="R#", out_prefix="o"))
+        proc = run_panflat_cli([*base, *bad_flags], check=False)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr
 
-    # 3. repeat_guard.py: interval helpers, edlib split-gap > 0, cs long tokens, slice_candidate guards
-    assert merge_intervals([(5, 2), (10, 10)]) == []
-    assert complement_intervals(0, [(0, 5)]) == []
-    assert complement_intervals(10, [(0, 10), (12, 15)]) == []
-    assert subtract_intervals([], [(0, 5)]) == []
-    assert merge_contiguous_provenance([]) == []
-    assert merge_contiguous_provenance([prov], "ACGT") == [(prov, "")]
-
-    with pytest.raises(InputContractError):
-        slice_candidate_by_intervals([Step("n1", "+")], [], {"n1": "ACGT"}, [(0, 4)], [])
-    with pytest.raises(InputContractError):
-        slice_candidate_by_intervals([Step("unknown", "+")], [prov], {"n1": "ACGT"}, [(0, 4)], [])
-    with pytest.raises(InputContractError):
-        slice_candidate_by_intervals(
-            [Step("n1", "+", slice_start=3, slice_end=2, is_partial=True)],
-            [prov],
-            {"n1": "ACGT"},
-            [(0, 4)],
-            [],
-        )
-    with pytest.raises(InputContractError):
-        slice_candidate_by_intervals([Step("n1", "+")], [prov], {"n1": "ACGT"}, [(0, 4)], [])
-
-    # Long cs token '=ACGT' and splice '~gt10ag' and reverse strand
-    assert parse_cs_to_query_ops("", 1) == []
-    cs_ops = parse_cs_to_query_ops("=ACGT*at+cc-gg~gt10ag", strand=-1)
-    assert any(op == "M" for op, _ in cs_ops) and any(op == "D" for op, _ in cs_ops)
-    assert parse_edlib_cigar_to_ops("") == []
-    r_dmd = "AAXXXXAATTYYYYTT"
-    s_dmd = "AATT"
-    assert parse_edlib_cigar_to_ops("6D4=6D", seq_s=s_dmd, seq_r=r_dmd) == [("M", 2), ("D", 12), ("M", 2)]
-    assert parse_edlib_cigar_to_ops("6I4=6I", seq_s=r_dmd, seq_r=s_dmd) == [("M", 2), ("I", 12), ("M", 2)]
-
-    assert subtract_reference_intervals_mappy("", "ACGT") == ([], [], 0)
-    assert subtract_reference_intervals_mappy("ACGT", "NNNN") == ([], [(0, 4)], 0)
-    assert check_similarity_merge("", "ACGT") is False
-    assert check_similarity_merge("ACGT", "TGCA", min_sv_len=0) is False
-
-    # 4. normalizer.py: flexible overload signatures & guards
-    from panflat.models import PathFragment, ProjectedAnchor
-    from panflat.normalizer import (
-        _extract_contiguous_nonref_slices,
-        compute_weighted_lis,
-        extract_deviations,
-    )
-    from panflat.centromere import _extract_nonref_runs
-
-    st_a = Step("n1", "+")
-    st_b = Step("n2", "+")
-    nodes_ab = {"n1": "ACGT", "n2": "TGCA"}
-    # Calling project_steps_onto_backbone without explicit provenance (synthesizes provenance)
-    ancs = project_steps_onto_backbone([st_a, st_b], [st_a, st_b], nodes_ab, 0, 2)
-    assert len(ancs) == 2
-    with pytest.raises(InputContractError):
-        project_steps_onto_backbone([st_a], [prov, prov], [st_a], nodes_ab)
-
-    # Discontiguous provenance break in _extract_contiguous_nonref_slices and _extract_nonref_runs
-    prov1 = StepProvenance("H#1", "H#1#Chr01", 0, 4, "+")
-    prov2_gap = StepProvenance("H#1", "H#1#Chr01", 10, 14, "+")
-    slices_gap = _extract_contiguous_nonref_slices(
-        [st_a, st_b], [prov1, prov2_gap], nodes_ab, set(), min_sv_len=1
-    )
-    assert len(slices_gap) == 2
-    runs_gap = _extract_nonref_runs([st_a, st_b], [prov1, prov2_gap], nodes_ab, set())
-    assert len(runs_gap) == 2
-
-    # compute_weighted_lis with only reverse-oriented anchors (n == 0 forward anchors)
-    assert compute_weighted_lis([ProjectedAnchor(0, 0, "-", "n1", 4, st_a, prov1)]) == ([], False)
-
-    # extract_deviations in nested mode (is_top_level=False) with empty main_chain
-    frag_ab = PathFragment("H", "1", "H#1", "Chr01", "H#1#Chr01", 0, (st_a,), (prov1,), False, 4)
-    nested_devs = extract_deviations(
-        frag_ab, [], [st_b], is_top_level=False, lo=0, hi=1
-    )
-    assert len(nested_devs) == 1 and nested_devs[0].left_anchor_rank == "START"
-
-    with pytest.raises(InputContractError):
-        fold_tandem_cycles([st_a], [], set(), max_copy=1)
-    with pytest.raises(InputContractError):
-        fold_tandem_cycles([st_a], [prov], set(), max_copy=0)
-    empty_fold = fold_tandem_cycles([], [], set(), max_copy=1)
-    assert empty_fold.folded_steps == ()
-    assert canonical_rotation([]) == ()
-    # detect_canonical_cnv where both sides have k=1 (line 1179)
-    assert detect_canonical_cnv([st_a], [st_a], nodes_ab, min_sv_len=1) is None
+    # Default centromere mode when --centromere-bed is provided without explicit --centromere-mode is 'bypass'
+    _, bun_default_cen = run_build(inputs)
+    assert bun_default_cen is not None
+    assert bun_default_cen.summary_kv["centromere_mode"] == "bypass"
 
 
 # ---------------------------------------------------------------------------
@@ -1137,41 +1035,6 @@ def test_tier5_m3m4_01_recursive_local_reanchoring_and_ancestor_termination(tmp_
     # ins_pre is anchored at 1..2 (ref_start of step 2 = 440); ins_post is anchored at 2..3 (ref_start of step 3 = 660)
     assert [int(ev["ref_start"]) for ev in bundle.sv_rows] == [440, 660]
     assert [ev["anchors"] for ev in bundle.sv_rows] == ["1..2", "2..3"]
-
-    # White-box check of can_transition and _solve_multi_member_component fallback when blocked by ancestor_keys
-    from panflat.linearizer import (
-        DedupCandidate,
-        ExtractedCandidate,
-        SubproblemStateKey,
-        _solve_multi_member_component,
-        can_transition,
-    )
-    from panflat.models import BuildConfig, GFAGraph, PathFragment, Piece, Step, StepProvenance
-
-    k_parent = SubproblemStateKey(b_id=(("B", 0, 10, "+"),), lo=0, hi=10, has_logical_start=False, has_logical_end=False, m_key=((("M1", 0, 5, "+"),), (("M2", 0, 5, "+"),)))
-    k_same = SubproblemStateKey(b_id=(("B", 0, 10, "+"),), lo=0, hi=10, has_logical_start=False, has_logical_end=False, m_key=((("M1", 0, 5, "+"),), (("M2", 0, 5, "+"),)))
-    k_child_ok = SubproblemStateKey(b_id=(("B", 0, 10, "+"),), lo=1, hi=5, has_logical_start=True, has_logical_end=True, m_key=((("M1", 0, 5, "+"),),))
-    assert not can_transition(k_parent, k_same, frozenset())
-    assert can_transition(k_parent, k_child_ok, frozenset())
-    assert not can_transition(k_parent, k_child_ok, frozenset({k_child_ok}))
-
-    # Exercise _solve_multi_member_component fallback when parent_state_key has smaller metric than child
-    st1 = Step("x1", "+")
-    st2 = Step("x2", "+")
-    p1 = StepProvenance("H1#1", "H1#1#Chr01", 0, 60, "+")
-    p2 = StepProvenance("H2#1", "H2#1#Chr01", 0, 60, "+")
-    s_x1 = make_complex_seq(60, seed=7110)
-    s_x2 = make_complex_seq(60, seed=7111)
-    ec1 = ExtractedCandidate("c1", None, "H1#1", "H1#1#Chr01", 0, 1, 0, (st1, st2), (p1, p1), s_x1 + s_x2)
-    ec2 = ExtractedCandidate("c2", None, "H2#1", "H2#1#Chr01", 0, 1, 1, (st1,), (p2,), s_x1)
-    dc1 = DedupCandidate(((st1.node_id, "+", 0, None, False), (st2.node_id, "+", 0, None, False)), (st1, st2), s_x1 + s_x2, (Piece("H1#1", "H1#1#Chr01", 0, 120, "+", s_x1 + s_x2, "source_contiguous", ("H1#1",)),), frozenset({"H1#1"}), (ec1,), ec1, "x1+,x2+", "H1#1")
-    dc2 = DedupCandidate(((st1.node_id, "+", 0, None, False),), (st1,), s_x1, (Piece("H2#1", "H2#1#Chr01", 0, 60, "+", s_x1, "source_contiguous", ("H2#1",)),), frozenset({"H2#1"}), (ec2,), ec2, "x1+", "H2#1")
-    dummy_frag = PathFragment("Ref", "1", "Ref#1", "Chr01", "Ref#1#Chr01", 0, (st1,), (p1,), False, 60)
-    dummy_graph = GFAGraph("g.gfa", "0" * 64, "Chr01", s_x1, {"x1": s_x1, "x2": s_x2}, set(), dummy_frag, (), ("Ref#1", "H1#1", "H2#1"), ((0, 60),), frozenset(), {})
-    dummy_cfg = BuildConfig(gfa="g.gfa", ref_fa="r.fa", backbone_prefix="Ref#1#", out_prefix="o")
-    tiny_parent_key = SubproblemStateKey(b_id=(), lo=0, hi=0, has_logical_start=True, has_logical_end=True, m_key=())
-    fb_res = _solve_multi_member_component([dc1, dc2], dummy_graph, dummy_cfg, tiny_parent_key, frozenset())
-    assert len(fb_res) == 2 and all(not r.is_synthetic for r in fb_res)
 
 
 # ---------------------------------------------------------------------------
@@ -1719,20 +1582,34 @@ def test_tier5_m3m4_09_gff3_liftover_multilevel_dag_utr_intron_splice_and_micro_
 # ---------------------------------------------------------------------------
 
 def test_tier5_m3m4_10_gff3_liftover_contract_error_rejections(tmp_path: Path) -> None:
-    """White-box target: `panflat/gff_liftover.py` (all validation error branches lines 169-260,
-    3-arg overload lines 147-156, empty features line 293, and empty `step_offsets` fallback lines 333-354).
+    """Opaque-box CLI verification of `gff_liftover.py` validation error branches,
+    missing `--ref-gff` file rejection, and comments-only empty GFF3 handling.
     """
-    import pytest
-    from panflat.gff_liftover import liftover_gff3, liftover_gff3_lines
-    from panflat.models import InputContractError, StepOffsetRow, SVEvent
+    b = SyntheticInputBuilder(tmp_path / "gff_err", chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("n1", make_complex_seq(200, seed=8091))
+    b.set_ref_path("Ref#1#Chr01", ["n1+"])
+    inputs = b.write("gff_base")
 
-    step_offsets = [StepOffsetRow("Chr01", 0, "n1", 0, 200, 0, 200, 0)]
+    # 1. Missing GFF3 file rejected by CLI
+    missing_proc = run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(inputs.gfa_path),
+            "--ref-fa",
+            str(inputs.ref_fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(tmp_path / "missing.gff3"),
+            "--out-prefix",
+            str(tmp_path / "bad_missing_gff"),
+        ],
+        check=False,
+    )
+    assert missing_proc.returncode != 0 and "Traceback" not in missing_proc.stderr
 
-    # 1. Missing GFF3 file
-    with pytest.raises(InputContractError):
-        liftover_gff3(tmp_path / "missing.gff3", "Chr01", step_offsets, [])
-
-    # 2. Malformed GFF3 lines matrix
+    # 2. Malformed GFF3 lines matrix rejected by CLI
     bad_gff_lines = [
         "Chr01\tsrc\tgene\t1\t100",  # < 9 cols
         "\tsrc\tgene\t1\t100\t.\t+\t.\tID=g1",  # empty seqid
@@ -1746,64 +1623,67 @@ def test_tier5_m3m4_10_gff3_liftover_contract_error_rejections(tmp_path: Path) -
         "Chr01\tsrc\tgene\t1\t100\t.\t*\t.\tID=g1",  # invalid strand
         "Chr01\tsrc\tCDS\t1\t100\t.\t+\t3\tID=c1",  # invalid phase
     ]
-    for bad_line in bad_gff_lines:
-        with pytest.raises(InputContractError):
-            liftover_gff3_lines([bad_line], "Chr01", step_offsets, [])
+    for idx, bad_line in enumerate(bad_gff_lines):
+        bad_gff = tmp_path / f"bad_{idx}.gff3"
+        bad_gff.write_text(f"##gff-version 3\n{bad_line}\n", encoding="utf-8")
+        proc = run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(inputs.gfa_path),
+                "--ref-fa",
+                str(inputs.ref_fa_path),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--ref-gff",
+                str(bad_gff),
+                "--out-prefix",
+                str(tmp_path / f"bad_gff_out_{idx}"),
+            ],
+            check=False,
+        )
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr
 
-    # 3. Empty feature GFF3 (comments only)
-    assert liftover_gff3_lines(["##gff-version 3", "# comment"], "Chr01", step_offsets, []) == ["##gff-version 3"]
-
-    # 4. 3-arg overload `liftover_gff3(gff_path, step_offsets, insertion_events)` and empty `step_offsets` fallback
-    gff_file = tmp_path / "valid_overload.gff3"
-    gff_file.write_text(
-        "##gff-version 3\nChr01\tsrc\texon\t10\t100\t.\t+\t.\tID=ex1;projection_split=Old\n",
-        encoding="utf-8",
+    # 3. Comments-only GFF3 succeeds and emits header-only lifted GFF3
+    empty_gff = tmp_path / "comments_only.gff3"
+    empty_gff.write_text("##gff-version 3\n# comment\n", encoding="utf-8")
+    out_emp = tmp_path / "emp_gff_out"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(inputs.gfa_path),
+            "--ref-fa",
+            str(inputs.ref_fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(empty_gff),
+            "--out-prefix",
+            str(out_emp),
+        ],
+        check=True,
     )
-    ins_ev = SVEvent(
-        chrom="Chr01",
-        pan_start=50,
-        pan_end=130,
-        event_id="Chr01_INS_1",
-        event_type="INS",
-        ref_start=50,
-        ref_end=50,
-        anchors="0..1",
-        alleles_str="1:len=80,src=H1#1,n=1",
-        n_carrier=1,
-        n_called=2,
-        region_id="Chr01_REG_1",
-        genotypes={"Ref#1": "0", "H1#1": "1"},
-        pieces=(),
-    )
-    res_overload = liftover_gff3(gff_file, step_offsets, [ins_ev])
-    assert len(res_overload) == 3  # header + 2 split exon segments
-    res_empty_offsets = liftover_gff3_lines(
-        ["Chr01\tsrc\texon\t10\t100\t.\t+\t.\t"],
-        "Chr01",
-        [],
-        [ins_ev],
-    )
-    assert len(res_empty_offsets) == 3
+    assert Path(f"{out_emp}.ref.lifted.gff3").read_text(encoding="utf-8").splitlines() == [
+        "##gff-version 3"
+    ]
 
 
 # ---------------------------------------------------------------------------
 # 27 (M3/M4 #11). Multi-Chromosome Merge: Heterogeneous Centromere Modes & Haplotype Union
 # ---------------------------------------------------------------------------
 
-def test_tier5_m3m4_11_multi_chromosome_merge_heterogeneous_centromere_and_hap_union(tmp_path: Path) -> None:
-    """White-box target: `panflat/writers.py` (`merge_chromosomes` lines 268-575).
-    Merges 3 chromosomes with heterogeneous configurations and haplotype subsets:
+def test_tier5_m3m4_11_multi_chromosome_merge_heterogeneous_centromere_and_hap_union(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI target: `panflat merge` across 3 chromosomes with heterogeneous
+    configurations and haplotype subsets:
     - `Chr01`: `extract-islands` + `--ref-gff`, haplotypes `Ref#1`, `H1#1`, `H2#1`
     - `Chr02`: `bypass` + `--dump-repeat-sequences`, haplotypes `Ref#1`, `H2#1`, `H3#1`
     - `Chr03`: `centromere-mode=off`, haplotypes `Ref#1`, `H1#1`, `H4#1` + `UNANCHORED_END`
-    Also tests `merge_chromosomes` error branches (missing prefix list, empty prefix list,
+    Also tests CLI `panflat merge` error branches (missing prefix list, empty prefix list,
     missing per-chrom file, duplicate chromosome name).
     """
-    import pytest
-    from tests.e2e.helpers import OutputBundle, run_merge
-    from panflat.models import InputContractError
-    from panflat.writers import merge_chromosomes
-
     # Chr01: extract-islands + GFF3
     b1 = SyntheticInputBuilder(tmp_path / "c1", chrom="Chr01", backbone_prefix="Ref#1#")
     for nid, seed in [("n0", 8101), ("u", 8102), ("cen", 8103), ("v", 8104)]:
@@ -1848,8 +1728,10 @@ def test_tier5_m3m4_11_multi_chromosome_merge_heterogeneous_centromere_and_hap_u
     assert list(mbun.pan_fa.keys()) == ["Chr01", "Chr02", "Chr03"]
 
     # Verify chain IDs 1, 2, 3
-    chain_hdrs = [l for l in mbun.chain_path.read_text(encoding="utf-8").splitlines() if l.startswith("chain ")]
-    assert [l.split()[12] for l in chain_hdrs] == ["1", "2", "3"]
+    chain_hdrs = [
+        ln for ln in mbun.chain_path.read_text(encoding="utf-8").splitlines() if ln.startswith("chain ")
+    ]
+    assert [ln.split()[12] for ln in chain_hdrs] == ["1", "2", "3"]
 
     # Verify haplotype union in genotypes.tsv with '.' filled for missing chromosome haplotypes
     assert mbun.genotype_haps == ["Ref#1", "H1#1", "H2#1", "H3#1", "H4#1"]
@@ -1866,15 +1748,23 @@ def test_tier5_m3m4_11_multi_chromosome_merge_heterogeneous_centromere_and_hap_u
     assert mbun.lifted_gff_path.is_file()
     assert int(mbun.summary_kv["chrom_count"]) == 3
 
-    # Verify merge_chromosomes error branches
-    with pytest.raises(InputContractError):
-        merge_chromosomes(tmp_path / "no_such_list.txt", tmp_path / "bad_m1")
-    with pytest.raises(InputContractError):
-        merge_chromosomes([], tmp_path / "bad_m2")
-    with pytest.raises(InputContractError):
-        merge_chromosomes([tmp_path / "missing_prefix"], tmp_path / "bad_m3")
-    with pytest.raises(InputContractError):
-        merge_chromosomes([inp1.out_prefix, inp1.out_prefix], tmp_path / "bad_m4")
+    # CLI panflat merge error branches
+    p_missing_list = run_panflat_cli(
+        ["merge", "--prefix-list", str(tmp_path / "no_such_list.txt"), "--out-prefix", str(tmp_path / "bad_m1")],
+        check=False,
+    )
+    assert p_missing_list.returncode != 0
+    empty_list = tmp_path / "empty_list.txt"
+    empty_list.write_text("# comment only\n\n", encoding="utf-8")
+    p_empty_list = run_panflat_cli(
+        ["merge", "--prefix-list", str(empty_list), "--out-prefix", str(tmp_path / "bad_m2")],
+        check=False,
+    )
+    assert p_empty_list.returncode != 0
+    pm3, _ = run_merge([tmp_path / "missing_prefix"], tmp_path / "bad_m3", check=False)
+    assert pm3.returncode != 0
+    pm4, _ = run_merge([inp1.out_prefix, inp1.out_prefix], tmp_path / "bad_m4", check=False)
+    assert pm4.returncode != 0
 
 
 # ---------------------------------------------------------------------------
@@ -1882,21 +1772,12 @@ def test_tier5_m3m4_11_multi_chromosome_merge_heterogeneous_centromere_and_hap_u
 # ---------------------------------------------------------------------------
 
 def test_tier5_m3m4_12_verify_exhaustive_tamper_detection_matrix(tmp_path: Path) -> None:
-    """White-box target: `panflat/verify_qc.py` (`verify_build_outputs` lines 480-1403).
-    Verifies that standalone `panflat verify` detects tampering across:
-    1. `pan.fa` reference base mutation -> `invariant_1_passed == False`
-    2. `pan.fa` spacer base mutation (`N -> A`) -> `invariant_2_passed == False`
-    3. `offsets.tsv` step gap -> `invariant_1_passed == False`
-    4. `ref_to_pan.chain` `dt != 0`, `dq` mismatch, `# block` / `# step` footer mismatch -> `invariant_3_passed == False`
-    5. `inserts.tsv` `src_strand` flip (`+ -> -`) -> `invariant_2_passed == False`
-    6. `centromere.tsv` 5-way accounting mismatch & mount point delta mismatch -> `centromere_passed == False`
-    7. `unresolved.fa` sequence corruption -> `unresolved_passed == False`
-    8. `ref.lifted.gff3` CDS coordinate shift -> `invariant_3_passed == False`
-    9. `summary.tsv` `gfa_sha256` tamper -> `invariant_2_passed == False`
-    10. Missing required output file -> `passed == False`
+    """Opaque-box CLI target: standalone `panflat verify` tamper detection across all 10
+    output surfaces (`pan.fa` ref & spacer bases, `offsets.tsv`, `ref_to_pan.chain`,
+    `inserts.tsv`, `centromere.tsv`, `unresolved.fa`, `ref.lifted.gff3`, `summary.tsv`
+    `gfa_sha256`, and missing output file).
     """
     import shutil
-    from panflat.verify_qc import verify_build_outputs
 
     b = SyntheticInputBuilder(tmp_path / "base", chrom="Chr01", backbone_prefix="Ref#1#")
     cds = make_coding_seq(40, seed=8201)  # 120 bp
@@ -1915,12 +1796,14 @@ def test_tier5_m3m4_12_verify_exhaustive_tamper_detection_matrix(tmp_path: Path)
 
     inputs = b.write("ver_base")
     run_build(inputs, extra_args=["--centromere-mode", "extract-islands", "--centromere-min-island", "500"])
-
-    # Clean build passes verify
-    clean_rep = verify_build_outputs(
-        inputs.out_prefix, inputs.gfa_path, inputs.ref_fa_path, inputs.gff_path, inputs.bed_path
+    assert inputs.gff_path is not None and inputs.bed_path is not None
+    run_verify(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--ref-gff", inputs.gff_path, "--centromere-bed", inputs.bed_path],
+        check=True,
     )
-    assert clean_rep.passed
 
     def _clone_prefix(tag: str) -> Path:
         dst_dir = tmp_path / f"tamper_{tag}"
@@ -1935,48 +1818,42 @@ def test_tier5_m3m4_12_verify_exhaustive_tamper_detection_matrix(tmp_path: Path)
     flipped_base = "T" if fa_txt[1][0] != "T" else "A"
     fa_txt[1] = flipped_base + fa_txt[1][1:]
     Path(f"{p1}.pan.fa").write_text("\n".join(fa_txt) + "\n", encoding="utf-8")
-    r1 = verify_build_outputs(p1, inputs.gfa_path, inputs.ref_fa_path, inputs.gff_path, inputs.bed_path)
-    assert not r1.passed and not r1.invariant_1_passed
+    assert run_verify(p1, inputs.gfa_path, inputs.ref_fa_path, extra_args=["--ref-gff", inputs.gff_path, "--centromere-bed", inputs.bed_path], check=False).returncode != 0
 
-    # 2. Tamper pan.fa spacer base ('N' -> 'A' right before CEN_ISLAND at pan pos 750)
+    # 2. Tamper pan.fa spacer base ('N' -> 'A')
     p2 = _clone_prefix("pan_spacer")
     fa_txt2 = Path(f"{p2}.pan.fa").read_text(encoding="utf-8").splitlines()
     seq2 = list(fa_txt2[1])
-    n_idx = fa_txt2[1].index("N")
-    seq2[n_idx] = "A"
+    seq2[fa_txt2[1].index("N")] = "A"
     fa_txt2[1] = "".join(seq2)
     Path(f"{p2}.pan.fa").write_text("\n".join(fa_txt2) + "\n", encoding="utf-8")
-    r2 = verify_build_outputs(p2, inputs.gfa_path, inputs.ref_fa_path, inputs.gff_path, inputs.bed_path)
-    assert not r2.passed and not r2.invariant_2_passed
+    assert run_verify(p2, inputs.gfa_path, inputs.ref_fa_path, extra_args=["--ref-gff", inputs.gff_path, "--centromere-bed", inputs.bed_path], check=False).returncode != 0
 
-    # 3. Tamper offsets.tsv (change ref_start of first step from 0 to 5)
+    # 3. Tamper offsets.tsv
     p3 = _clone_prefix("offsets")
     off_lines = Path(f"{p3}.offsets.tsv").read_text(encoding="utf-8").splitlines()
     cols = off_lines[1].split("\t")
     cols[3] = "5"
     off_lines[1] = "\t".join(cols)
     Path(f"{p3}.offsets.tsv").write_text("\n".join(off_lines) + "\n", encoding="utf-8")
-    r3 = verify_build_outputs(p3, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r3.passed and not r3.invariant_1_passed
+    assert run_verify(p3, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
-    # 4. Tamper ref_to_pan.chain (# block footer comment mismatch)
+    # 4. Tamper ref_to_pan.chain
     p4 = _clone_prefix("chain")
     ch_txt = Path(f"{p4}.ref_to_pan.chain").read_text(encoding="utf-8").replace("# block\t0\t", "# block\t10\t")
     Path(f"{p4}.ref_to_pan.chain").write_text(ch_txt, encoding="utf-8")
-    r4 = verify_build_outputs(p4, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r4.passed and not r4.invariant_3_passed
+    assert run_verify(p4, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
-    # 5. Tamper inserts.tsv (flip src_strand '+' -> '-')
+    # 5. Tamper inserts.tsv
     p5 = _clone_prefix("inserts")
     ins_lines = Path(f"{p5}.inserts.tsv").read_text(encoding="utf-8").splitlines()
     icols = ins_lines[1].split("\t")
     icols[9] = "-" if icols[9] == "+" else "+"
     ins_lines[1] = "\t".join(icols)
     Path(f"{p5}.inserts.tsv").write_text("\n".join(ins_lines) + "\n", encoding="utf-8")
-    r5 = verify_build_outputs(p5, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r5.passed and not r5.invariant_2_passed
+    assert run_verify(p5, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
-    # 6. Tamper centromere.tsv (corrupt accepted_source_bp so 5-way sum fails)
+    # 6. Tamper centromere.tsv
     p6 = _clone_prefix("cen")
     c_lines = Path(f"{p6}.centromere.tsv").read_text(encoding="utf-8").splitlines()
     for i in range(1, len(c_lines)):
@@ -1985,41 +1862,36 @@ def test_tier5_m3m4_12_verify_exhaustive_tamper_detection_matrix(tmp_path: Path)
             ccols[25] = "99999"
             c_lines[i] = "\t".join(ccols)
     Path(f"{p6}.centromere.tsv").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
-    r6 = verify_build_outputs(p6, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r6.passed and not r6.centromere_passed
+    assert run_verify(p6, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
-    # 7. Tamper unresolved.fa (corrupt sequence)
+    # 7. Tamper unresolved.fa
     p7 = _clone_prefix("unres_fa")
     Path(f"{p7}.unresolved.fa").write_text(">Chr01_UNRES_1\nTTTTTTTTTT\n", encoding="utf-8")
-    r7 = verify_build_outputs(p7, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r7.passed and not r7.unresolved_passed
+    assert run_verify(p7, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
-    # 8. Tamper ref.lifted.gff3 (shift CDS end by -3 bp so translated protein differs)
+    # 8. Tamper ref.lifted.gff3
     p8 = _clone_prefix("gff")
     g_txt = Path(f"{p8}.ref.lifted.gff3").read_text(encoding="utf-8").replace("\t170\t", "\t167\t")
     Path(f"{p8}.ref.lifted.gff3").write_text(g_txt, encoding="utf-8")
-    r8 = verify_build_outputs(p8, inputs.gfa_path, inputs.ref_fa_path, ref_gff_path=inputs.gff_path)
-    assert not r8.passed and not r8.invariant_3_passed
+    assert run_verify(p8, inputs.gfa_path, inputs.ref_fa_path, extra_args=["--ref-gff", inputs.gff_path], check=False).returncode != 0
 
     # 9. Tamper summary.tsv gfa_sha256
     p9 = _clone_prefix("sha")
     s_txt = Path(f"{p9}.summary.tsv").read_text(encoding="utf-8")
     Path(f"{p9}.summary.tsv").write_text(
         "\n".join(
-            f"gfa_sha256\t{'f' * 64}" if l.startswith("gfa_sha256\t") else l
-            for l in s_txt.splitlines()
+            f"gfa_sha256\t{'f' * 64}" if ln.startswith("gfa_sha256\t") else ln
+            for ln in s_txt.splitlines()
         )
         + "\n",
         encoding="utf-8",
     )
-    r9 = verify_build_outputs(p9, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r9.passed and not r9.invariant_2_passed
+    assert run_verify(p9, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
     # 10. Missing required output file
     p10 = _clone_prefix("missing")
     Path(f"{p10}.sv.tsv").unlink()
-    r10 = verify_build_outputs(p10, inputs.gfa_path, inputs.ref_fa_path)
-    assert not r10.passed
+    assert run_verify(p10, inputs.gfa_path, inputs.ref_fa_path, check=False).returncode != 0
 
 
 # ---------------------------------------------------------------------------
@@ -2027,13 +1899,8 @@ def test_tier5_m3m4_12_verify_exhaustive_tamper_detection_matrix(tmp_path: Path)
 # ---------------------------------------------------------------------------
 
 def test_tier5_m3m4_13_qc_bucket_boundaries_50_149_150_and_union_cap(tmp_path: Path) -> None:
-    """White-box target: `panflat/verify_qc.py` (`run_qc` and `_merge_intervals` lines 107-220).
-    Constructs inserted pieces of exact lengths:
-    - `50 bp` (lower boundary of short bucket `[50, 149]`)
-    - `149 bp` (upper boundary of short bucket `[50, 149]`)
-    - `150 bp` (lower boundary of long bucket `>= 150`, unique complex sequence)
-    - `250 bp` (long piece whose sequence also appears 3 times in the reference backbone of `pan.fa`,
-      testing multi-hit union interval merging `_merge_intervals` so `ratio <= 1.0`).
+    """Opaque-box CLI target: `panflat build --qc` bucket boundaries (`50`, `149`, `150 bp`)
+    and multi-hit union interval capping (`ratio <= 1.0`).
     """
     b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
     s_hom_250 = make_complex_seq(250, seed=8301)
@@ -2046,7 +1913,6 @@ def test_tier5_m3m4_13_qc_bucket_boundaries_50_149_150_and_union_cap(tmp_path: P
     b.add_node("ins_50", make_complex_seq(50, seed=8304))
     b.add_node("ins_149", make_complex_seq(149, seed=8305))
     b.add_node("ins_150", make_complex_seq(150, seed=8306))
-    # 250 bp inserted node with 2 SNPs relative to s_hom_250 (>99% identical to 3 reference copies in pan.fa)
     b.add_node("ins_250_hom", mutate_seq_snps(s_hom_250, num_snps=2, seed=8307))
 
     b.set_ref_path("Ref#1#Chr01", ["r1+", "r2+", "r3+", "r4+", "r5+"])
@@ -2066,8 +1932,6 @@ def test_tier5_m3m4_13_qc_bucket_boundaries_50_149_150_and_union_cap(tmp_path: P
     assert bundle.summary_kv["qc_short_50_149_lengths"] == "50,149"
     assert int(bundle.summary_kv["qc_long_ge150_count"]) == 2
     assert int(bundle.summary_kv["qc_long_ge150_bp"]) == 400
-    # ins_250_hom (250 bp) aligns to the 3 copies of s_hom_250 in pan.fa at >=98% identity,
-    # and _merge_intervals caps its redundant bases at 250 bp (not 3 * 250 = 750 bp)!
     assert int(bundle.summary_kv["qc_redundancy_0.98_bp"]) == 250
     assert 0.0 < float(bundle.summary_kv["qc_redundancy_0.98_ratio"]) <= 1.0
 
@@ -2076,13 +1940,14 @@ def test_tier5_m3m4_13_qc_bucket_boundaries_50_149_150_and_union_cap(tmp_path: P
 # 30 (M3/M4 #14). CLI Flag Validation & Multithreaded Shuffled GFA Determinism
 # ---------------------------------------------------------------------------
 
-def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determinism(tmp_path: Path) -> None:
-    """White-box target: `panflat/cli.py` (`main` lines 195-298) and `panflat/gfa_io.py`
-    (`validate_build_config` lines 65-145), plus deterministic multithreaded (`--threads 4`)
-    execution on a shuffled GFA input vs `--threads 1` on the unshuffled GFA input.
+def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determinism(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI target: invalid CLI flag rejections via `run_panflat_cli` and
+    deterministic multithreaded (`--threads 4`) execution on a shuffled GFA input vs
+    `--threads 1` on the unshuffled GFA input.
     """
     import random
-    from panflat.cli import main as cli_main
 
     b = SyntheticInputBuilder(tmp_path, chrom="Chr01", backbone_prefix="Ref#1#")
     for idx, nid in enumerate(["r0", "u", "cen", "v", "r4", "r5"]):
@@ -2090,7 +1955,12 @@ def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determin
     b.add_node("isl_a", make_complex_seq(550, seed=8410))
     b.add_node("ins_1", make_complex_seq(140, seed=8411))
     b.add_node("ins_2", make_complex_seq(160, seed=8412))
-    b.add_node("hyb_rg", make_complex_seq(250, seed=8413) + make_satellite_seq(20, 1500, seed=8414) + make_complex_seq(250, seed=8415))
+    b.add_node(
+        "hyb_rg",
+        make_complex_seq(250, seed=8413)
+        + make_satellite_seq(20, 1500, seed=8414)
+        + make_complex_seq(250, seed=8415),
+    )
 
     b.set_ref_path("Ref#1#Chr01", ["r0+", "u+", "cen+", "v+", "r4+", "r5+"])
     b.add_path("H1#1#Chr01", ["r0+", "ins_1+", "u+", "cen+", "isl_a+", "v+", "r4-", "r5+"])
@@ -2100,14 +1970,18 @@ def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determin
     b.add_gff_gene("g1", "m1", "+", [(20, 199)], [(20, 199, 0)])
 
     inputs = b.write("det_orig")
+    assert inputs.gff_path is not None and inputs.bed_path is not None
 
-    # 1. Invalid CLI flag combinations via direct `cli_main` (in-process coverage)
     base_cmd = [
         "build",
-        "--gfa", str(inputs.gfa_path),
-        "--ref-fa", str(inputs.ref_fa_path),
-        "--backbone-prefix", "Ref#1#",
-        "--out-prefix", str(tmp_path / "bad_cli"),
+        "--gfa",
+        str(inputs.gfa_path),
+        "--ref-fa",
+        str(inputs.ref_fa_path),
+        "--backbone-prefix",
+        "Ref#1#",
+        "--out-prefix",
+        str(tmp_path / "bad_cli"),
     ]
     bad_arg_sets = [
         [*base_cmd, "--cluster-cov", "0.0"],
@@ -2117,20 +1991,20 @@ def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determin
         [*base_cmd, "--sec-backbone", "invalid"],
         [*base_cmd, "--repeat-guard", "maybe"],
         [*base_cmd, "--centromere-mode", "invalid"],
-        [*base_cmd, "--centromere-mode", "extract-islands"],  # missing --centromere-bed
-        [*base_cmd, "--centromere-bed", str(inputs.bed_path), "--centromere-mode", "off"],  # explicit off with bed
-        [*base_cmd, "--centromere-min-island", "600"],  # explicit min-island when centromere mode is off
+        [*base_cmd, "--centromere-mode", "extract-islands"],
+        [*base_cmd, "--centromere-bed", str(inputs.bed_path), "--centromere-mode", "off"],
+        [*base_cmd, "--centromere-min-island", "600"],
         [*base_cmd, "--centromere-bed", str(inputs.bed_path), "--centromere-mode", "extract-islands", "--centromere-min-island", "20"],
         [*base_cmd, "--min-sv-len", "0"],
         [*base_cmd, "--splice-window", "-1"],
     ]
     for bad_argv in bad_arg_sets:
-        assert cli_main(bad_argv) != 0
+        proc = run_panflat_cli(bad_argv, check=False)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr
 
-    # 2. Create a shuffled copy of the GFA (permuting S, L, P, W lines deterministically)
     orig_lines = inputs.gfa_path.read_text(encoding="utf-8").splitlines()
-    hdr_lines = [l for l in orig_lines if l.startswith("H\t")]
-    body_lines = [l for l in orig_lines if not l.startswith("H\t") and l.strip()]
+    hdr_lines = [ln for ln in orig_lines if ln.startswith("H\t")]
+    body_lines = [ln for ln in orig_lines if not ln.startswith("H\t") and ln.strip()]
     rng = random.Random(8499)
     rng.shuffle(body_lines)
     shuf_gfa = tmp_path / "det_shuf.gfa"
@@ -2139,20 +2013,37 @@ def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determin
     out_t1 = tmp_path / "out_t1"
     out_t4 = tmp_path / "out_t4"
     common_flags = [
-        "--ref-fa", str(inputs.ref_fa_path),
-        "--backbone-prefix", "Ref#1#",
-        "--ref-gff", str(inputs.gff_path),
-        "--centromere-bed", str(inputs.bed_path),
-        "--centromere-mode", "extract-islands",
-        "--centromere-min-island", "500",
+        "--ref-fa",
+        str(inputs.ref_fa_path),
+        "--backbone-prefix",
+        "Ref#1#",
+        "--ref-gff",
+        str(inputs.gff_path),
+        "--centromere-bed",
+        str(inputs.bed_path),
+        "--centromere-mode",
+        "extract-islands",
+        "--centromere-min-island",
+        "500",
         "--dump-repeat-sequences",
         "--qc",
     ]
-    assert cli_main(["build", "--gfa", str(inputs.gfa_path), "--out-prefix", str(out_t1), "--threads", "1", *common_flags]) == 0
-    assert cli_main(["build", "--gfa", str(shuf_gfa), "--out-prefix", str(out_t4), "--threads", "4", *common_flags]) == 0
-    assert cli_main(["verify", "--prefix", str(out_t4), "--gfa", str(shuf_gfa), "--ref-fa", str(inputs.ref_fa_path), "--ref-gff", str(inputs.gff_path)]) == 0
+    run_panflat_cli(
+        ["build", "--gfa", str(inputs.gfa_path), "--out-prefix", str(out_t1), "--threads", "1", *common_flags],
+        check=True,
+    )
+    run_panflat_cli(
+        ["build", "--gfa", str(shuf_gfa), "--out-prefix", str(out_t4), "--threads", "4", *common_flags],
+        check=True,
+    )
+    run_verify(
+        out_t4,
+        shuf_gfa,
+        inputs.ref_fa_path,
+        extra_args=["--ref-gff", inputs.gff_path, "--centromere-bed", inputs.bed_path],
+        check=True,
+    )
 
-    # All primary output files must be byte-for-byte identical between unshuffled threads=1 and shuffled threads=4!
     for ext in [
         ".pan.fa",
         ".offsets.tsv",
@@ -2169,3 +2060,1859 @@ def test_tier5_m3m4_14_cli_entrypoints_flags_and_multithreaded_shuffled_determin
             f"Determinism mismatch in {ext} between threads=1 unshuffled and threads=4 shuffled GFA"
         )
 
+
+# ===========================================================================
+# M7 Deep Code-Review Hardening & Bug-Fix Verification CLI E2E Suite
+# ===========================================================================
+
+
+def test_tier5_m7_01_w_walk_int_gfa_full_sv_reanchor_and_centromere_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #1 (CLI E2E): Pure W-line integer GFA (`1..20`, activating compact
+    `LazyStepTuple` fast paths) exercising `DEL` (empty `LazyStepTuple` branch), `CNV`,
+    `DUP_TRA`, `LARGE_JUMP`, local re-anchoring across multi-copy nodes, and centromere
+    `extract-islands` & `bypass` via `panflat build` + `panflat verify`.
+    """
+    b = SyntheticInputBuilder(tmp_path / "m7_w", chrom="Chr01", backbone_prefix="Ref#1#")
+    for i in range(1, 20):
+        b.add_node(str(i), make_complex_seq(200, seed=9800 + i))
+    b.add_node("20", make_complex_seq(600, seed=9820))
+
+    ref_toks = [
+        "1+", "2+", "3+", "4+",
+        "5+", "6+", "5+",
+        "7+", "8+",
+        "9+", "9+", "10+",
+        "11+", "12+", "13+", "14+", "15+", "16+",
+    ]
+    alt1_toks = [
+        "1+", "2+", "3+", "20+", "4+",
+        "5+", "17+", "6+", "5+",
+        "8+",
+        "9+", "9+", "9+", "9+", "10+",
+        "11+", "12+", "13+", "14+", "8+", "15+", "16+",
+    ]
+    alt2_toks = [
+        "1+", "2+", "3+", "4+",
+        "5+", "6+", "5+",
+        "7+", "8+",
+        "9+", "9+", "10+",
+        "11+", "18+", "15+", "16+",
+    ]
+
+    # Write pure W-line integer GFA (no P-lines at all)
+    links: set[tuple[str, str]] = set()
+    for w in (ref_toks, alt1_toks, alt2_toks):
+        for x, y in zip(w[:-1], w[1:]):
+            links.add((x[:-1], y[:-1]))
+    gfa_lines = ["H\tVN:Z:1.0"]
+    for i in range(1, 21):
+        gfa_lines.append(f"S\t{i}\t{b.nodes[str(i)]}")
+    for u, v in sorted(links, key=lambda kv: (int(kv[0]), int(kv[1]))):
+        gfa_lines.append(f"L\t{u}\t+\t{v}\t+\t0M")
+    gfa_lines.append("W\tRef\t1\tChr01\t0\t*\t" + "".join(f">{t[:-1]}" for t in ref_toks))
+    gfa_lines.append("W\tAlt1\t1\tctgA\t500\t*\t" + "".join(f">{t[:-1]}" for t in alt1_toks))
+    gfa_lines.append("W\tAlt2\t1\tctgB\t900\t*\t" + "".join(f">{t[:-1]}" for t in alt2_toks))
+
+    gfa_path = tmp_path / "pure_w.gfa"
+    gfa_path.write_text("\n".join(gfa_lines) + "\n", encoding="utf-8")
+    ref_fa_path = tmp_path / "pure_w.fa"
+    ref_fa_path.write_text(
+        ">Chr01\n" + "".join(b.nodes[t[:-1]] for t in ref_toks) + "\n",
+        encoding="utf-8",
+    )
+    bed_path = tmp_path / "pure_w.bed"
+    bed_path.write_text("Chr01\t400\t600\tCEN_W\n", encoding="utf-8")
+
+    for mode in ("extract-islands", "bypass"):
+        out_p = tmp_path / f"out_w_{mode}"
+        extra = ["--centromere-mode", mode]
+        if mode == "extract-islands":
+            extra += ["--centromere-min-island", "500"]
+        run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gfa_path),
+                "--ref-fa",
+                str(ref_fa_path),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--centromere-bed",
+                str(bed_path),
+                "--max-jump",
+                "500",
+                *extra,
+                "--out-prefix",
+                str(out_p),
+            ],
+            check=True,
+        )
+        run_verify(out_p, gfa_path, ref_fa_path, extra_args=["--centromere-bed", bed_path], check=True)
+        bun = OutputBundle(out_p)
+        assert_all_global_invariants(bun, gfa_path, ref_fa_path)
+        assert_centromere_accounting_and_offsets(bun)
+        sv_types = {r["type"] for r in bun.sv_rows}
+        assert {"INS", "DEL", "CNV", "DUP_TRA", "LARGE_JUMP"}.issubset(sv_types)
+        if mode == "extract-islands":
+            assert "CEN_ISLAND" in sv_types
+        else:
+            assert "CEN_ISLAND" not in sv_types
+
+
+def test_tier5_m7_02_pansn_backbone_prefix_disambiguation_and_verify_override_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #2 (CLI E2E):
+    - `--backbone-prefix SampleA` vs `SampleA2#1#Chr10A` / `SampleAB#1#Chr10A`
+    - `--backbone-prefix SampleA#1` vs `SampleA#10#Chr10A`
+    - `--backbone-prefix SampleA#0#` fallback to `SampleA#1#Chr10A`
+    - Multi-record PanSN `--ref-fa` selection and ambiguous/unmatched rejection
+    - Standalone `panflat verify --backbone-prefix ...` positive AND negative (`WrongSample#`
+      and `SampleB#1#` failing verification even when `summary.tsv` recorded valid `ref_path`).
+    """
+    s_a = make_complex_seq(180, seed=9831)
+    s_b = make_complex_seq(180, seed=9832)
+    s_ins = make_complex_seq(90, seed=9833)
+    gfa_path = tmp_path / "pansn.gfa"
+    gfa_path.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{s_a}",
+                f"S\t2\t{s_b}",
+                f"S\t3\t{s_ins}",
+                "L\t1\t+\t3\t+\t0M",
+                "P\tSampleA#1#Chr10A\t1+\t*",
+                "P\tSampleA2#1#Chr10A\t2+\t*",
+                "P\tSampleAB#1#Chr10A\t2+\t*",
+                "P\tSampleA#10#Chr10A\t2+\t*",
+                "P\tSampleB#1#Chr10A\t1+,3+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    multi_fa = tmp_path / "pansn_multi.fa"
+    multi_fa.write_text(
+        f">SampleB#1#Chr10A\n{s_a + s_ins}\n"
+        f">SampleA2#1#Chr10A\n{s_b}\n"
+        f">SampleA#10#Chr10A\n{s_b}\n"
+        f">SampleA#1#Chr10A\n{s_a}\n"
+        f">SampleA#1#Chr10B\n{s_b}\n",
+        encoding="utf-8",
+    )
+
+    for idx, ok_bp in enumerate(["SampleA", "SampleA#1", "SampleA#0#", "SampleA#1#"]):
+        out_p = tmp_path / f"ok_bp_{idx}"
+        run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gfa_path),
+                "--ref-fa",
+                str(multi_fa),
+                "--backbone-prefix",
+                ok_bp,
+                "--out-prefix",
+                str(out_p),
+            ],
+            check=True,
+        )
+        bun = OutputBundle(out_p)
+        assert bun.summary_kv["chrom"] == "Chr10A"
+        assert int(bun.summary_kv["ref_len"]) == len(s_a)
+
+    # Ambiguous / unmatched multi-record plain FASTA (>Chr10A + >Chr10B without '#') fails CLI
+    plain_multi = tmp_path / "plain_multi.fa"
+    plain_multi.write_text(f">Chr10A\n{s_a}\n>Chr10B\n{s_b}\n", encoding="utf-8")
+    p_plain = run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(plain_multi),
+            "--backbone-prefix",
+            "SampleA#1#",
+            "--out-prefix",
+            str(tmp_path / "bad_plain"),
+        ],
+        check=False,
+    )
+    assert p_plain.returncode != 0 and "Traceback" not in p_plain.stderr
+
+    # Standalone panflat verify --backbone-prefix positive & negative override checks
+    built_prefix = tmp_path / "ok_bp_3"
+    run_verify(built_prefix, gfa_path, multi_fa, check=True)
+    run_panflat_cli(
+        [
+            "verify",
+            "--prefix",
+            str(built_prefix),
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(multi_fa),
+            "--backbone-prefix",
+            "SampleA#0#",
+        ],
+        check=True,
+    )
+    p_wrong1 = run_panflat_cli(
+        [
+            "verify",
+            "--prefix",
+            str(built_prefix),
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(multi_fa),
+            "--backbone-prefix",
+            "WrongSample#",
+        ],
+        check=False,
+    )
+    assert p_wrong1.returncode != 0
+    p_wrong2 = run_panflat_cli(
+        [
+            "verify",
+            "--prefix",
+            str(built_prefix),
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(multi_fa),
+            "--backbone-prefix",
+            "SampleB#1#",
+        ],
+        check=False,
+    )
+    assert p_wrong2.returncode != 0
+
+
+def test_tier5_m7_03_noncanonical_zero_padded_and_sparse_50m_node_ids_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #3 (CLI E2E): Coexisting zero-padded `"01"`, `"001"`, canonical `"1"`,
+    and huge integer `"999999999999999999999999999999"` node IDs, plus sparse integer
+    `S 1` + `S 50000000` completing rapidly via CLI `panflat build` + `panflat verify`.
+    """
+    s01 = make_complex_seq(120, seed=9841)
+    s001 = make_complex_seq(120, seed=9842)
+    s1 = make_complex_seq(120, seed=9843)
+    shuge = make_complex_seq(120, seed=9844)
+    gfa_noncanon = tmp_path / "noncanon.gfa"
+    huge_id = "999999999999999999999999999999"
+    gfa_noncanon.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t01\t{s01}",
+                f"S\t001\t{s001}",
+                f"S\t1\t{s1}",
+                f"S\t{huge_id}\t{shuge}",
+                f"L\t01\t+\t{huge_id}\t+\t0M",
+                "L\t01\t+\t001\t+\t0M",
+                "L\t001\t+\t1\t+\t0M",
+                f"L\t1\t+\t{huge_id}\t+\t0M",
+                f"P\tRef#1#Chr01\t01+,{huge_id}+\t*",
+                f"P\tAlt#1#Chr01\t01+,001+,1+,{huge_id}+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa_noncanon = tmp_path / "noncanon.fa"
+    fa_noncanon.write_text(f">Chr01\n{s01 + shuge}\n", encoding="utf-8")
+    out_nc = tmp_path / "out_nc"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_noncanon),
+            "--ref-fa",
+            str(fa_noncanon),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out_nc),
+        ],
+        check=True,
+    )
+    run_verify(out_nc, gfa_noncanon, fa_noncanon, check=True)
+    bun_nc = OutputBundle(out_nc)
+    assert len(bun_nc.sv_rows) == 1 and int(bun_nc.inserts[0]["pan_end"]) - int(bun_nc.inserts[0]["pan_start"]) == 240
+
+    # Sparse canonical integer IDs: S 1 and S 50000000
+    s_50m = make_complex_seq(150, seed=9845)
+    gfa_sparse = tmp_path / "sparse50m.gfa"
+    gfa_sparse.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{s1}",
+                f"S\t2\t{s01}",
+                f"S\t50000000\t{s_50m}",
+                "L\t1\t+\t50000000\t+\t0M",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t50000000\t+\t0M",
+                "P\tRef#1#Chr01\t1+,50000000+\t*",
+                "P\tAlt#1#Chr01\t1+,2+,50000000+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa_sparse = tmp_path / "sparse50m.fa"
+    fa_sparse.write_text(f">Chr01\n{s1 + s_50m}\n", encoding="utf-8")
+    out_sp = tmp_path / "out_sp50m"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_sparse),
+            "--ref-fa",
+            str(fa_sparse),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out_sp),
+        ],
+        check=True,
+    )
+    run_verify(out_sp, gfa_sparse, fa_sparse, check=True)
+
+
+def test_tier5_m7_04_qc_self_hit_masking_91pct_homologs_and_cen_ref_hits_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #4 (CLI E2E): Two `1000 bp` inserted pieces ~91.5% identical (`85` SNPs)
+    report `qc_redundancy_0.90_bp == 2000` (`100%`) and `qc_redundancy_0.95_bp == 0` via
+    `panflat build --qc` (confirming 100% self-hit in `pan.fa` no longer suppresses ~91.5%
+    homologs), plus a `CEN_ISLAND` with ~92% homology to a non-centromeric reference arm.
+    """
+    b = SyntheticInputBuilder(tmp_path / "m7_qc", chrom="Chr01", backbone_prefix="Ref#1#")
+    s_arm_hom = make_complex_seq(1000, seed=9850)
+    b.add_node("r1", s_arm_hom)
+    b.add_node("u", make_complex_seq(300, seed=9851))
+    b.add_node("cen", make_complex_seq(300, seed=9852))
+    b.add_node("v", make_complex_seq(300, seed=9853))
+    b.add_node("r2", make_complex_seq(300, seed=9854))
+    b.add_node("r3", make_complex_seq(300, seed=9855))
+
+    import random as _rnd
+
+    p1 = make_complex_seq(1000, seed=9856)
+    p2 = mutate_seq_snps(p1, positions=sorted(_rnd.Random(9857).sample(range(30, 970), 75)), seed=9857)
+    cen_isl = mutate_seq_snps(s_arm_hom, positions=sorted(_rnd.Random(9858).sample(range(30, 970), 75)), seed=9858)
+    b.add_node("p1", p1)
+    b.add_node("p2", p2)
+    b.add_node("cisl", cen_isl)
+
+    b.set_ref_path("Ref#1#Chr01", ["r1+", "u+", "cen+", "v+", "r2+", "r3+"])
+    b.add_path("Alt#1#Chr01", ["r1+", "u+", "cen+", "cisl+", "v+", "p1+", "r2+", "p2+", "r3+"])
+    b.add_bed_region(1300, 1600, "CEN_QC")
+    inputs = b.write("m7_qc")
+
+    # Test both without centromere (pure 2 pieces: 2000 bp) and with centromere island (3000 bp)
+    out_pure2 = tmp_path / "out_pure2"
+    gfa_pure2 = tmp_path / "pure2.gfa"
+    fa_pure2 = tmp_path / "pure2.fa"
+    r_a, r_b, r_c = make_complex_seq(300, seed=9861), make_complex_seq(300, seed=9862), make_complex_seq(300, seed=9863)
+    gfa_pure2.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{r_a}",
+                f"S\t2\t{r_b}",
+                f"S\t3\t{r_c}",
+                f"S\t4\t{p1}",
+                f"S\t5\t{p2}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t1\t+\t4\t+\t0M",
+                "L\t4\t+\t2\t+\t0M",
+                "L\t2\t+\t5\t+\t0M",
+                "L\t5\t+\t3\t+\t0M",
+                "P\tRef#1#Chr01\t1+,2+,3+\t*",
+                "P\tAlt#1#Chr01\t1+,4+,2+,5+,3+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa_pure2.write_text(f">Chr01\n{r_a + r_b + r_c}\n", encoding="utf-8")
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_pure2),
+            "--ref-fa",
+            str(fa_pure2),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--qc",
+            "--out-prefix",
+            str(out_pure2),
+        ],
+        check=True,
+    )
+    bun_p2 = OutputBundle(out_pure2)
+    assert int(bun_p2.summary_kv["qc_long_ge150_bp"]) == 2000
+    assert int(bun_p2.summary_kv["qc_redundancy_0.90_bp"]) == 2000
+    assert int(bun_p2.summary_kv["qc_redundancy_0.95_bp"]) == 0
+
+    _, bun_cen = run_build(
+        inputs,
+        extra_args=["--centromere-mode", "extract-islands", "--centromere-min-island", "500", "--qc"],
+    )
+    assert bun_cen is not None
+    assert int(bun_cen.summary_kv["qc_cen_island_ge150_bp"]) == 1000
+    assert int(bun_cen.summary_kv["qc_cen_island_ref_hit_0.90_bp"]) == 1000
+    assert int(bun_cen.summary_kv["qc_cen_island_ref_hit_0.95_bp"]) == 0
+
+
+def test_tier5_m7_05_gff3_multi_parent_isoforms_liftover_and_verify_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #5 (CLI E2E): Shared `exon` and `CDS` rows carrying `Parent=tx1,tx2`
+    (comma-separated multiple parent transcripts) lifted across internal CDS and intronic
+    insertions and verified by `panflat verify --ref-gff` with 100% reconstructed mRNA &
+    protein sequence identity for both `tx1` and `tx2`.
+    """
+    cds_up = make_coding_seq(31, seed=9871)[:-3]  # 90 bp: ATG + 29 sense codons (no stop)
+    intron = make_complex_seq(90, seed=9872)
+    shared_orf = make_coding_seq(60, seed=9873)  # 180 bp: ATG + 58 sense codons + TAA
+    cds_sh1 = shared_orf[:90]
+    cds_sh2 = shared_orf[90:]
+    ins_intron = make_complex_seq(70, seed=9875)
+    ins_cds = make_complex_seq(80, seed=9876)
+
+    gfa_path = tmp_path / "mp_iso.gfa"
+    gfa_path.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{cds_up}",
+                f"S\t2\t{intron[:45]}",
+                f"S\t3\t{intron[45:]}",
+                f"S\t4\t{cds_sh1}",
+                f"S\t5\t{cds_sh2}",
+                f"S\t6\t{ins_intron}",
+                f"S\t7\t{ins_cds}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t3\t+\t4\t+\t0M",
+                "L\t4\t+\t5\t+\t0M",
+                "L\t2\t+\t6\t+\t0M",
+                "L\t6\t+\t3\t+\t0M",
+                "L\t4\t+\t7\t+\t0M",
+                "L\t7\t+\t5\t+\t0M",
+                "P\tRef#1#Chr01\t1+,2+,3+,4+,5+\t*",
+                "P\tAlt#1#Chr01\t1+,2+,6+,3+,4+,7+,5+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ref_seq = cds_up + intron + cds_sh1 + cds_sh2
+    fa_path = tmp_path / "mp_iso.fa"
+    fa_path.write_text(f">Chr01\n{ref_seq}\n", encoding="utf-8")
+
+    gff_path = tmp_path / "mp_iso.gff3"
+    gff_path.write_text(
+        "\n".join(
+            [
+                "##gff-version 3",
+                "Chr01\tsrc\tgene\t1\t360\t.\t+\t.\tID=g1",
+                "Chr01\tsrc\tmRNA\t1\t360\t.\t+\t.\tID=tx1;Parent=g1",
+                "Chr01\tsrc\tmRNA\t181\t360\t.\t+\t.\tID=tx2;Parent=g1",
+                "Chr01\tsrc\texon\t1\t90\t.\t+\t.\tID=ex1;Parent=tx1",
+                "Chr01\tsrc\tCDS\t1\t90\t.\t+\t0\tID=cds1;Parent=tx1",
+                "Chr01\tsrc\texon\t181\t360\t.\t+\t.\tID=ex_shared;Parent=tx1,tx2",
+                "Chr01\tsrc\tCDS\t181\t360\t.\t+\t0\tID=cds_shared;Parent=tx1,tx2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    out_p = tmp_path / "out_mp_iso"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_path),
+            "--ref-fa",
+            str(fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(gff_path),
+            "--out-prefix",
+            str(out_p),
+        ],
+        check=True,
+    )
+    run_verify(out_p, gfa_path, fa_path, extra_args=["--ref-gff", gff_path], check=True)
+
+    bun = OutputBundle(out_p)
+    pan_seq = bun.pan_fa["Chr01"]
+    ex_by_tx: dict[str, list[tuple[int, int]]] = {"tx1": [], "tx2": []}
+    tx_status: dict[str, str] = {}
+    for row in bun.lifted_gff_rows:
+        attrs = row["attributes"]
+        if row["type"] == "mRNA":
+            tx_status[attrs["ID"]] = attrs.get("sv_status", "")
+        elif row["type"] == "exon":
+            for pid in attrs.get("Parent", "").split(","):
+                if pid in ex_by_tx:
+                    ex_by_tx[pid].append((int(row["start"]) - 1, int(row["end"])))
+
+    assert "".join(pan_seq[s:e] for s, e in sorted(ex_by_tx["tx1"])) == cds_up + cds_sh1 + cds_sh2
+    assert "".join(pan_seq[s:e] for s, e in sorted(ex_by_tx["tx2"])) == cds_sh1 + cds_sh2
+    assert "intronic_insertion" in tx_status["tx1"] and "cds_split_by_insertion" in tx_status["tx1"]
+    assert tx_status["tx2"] == "cds_split_by_insertion"
+
+
+def test_tier5_m7_06_hierarchical_merge_colliding_ids_custom_spacer_and_reversed_ref_verify_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #2 & #6 (CLI E2E):
+    - Multi-chromosome `panflat merge` across 3 chromosomes built with `--spacer-n 50` and
+      `--qc`, with cross-GFA colliding `src_path` (`scaf_shared`), `exported_fasta_id`,
+      `region_id` (`CEN_SHARED`), and `event_id`.
+    - Hierarchical `panflat merge` (`merge([chr1, chr2])` + `chr3`) preserving exact
+      per-chromosome `Chr02::scaf_shared` / `Chr03::scaf_shared` attribution and unique
+      per-chromosome `summary.tsv` keys.
+    - Standalone `panflat verify` on the merged bundle against a multi-sequence PanSN
+      `--ref-fa` whose record order (`Chr03`, `Chr02`, `Chr01`) is reversed relative to
+      `prefix_list` order (`Chr01`, `Chr02`, `Chr03`).
+    """
+    chrom_specs = [("Chr01", 10), ("Chr02", 20), ("Chr03", 30)]
+    per_chrom_prefixes: list[Path] = []
+    comb_gfa_lines = ["H\tVN:Z:1.0"]
+    ref_records_map: dict[str, str] = {}
+
+    for chrom, nbase in chrom_specs:
+        s1 = make_complex_seq(200, seed=9900 + nbase + 1)
+        s_u = make_complex_seq(200, seed=9900 + nbase + 2)
+        s_cen = make_complex_seq(200, seed=9900 + nbase + 3)
+        s_v = make_complex_seq(200, seed=9900 + nbase + 4)
+        ins_seq = make_complex_seq(180, seed=9900 + nbase + 5)
+        unanch = make_complex_seq(120, seed=9900 + nbase + 6)
+        cen_isl = make_complex_seq(550, seed=9900 + nbase + 7)
+
+        alt_path = "scaf_c1" if chrom == "Chr01" else "scaf_shared"
+        gfa_c_lines = [
+            "H\tVN:Z:1.0",
+            f"S\t{nbase+1}\t{s1}",
+            f"S\t{nbase+2}\t{s_u}",
+            f"S\t{nbase+3}\t{s_cen}",
+            f"S\t{nbase+4}\t{s_v}",
+            f"S\t{nbase+5}\t{ins_seq}",
+            f"S\t{nbase+6}\t{unanch}",
+            f"S\t{nbase+7}\t{cen_isl}",
+            f"L\t{nbase+6}\t+\t{nbase+1}\t+\t0M",
+            f"L\t{nbase+1}\t+\t{nbase+2}\t+\t0M",
+            f"L\t{nbase+1}\t+\t{nbase+5}\t+\t0M",
+            f"L\t{nbase+5}\t+\t{nbase+2}\t+\t0M",
+            f"L\t{nbase+2}\t+\t{nbase+3}\t+\t0M",
+            f"L\t{nbase+3}\t+\t{nbase+4}\t+\t0M",
+            f"L\t{nbase+3}\t+\t{nbase+7}\t+\t0M",
+            f"L\t{nbase+7}\t+\t{nbase+4}\t+\t0M",
+            f"P\tSampleA#1#{chrom}\t{nbase+1}+,{nbase+2}+,{nbase+3}+,{nbase+4}+\t*",
+            f"P\t{alt_path}\t{nbase+6}+,{nbase+1}+,{nbase+5}+,{nbase+2}+,{nbase+3}+,{nbase+7}+,{nbase+4}+\t*",
+        ]
+        gfa_c = tmp_path / f"{chrom}.gfa"
+        gfa_c.write_text("\n".join(gfa_c_lines) + "\n", encoding="utf-8")
+        for gl in gfa_c_lines[1:]:
+            if not gl.startswith("P\tscaf_shared\t"):
+                comb_gfa_lines.append(gl)
+            else:
+                comb_gfa_lines.append(gl.replace("P\tscaf_shared\t", f"P\t{chrom}::scaf_shared\t", 1))
+
+        ref_seq_c = s1 + s_u + s_cen + s_v
+        ref_records_map[chrom] = ref_seq_c
+        fa_c = tmp_path / f"{chrom}.fa"
+        fa_c.write_text(f">SampleA#1#{chrom}\n{ref_seq_c}\n", encoding="utf-8")
+        bed_c = tmp_path / f"{chrom}.bed"
+        bed_c.write_text(f"{chrom}\t400\t600\tCEN_SHARED\n", encoding="utf-8")
+
+        out_c = tmp_path / f"built_{chrom}"
+        run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gfa_c),
+                "--ref-fa",
+                str(fa_c),
+                "--backbone-prefix",
+                "SampleA#1#",
+                "--centromere-bed",
+                str(bed_c),
+                "--centromere-mode",
+                "extract-islands",
+                "--centromere-min-island",
+                "500",
+                "--spacer-n",
+                "50",
+                "--qc",
+                "--out-prefix",
+                str(out_c),
+            ],
+            check=True,
+        )
+        per_chrom_prefixes.append(out_c)
+
+    # Hierarchical merge via CLI: merge([Chr01, Chr02]) -> m12, then merge([m12, Chr03]) -> m123
+    m12 = tmp_path / "m12"
+    run_merge([per_chrom_prefixes[0], per_chrom_prefixes[1]], m12)
+    m123 = tmp_path / "m123"
+    _, bun_123 = run_merge([m12, per_chrom_prefixes[2]], m123)
+    assert bun_123 is not None
+
+    # Reversed multi-sequence PanSN FASTA (Chr03, Chr02, Chr01 + distractor SampleB records)
+    rev_multi_fa = tmp_path / "rev_multi.fa"
+    rev_multi_fa.write_text(
+        f">SampleB#1#Chr03\n{make_complex_seq(800, seed=9991)}\n"
+        f">SampleA#1#Chr03\n{ref_records_map['Chr03']}\n"
+        f">SampleA#1#Chr02\n{ref_records_map['Chr02']}\n"
+        f">SampleB#1#Chr01\n{make_complex_seq(800, seed=9992)}\n"
+        f">SampleA#1#Chr01\n{ref_records_map['Chr01']}\n",
+        encoding="utf-8",
+    )
+    comb_gfa = tmp_path / "comb_123.gfa"
+    comb_gfa.write_text("\n".join(comb_gfa_lines) + "\n", encoding="utf-8")
+
+    # Standalone panflat verify passes on reversed PanSN multi-FASTA
+    run_verify(m123, comb_gfa, rev_multi_fa, check=True)
+
+    # Colliding scaf_shared on Chr02 and Chr03 must be qualified as Chr02::scaf_shared and Chr03::scaf_shared
+    ins_by_chrom = [(r["chrom"], r["src_path"]) for r in bun_123.inserts]
+    assert ("Chr02", "Chr02::scaf_shared") in ins_by_chrom
+    assert ("Chr03", "Chr03::scaf_shared") in ins_by_chrom
+    assert ("Chr02", "Chr01::scaf_shared") not in ins_by_chrom
+
+    # And wrong --backbone-prefix on merged verify fails
+    p_m_wrong = run_panflat_cli(
+        [
+            "verify",
+            "--prefix",
+            str(m123),
+            "--gfa",
+            str(comb_gfa),
+            "--ref-fa",
+            str(rev_multi_fa),
+            "--backbone-prefix",
+            "WrongSample#",
+        ],
+        check=False,
+    )
+    assert p_m_wrong.returncode != 0
+
+
+def test_tier5_m7_07_centromere_duplicate_flanking_anchor_and_repeat_guard_boundaries_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #7 (CLI E2E):
+    - Centromere flanking node `u` or `v` visited twice inside a donor contig (`ambiguous` /
+      `partial` status, never false `complete`).
+    - Repeat-guard window boundaries (`499`, `500`, `999`, `1000`, `1001 bp`), exact `0.30`
+      vs `< 0.30` singleton_ratio boundary (`180/600` vs `179/600`), and `unknown` window
+      breaking adjacent `low` runs via `panflat build` + `panflat verify`.
+    """
+    b = SyntheticInputBuilder(tmp_path / "m7_cen_rg", chrom="Chr01", backbone_prefix="Ref#1#")
+    for idx, nid in enumerate(["r0", "u", "cen", "v", "r1", "r2", "r3", "r4", "r5", "r6"]):
+        b.add_node(nid, make_complex_seq(200, seed=9950 + idx))
+    b.add_node("cisl", make_complex_seq(600, seed=9965))
+
+    sat_big = make_satellite_seq(20, 2600, seed=9601)
+    sat_614 = make_satellite_seq(20, 614, seed=901)
+    comp_614 = make_complex_seq(614, seed=902)
+    b.add_node("sat499", sat_big[:499])  # < 500 bp -> NOT repeat-masked, kept!
+    b.add_node("sat500", sat_big[:500])  # == 500 bp -> short-block masked!
+    b.add_node("sat1001", sat_big[:1001])  # == 1001 bp -> 2-window masked!
+    b.add_node("eq030", sat_614[:434] + comp_614[434:614])  # 180/600 == 0.30 -> kept!
+    b.add_node("lt030", sat_614[:435] + comp_614[435:614])  # 179/600 < 0.30 -> masked!
+    b.add_node("unk_brk", sat_big[:1000] + ("N" * 200) + sat_big[1200:2500])  # unknown breaks low runs -> kept!
+
+    b.set_ref_path("Ref#1#Chr01", ["r0+", "u+", "cen+", "v+", "r1+", "r2+", "r3+", "r4+", "r5+", "r6+"])
+    b.add_path("DupU#1#Chr01", ["r0+", "u+", "cen+", "u+", "cisl+", "v+", "r1+", "r2+", "r3+", "r4+", "r5+", "r6+"])
+    b.add_path("DupV#1#Chr01", ["r0+", "u+", "cisl+", "v+", "cen+", "v+", "r1+", "r2+", "r3+", "r4+", "r5+", "r6+"])
+    b.add_path(
+        "RG#1#Chr01",
+        [
+            "r0+", "u+", "cen+", "v+",
+            "sat499+", "r1+",
+            "sat500+", "r2+",
+            "sat1001+", "r3+",
+            "eq030+", "r4+",
+            "lt030+", "r5+",
+            "unk_brk+", "r6+",
+        ],
+    )
+    b.add_bed_region(400, 600, "CEN_DUP")
+    inputs = b.write("cen_rg")
+    assert inputs.bed_path is not None
+
+    _, bun = run_build(
+        inputs,
+        extra_args=[
+            "--centromere-mode",
+            "extract-islands",
+            "--centromere-min-island",
+            "500",
+            "--repeat-guard",
+            "on",
+            "--dump-repeat-sequences",
+        ],
+    )
+    assert bun is not None
+    run_verify(inputs.out_prefix, inputs.gfa_path, inputs.ref_fa_path, extra_args=["--centromere-bed", inputs.bed_path], check=True)
+
+    assert bun.centromere_rows is not None
+    cen_by_hap = {r["hap"]: r for r in bun.centromere_rows}
+    for h in ("DupU#1", "DupV#1"):
+        assert cen_by_hap[h]["status"] in ("ambiguous", "partial")
+        assert cen_by_hap[h]["length_ratio"] == "."
+
+    # sat500 (500 bp), sat1001 (1001 bp), and lt030 (614 bp) are masked as REPEAT_LIKE;
+    # sat499 (499 bp), eq030 (614 bp), and unk_brk (2500 bp total) are KEPT as INS!
+    rep_lens = sorted(int(r["length"]) for r in bun.unresolved if r["reason"] == "REPEAT_LIKE")
+    assert rep_lens == [500, 614, 1001]
+    ins_lens = sorted(int(r["pan_end"]) - int(r["pan_start"]) for r in bun.inserts)
+    assert [499, 614, 2500] == ins_lens
+
+
+def test_tier5_m7_08_malformed_fasta_gfa_w_overlap_and_cli_bounds_rejections(
+    tmp_path: Path,
+) -> None:
+    """M7 Checklist #8 (CLI E2E): Opaque-box CLI rejection matrix (non-zero exit code,
+    clean error message, zero Python tracebacks) across malformed FASTA files, GFA `LN:i:`
+    mismatch, non-`0M` L/P overlaps, overlapping W-line intervals on `(hap_id, seqid)`,
+    duplicate P+W source intervals, and invalid `verify --spacer-n -1`.
+    """
+    valid_gfa = tmp_path / "ok.gfa"
+    valid_gfa.write_text("H\tVN:Z:1.0\nS\t1\tACGTACGT\nP\tRef#1#Chr01\t1+\t*\n", encoding="utf-8")
+    valid_fa = tmp_path / "ok.fa"
+    valid_fa.write_text(">Chr01\nACGTACGT\n", encoding="utf-8")
+
+    # 1. Malformed FASTA files
+    for idx, bad_fa in enumerate(
+        [
+            "",
+            "ACGTACGT\n>Chr01\nACGT\n",
+            ">\nACGTACGT\n",
+            ">Chr01\n>Chr02\nACGT\n",
+            ">Chr01\nACGTACGT\n>Chr01\nACGTACGT\n",
+            ">Chr01\nACGT1234\n",
+        ]
+    ):
+        fp = tmp_path / f"bad_fa_{idx}.fa"
+        fp.write_text(bad_fa, encoding="utf-8")
+        proc = run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(valid_gfa),
+                "--ref-fa",
+                str(fp),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--out-prefix",
+                str(tmp_path / f"out_bfa_{idx}"),
+            ],
+            check=False,
+        )
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr
+
+    # 2. Malformed GFA files
+    for idx, bad_gfa in enumerate(
+        [
+            "H\tVN:Z:1.0\nS\t1\tACGTACGT\tLN:i:99\nP\tRef#1#Chr01\t1+\t*\n",
+            "H\tVN:Z:1.0\nS\t1\tACGT$CGT\nP\tRef#1#Chr01\t1+\t*\n",
+            "H\tVN:Z:1.0\nS\t1\tACGT\nS\t2\tACGT\nL\t1\t+\t2\t+\t4M\nP\tRef#1#Chr01\t1+,2+\t*\n",
+            "H\tVN:Z:1.0\nS\t1\tACGT\nS\t2\tACGT\nL\t1\t+\t2\t+\t0M\nP\tRef#1#Chr01\t1+,2+\t4M\n",
+            "H\tVN:Z:1.0\nS\t1\tACGTACGT\nP\tRef#1#Chr01\t1+\t*\nW\tAlt\t1\tctg1\t0\t8\t>1\nW\tAlt\t1\tctg1\t4\t12\t>1\n",
+            "H\tVN:Z:1.0\nS\t1\tACGTACGT\nP\tRef#1#Chr01\t1+\t*\nP\tAlt#1#Chr01\t1+\t*\nW\tAlt\t1\tChr01\t0\t8\t>1\n",
+        ]
+    ):
+        gp = tmp_path / f"bad_gfa_{idx}.gfa"
+        gp.write_text(bad_gfa, encoding="utf-8")
+        proc = run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gp),
+                "--ref-fa",
+                str(valid_fa),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--out-prefix",
+                str(tmp_path / f"out_bgfa_{idx}"),
+            ],
+            check=False,
+        )
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr
+
+    # 3. Invalid verify --spacer-n -1 rejected cleanly
+    out_ok = tmp_path / "out_ok"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(valid_gfa),
+            "--ref-fa",
+            str(valid_fa),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out_ok),
+        ],
+        check=True,
+    )
+    proc_ver = run_panflat_cli(
+        [
+            "verify",
+            "--prefix",
+            str(out_ok),
+            "--gfa",
+            str(valid_gfa),
+            "--ref-fa",
+            str(valid_fa),
+            "--spacer-n",
+            "-1",
+        ],
+        check=False,
+    )
+    assert proc_ver.returncode != 0 and "Traceback" not in proc_ver.stderr
+
+
+def test_tier5_m7_09_r2_d1_four_way_isomorphic_graph_multi_hit_isolation_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D1` (CLI E2E): 4-way isomorphic graph encoding parity across
+    integer `P`, integer `W` (`seq_start > 0`), string `P`, and mixed `0`/`01`/`¹` node IDs.
+    Verifies via `panflat build` + `panflat verify` that neither a `< min_sv_len` micro-SNP
+    nor a co-occurring pure `DEL` on a `multi_hit` non-carrier haplotype leaks `multi_hit=1`
+    onto `INS` alleles, and all 4 encodings produce identical `pan.fa`, `sv.tsv`, and
+    `genotypes.tsv`.
+    """
+    s_a = make_complex_seq(140, seed=10101)
+    s_b = make_complex_seq(140, seed=10102)
+    s_del = make_complex_seq(80, seed=10103)
+    s_c = make_complex_seq(140, seed=10104)
+    s_ins1 = make_complex_seq(110, seed=10105)
+    s_mic = make_complex_seq(20, seed=10106)
+    s_ins2 = make_complex_seq(95, seed=10107)
+
+    ref_fa = tmp_path / "r2_d1_ref.fa"
+    ref_fa.write_text(f">Chr01\n{s_a + s_b + s_del + s_c}\n", encoding="utf-8")
+
+    def _build_isomorphic_gfa(
+        nids: tuple[str, str, str, str, str, str, str],
+        mode: str,
+    ) -> list[str]:
+        na, nb, ndel, nc, nins1, nmic, nins2 = nids
+        seqs = (s_a, s_b, s_del, s_c, s_ins1, s_mic, s_ins2)
+        ref_w = [na, nb, ndel, nc]
+        alt1_w = [na, nins1, nb, ndel, nc]
+        alt2_w = [na, nmic, nb, nc, na]
+        alt3_w = [na, nb, nins2, nc]
+
+        edges: list[tuple[str, str]] = []
+        seen_e: set[tuple[str, str]] = set()
+        for w in (ref_w, alt1_w, alt2_w, alt3_w):
+            for u, v in zip(w[:-1], w[1:]):
+                if (u, v) not in seen_e:
+                    seen_e.add((u, v))
+                    edges.append((u, v))
+
+        lines = ["H\tVN:Z:1.0"]
+        for nid, seq in zip(nids, seqs):
+            lines.append(f"S\t{nid}\t{seq}")
+        for u, v in edges:
+            lines.append(f"L\t{u}\t+\t{v}\t+\t0M")
+
+        if mode == "p":
+            lines.append("P\tRef#1#Chr01\t" + ",".join(f"{x}+" for x in ref_w) + "\t*")
+            lines.append("P\tAlt1#1#Chr01\t" + ",".join(f"{x}+" for x in alt1_w) + "\t*")
+            lines.append("P\tAlt2#1#Chr01\t" + ",".join(f"{x}+" for x in alt2_w) + "\t*")
+            lines.append("P\tAlt3#1#Chr01\t" + ",".join(f"{x}+" for x in alt3_w) + "\t*")
+        elif mode == "w":
+            lines.append("W\tRef\t1\tChr01\t200\t*\t" + "".join(f">{x}" for x in ref_w))
+            lines.append("W\tAlt1\t1\tctg1\t350\t*\t" + "".join(f">{x}" for x in alt1_w))
+            lines.append("W\tAlt2\t1\tctg2\t500\t*\t" + "".join(f">{x}" for x in alt2_w))
+            lines.append("W\tAlt3\t1\tctg3\t750\t*\t" + "".join(f">{x}" for x in alt3_w))
+        else:
+            lines.append("P\tRef#1#Chr01\t" + ",".join(f"{x}+" for x in ref_w) + "\t*")
+            lines.append("P\tAlt1#1#Chr01\t" + ",".join(f"{x}+" for x in alt1_w) + "\t*")
+            lines.append("W\tAlt2\t1\tctg2\t420\t*\t" + "".join(f">{x}" for x in alt2_w))
+            lines.append("W\tAlt3\t1\tctg3\t880\t*\t" + "".join(f">{x}" for x in alt3_w))
+        return lines
+
+    encodings = {
+        "int_p": _build_isomorphic_gfa(("1", "2", "3", "4", "5", "6", "7"), "p"),
+        "int_w": _build_isomorphic_gfa(("1", "2", "3", "4", "5", "6", "7"), "w"),
+        "str_p": _build_isomorphic_gfa(
+            ("nd_a", "nd_b", "nd_del", "nd_c", "nd_ins1", "nd_mic", "nd_ins2"), "p"
+        ),
+        "mixed_0_01_sup1": _build_isomorphic_gfa(
+            ("0", "01", "1", "¹", "001", "²", "nd_ins2"), "mixed"
+        ),
+    }
+
+    pan_texts: dict[str, str] = {}
+    sv_texts: dict[str, str] = {}
+    gt_texts: dict[str, str] = {}
+    for ename, gfa_lines in encodings.items():
+        gfa_p = tmp_path / f"{ename}.gfa"
+        gfa_p.write_text("\n".join(gfa_lines) + "\n", encoding="utf-8")
+        out_p = tmp_path / f"out_{ename}"
+        run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gfa_p),
+                "--ref-fa",
+                str(ref_fa),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--out-prefix",
+                str(out_p),
+            ],
+            check=True,
+        )
+        run_verify(out_p, gfa_p, ref_fa, check=True)
+        bun = OutputBundle(out_p)
+        assert_all_global_invariants(bun, gfa_p, ref_fa)
+
+        ins_rows = [r for r in bun.sv_rows if r["type"] == "INS"]
+        del_rows = [r for r in bun.sv_rows if r["type"] == "DEL"]
+        assert len(ins_rows) == 2 and len(del_rows) == 1
+        for ir in ins_rows:
+            assert "multi_hit=1" not in str(ir["alleles"])
+        assert "multi_hit=1" in str(del_rows[0]["alleles"])
+
+        ins_slot01 = next(r for r in ins_rows if int(r["ref_start"]) == len(s_a))
+        assert bun.genotypes[ins_slot01["event_id"]]["Alt1#1"] == "1"
+        assert bun.genotypes[ins_slot01["event_id"]]["Alt2#1"] == "0"
+
+        pan_texts[ename] = Path(f"{out_p}.pan.fa").read_text(encoding="utf-8")
+        sv_texts[ename] = Path(f"{out_p}.sv.tsv").read_text(encoding="utf-8")
+        gt_texts[ename] = Path(f"{out_p}.genotypes.tsv").read_text(encoding="utf-8")
+
+    assert pan_texts["int_p"] == pan_texts["int_w"] == pan_texts["str_p"] == pan_texts["mixed_0_01_sup1"]
+    assert sv_texts["int_p"] == sv_texts["int_w"] == sv_texts["str_p"] == sv_texts["mixed_0_01_sup1"]
+    assert gt_texts["int_p"] == gt_texts["int_w"] == gt_texts["str_p"] == gt_texts["mixed_0_01_sup1"]
+
+
+def test_tier5_m7_10_r2_d2_exact_p_w_src_path_collision_large_w_offset_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D2` (CLI E2E): Exact `P` + `W` `src_path` collision when
+    `W.seq_start >= len(P)` (`P\tAlt#1#Chr01:1000-1200` + `W\tAlt\t1\tChr01\t1000\t1200`
+    or wildcard `*` computing `1200`) is cleanly rejected by `panflat build` across both
+    integer and string GFA paths with non-zero exit code and zero Python tracebacks, while
+    disjoint `P` (`Alt#1#Chr01`) + high-offset `W` (`1000..1360`) succeeds cleanly.
+    """
+    s1 = make_complex_seq(100, seed=10201)
+    s2 = make_complex_seq(100, seed=10202)
+    s3 = make_complex_seq(100, seed=10203)
+    s4 = make_complex_seq(160, seed=10204)
+    fa_path = tmp_path / "r2_d2.fa"
+    fa_path.write_text(f">Chr01\n{s1 + s2 + s3}\n", encoding="utf-8")
+
+    bad_variants = [
+        # Integer fast GFA path, explicit seq_end=1200 where seq_start=1000 >= len(P)=260
+        [
+            "H\tVN:Z:1.0",
+            f"S\t1\t{s1}",
+            f"S\t2\t{s2}",
+            f"S\t3\t{s3}",
+            f"S\t4\t{s4}",
+            "L\t1\t+\t2\t+\t0M",
+            "L\t2\t+\t3\t+\t0M",
+            "L\t4\t+\t2\t+\t0M",
+            "P\tRef#1#Chr01\t1+,2+,3+\t*",
+            "P\tAlt#1#Chr01:1000-1200\t4+,2+\t*",
+            "W\tAlt\t1\tChr01\t1000\t1200\t>1>2",
+        ],
+        # String GFA path, wildcard '*' end computing 1000 + 200 = 1200 -> exact src_path collision
+        [
+            "H\tVN:Z:1.0",
+            f"S\tn1\t{s1}",
+            f"S\tn2\t{s2}",
+            f"S\tn3\t{s3}",
+            f"S\tn4\t{s4}",
+            "L\tn1\t+\tn2\t+\t0M",
+            "L\tn2\t+\tn3\t+\t0M",
+            "L\tn4\t+\tn2\t+\t0M",
+            "P\tRef#1#Chr01\tn1+,n2+,n3+\t*",
+            "P\tAlt#1#Chr01:1000-1200\tn4+,n2+\t*",
+            "W\tAlt\t1\tChr01\t1000\t*\t>n1>n2",
+        ],
+    ]
+    for idx, lines in enumerate(bad_variants):
+        gfa_bad = tmp_path / f"collide_{idx}.gfa"
+        gfa_bad.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = run_panflat_cli(
+            [
+                "build",
+                "--gfa",
+                str(gfa_bad),
+                "--ref-fa",
+                str(fa_path),
+                "--backbone-prefix",
+                "Ref#1#",
+                "--out-prefix",
+                str(tmp_path / f"out_collide_{idx}"),
+            ],
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert "Traceback" not in proc.stderr
+        assert "Ambiguous duplicate source interval" in proc.stderr
+
+    # Positive control: disjoint P [0, 200) and W [1000, 1460) on Alt#1#Chr01 passes CLI build + verify
+    gfa_ok = tmp_path / "disjoint_ok.gfa"
+    gfa_ok.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{s1}",
+                f"S\t2\t{s2}",
+                f"S\t3\t{s3}",
+                f"S\t4\t{s4}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t1\t+\t4\t+\t0M",
+                "L\t4\t+\t2\t+\t0M",
+                "P\tRef#1#Chr01\t1+,2+,3+\t*",
+                "P\tAlt#1#Chr01\t1+,2+\t*",
+                "W\tAlt\t1\tChr01\t1000\t*\t>1>4>2>3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_ok = tmp_path / "out_disjoint_ok"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_ok),
+            "--ref-fa",
+            str(fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out_ok),
+        ],
+        check=True,
+    )
+    run_verify(out_ok, gfa_ok, fa_path, check=True)
+
+
+def test_tier5_m7_11_r2_d4_mixed_gt10k_and_le10k_steps_merge_and_verify_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D4` (CLI E2E): `10,050`-step `Chr01` (omitting `# step` lines via
+    `LazyStepOffsetSequence`) merged with `20`-step `Chr02` (emitting `20` `# step` lines)
+    passes `panflat build`, `panflat merge`, and standalone `panflat verify` (`rc == 0`),
+    while tampering `# step`, duplicating `tName`, or adding orphan `# block` lines fails
+    `panflat verify` cleanly.
+    """
+    import shutil
+
+    # Chr01: 10,050 reference steps (steps 0..10047 repeat node 1, steps 10048..10049 unique 2+, 3+ with INS 4+)
+    u20 = "ACGTACGTTGCATGCAACGT"  # 20 bp
+    s_u2 = make_complex_seq(100, seed=10301)
+    s_u3 = make_complex_seq(100, seed=10302)
+    s_ins1 = make_complex_seq(90, seed=10303)
+
+    c1_ref_steps = ["1+"] * 10_048 + ["2+", "3+"]
+    assert len(c1_ref_steps) == 10_050
+    c1_ref_seq = (u20 * 10_048) + s_u2 + s_u3
+    gfa1 = tmp_path / "chr01_10k.gfa"
+    gfa1.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{u20}",
+                f"S\t2\t{s_u2}",
+                f"S\t3\t{s_u3}",
+                f"S\t4\t{s_ins1}",
+                "L\t1\t+\t1\t+\t0M",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t2\t+\t4\t+\t0M",
+                "L\t4\t+\t3\t+\t0M",
+                f"P\tRef#1#Chr01\t{','.join(c1_ref_steps)}\t*",
+                "P\tAlt#1#Chr01\t2+,4+,3+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa1 = tmp_path / "chr01_10k.fa"
+    fa1.write_text(f">Chr01\n{c1_ref_seq}\n", encoding="utf-8")
+    out1 = tmp_path / "b_chr01"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa1),
+            "--ref-fa",
+            str(fa1),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out1),
+        ],
+        check=True,
+    )
+
+    # Chr02: 20 reference steps (nodes 11..30) + INS node 31 between 20+ and 21+
+    c2_nodes = {str(10 + i): make_complex_seq(60, seed=10320 + i) for i in range(1, 21)}
+    s_ins2 = make_complex_seq(80, seed=10350)
+    c2_ref_steps = [f"{10 + i}+" for i in range(1, 21)]
+    assert len(c2_ref_steps) == 20
+    c2_alt_steps = [f"{10 + i}+" for i in range(1, 11)] + ["31+"] + [f"{10 + i}+" for i in range(11, 21)]
+    c2_lines = ["H\tVN:Z:1.0"]
+    for nid, seq in c2_nodes.items():
+        c2_lines.append(f"S\t{nid}\t{seq}")
+    c2_lines.append(f"S\t31\t{s_ins2}")
+    for i in range(1, 20):
+        c2_lines.append(f"L\t{10 + i}\t+\t{11 + i}\t+\t0M")
+    c2_lines.append("L\t20\t+\t31\t+\t0M")
+    c2_lines.append("L\t31\t+\t21\t+\t0M")
+    c2_lines.append(f"P\tRef#1#Chr02\t{','.join(c2_ref_steps)}\t*")
+    c2_lines.append(f"P\tAlt#1#Chr02\t{','.join(c2_alt_steps)}\t*")
+
+    gfa2 = tmp_path / "chr02_20.gfa"
+    gfa2.write_text("\n".join(c2_lines) + "\n", encoding="utf-8")
+    c2_ref_seq = "".join(c2_nodes[str(10 + i)] for i in range(1, 21))
+    fa2 = tmp_path / "chr02_20.fa"
+    fa2.write_text(f">Chr02\n{c2_ref_seq}\n", encoding="utf-8")
+    out2 = tmp_path / "b_chr02"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa2),
+            "--ref-fa",
+            str(fa2),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--out-prefix",
+            str(out2),
+        ],
+        check=True,
+    )
+
+    merged = tmp_path / "merged_mixed_steps"
+    _, mbun = run_merge([out1, out2], merged)
+    assert mbun is not None
+    step_comment_lines = [
+        ln for ln in mbun.chain_text.splitlines() if ln.startswith("# step\t")
+    ]
+    assert len(step_comment_lines) == 20
+
+    comb_gfa = tmp_path / "comb_mixed.gfa"
+    comb_gfa.write_text(
+        gfa1.read_text(encoding="utf-8")
+        + "\n".join(c2_lines[1:])
+        + "\n",
+        encoding="utf-8",
+    )
+    comb_fa = tmp_path / "comb_mixed.fa"
+    comb_fa.write_text(f">Chr01\n{c1_ref_seq}\n>Chr02\n{c2_ref_seq}\n", encoding="utf-8")
+
+    # Standalone panflat verify passes (rc == 0)
+    proc_ok = run_verify(merged, comb_gfa, comb_fa, check=True)
+    assert proc_ok.returncode == 0
+
+    # Negative CLI tamper checks on merged ref_to_pan.chain
+    orig_chain = mbun.chain_text
+    for idx_bad, mutated_chain in enumerate(
+        [
+            orig_chain.replace("# step\t0\t0\t60\t", "# step\t0\t0\t999\t", 1),
+            orig_chain + f"\nchain {len(c2_ref_seq)} Chr02 {len(c2_ref_seq)} + 0 {len(c2_ref_seq)} Chr02 {len(c2_ref_seq)} + 0 {len(c2_ref_seq)} 3\n{len(c2_ref_seq)}\n",
+            "# block\t0\t60\t0\n" + orig_chain,
+        ]
+    ):
+        tdir = tmp_path / f"tamper_chain_{idx_bad}"
+        tdir.mkdir()
+        for f in merged.parent.glob(f"{merged.name}.*"):
+            shutil.copy2(f, tdir / f.name)
+        tpref = tdir / merged.name
+        Path(f"{tpref}.ref_to_pan.chain").write_text(mutated_chain, encoding="utf-8")
+        p_bad = run_verify(tpref, comb_gfa, comb_fa, check=False)
+        assert p_bad.returncode != 0 and "Traceback" not in p_bad.stderr
+
+
+def test_tier5_m7_12_r2_d5_qc_contiguous_ref_stage1_and_short_insert_chimeric_guard_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D5` (CLI E2E):
+    1. Contiguous-reference Stage 1 sensitivity: a `220 bp` (`>= 150 bp`) homolog of
+       `ref[0:220]` whose reference origin is split across two `110 bp` anchors (`< 150 bp`
+       each) by an `80 bp` short slot insertion in `pan.fa` is accurately detected (`220 bp`
+       at `>= 0.98` identity) by `panflat build --qc`.
+    2. Chimeric Stage 1 & Stage 2 specificity: `0 bp` false positives across a `210 bp`
+       `100 bp short_insert + 110 bp right_anchor` junction AND across adjacent Stage 2
+       target pieces separated by `N * 200`.
+    """
+    r1 = make_complex_seq(110, seed=10401)
+    r2 = make_complex_seq(110, seed=10402)
+    r3 = make_complex_seq(200, seed=10403)
+    r4 = make_complex_seq(200, seed=10404)
+    r5 = make_complex_seq(200, seed=10405)
+
+    # 1. Stage 1 contiguous-reference sensitivity across a split reference slot
+    short80 = make_complex_seq(80, seed=10406)
+    hom220 = mutate_seq_snps(r1 + r2, num_snps=2, seed=10407)
+    gfa_sens = tmp_path / "qc_sens.gfa"
+    gfa_sens.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{r1}",
+                f"S\t2\t{r2}",
+                f"S\t3\t{r3}",
+                f"S\t4\t{short80}",
+                f"S\t5\t{hom220}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t1\t+\t4\t+\t0M",
+                "L\t4\t+\t2\t+\t0M",
+                "L\t2\t+\t5\t+\t0M",
+                "L\t5\t+\t3\t+\t0M",
+                "P\tRef#1#Chr01\t1+,2+,3+\t*",
+                "P\tAlt1#1#Chr01\t1+,4+,2+,3+\t*",
+                "P\tAlt2#1#Chr01\t1+,2+,5+,3+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa_sens = tmp_path / "qc_sens.fa"
+    fa_sens.write_text(f">Chr01\n{r1 + r2 + r3}\n", encoding="utf-8")
+    out_sens = tmp_path / "out_qc_sens"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_sens),
+            "--ref-fa",
+            str(fa_sens),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--qc",
+            "--out-prefix",
+            str(out_sens),
+        ],
+        check=True,
+    )
+    bun_sens = OutputBundle(out_sens)
+    assert_all_global_invariants(bun_sens, gfa_sens, fa_sens)
+    assert int(bun_sens.summary_kv["qc_short_50_149_count"]) == 1
+    assert int(bun_sens.summary_kv["qc_short_50_149_bp"]) == 80
+    assert int(bun_sens.summary_kv["qc_long_ge150_count"]) == 1
+    assert int(bun_sens.summary_kv["qc_long_ge150_bp"]) == 220
+    assert int(bun_sens.summary_kv["qc_redundancy_0.98_bp"]) == 220
+
+    # 2. Stage 1 short_insert+right_anchor chimera & Stage 2 cross-target sep bridging -> 0 bp false positives
+    short100 = make_complex_seq(100, seed=10410)
+    chim210 = short100 + r2  # 100 bp short insert + 110 bp right_anchor (< 150 bp each!)
+    p_left = make_complex_seq(160, seed=10411)
+    p_right = make_complex_seq(160, seed=10412)
+    p_bridge = p_left[60:] + p_right[:100]  # 100 bp suffix of p_left + 100 bp prefix of p_right
+
+    gfa_spec = tmp_path / "qc_spec.gfa"
+    gfa_spec.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{r1}",
+                f"S\t2\t{r2}",
+                f"S\t3\t{r3}",
+                f"S\t4\t{r4}",
+                f"S\t5\t{r5}",
+                f"S\t6\t{short100}",
+                f"S\t7\t{chim210}",
+                f"S\t8\t{p_left}",
+                f"S\t9\t{p_bridge}",
+                f"S\t10\t{p_right}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t2\t+\t3\t+\t0M",
+                "L\t3\t+\t4\t+\t0M",
+                "L\t4\t+\t5\t+\t0M",
+                "L\t1\t+\t6\t+\t0M",
+                "L\t6\t+\t2\t+\t0M",
+                "L\t2\t+\t7\t+\t0M",
+                "L\t7\t+\t3\t+\t0M",
+                "L\t3\t+\t8\t+\t0M",
+                "L\t8\t+\t4\t+\t0M",
+                "L\t3\t+\t9\t+\t0M",
+                "L\t9\t+\t4\t+\t0M",
+                "L\t4\t+\t10\t+\t0M",
+                "L\t10\t+\t5\t+\t0M",
+                "P\tRef#1#Chr01\t1+,2+,3+,4+,5+\t*",
+                "P\tAlt1#1#Chr01\t1+,6+,2+,3+,8+,4+,5+\t*",
+                "P\tAlt2#1#Chr01\t1+,2+,7+,3+,9+,4+,10+,5+\t*",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fa_spec = tmp_path / "qc_spec.fa"
+    fa_spec.write_text(f">Chr01\n{r1 + r2 + r3 + r4 + r5}\n", encoding="utf-8")
+    out_spec = tmp_path / "out_qc_spec"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa_spec),
+            "--ref-fa",
+            str(fa_spec),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--qc",
+            "--out-prefix",
+            str(out_spec),
+        ],
+        check=True,
+    )
+    bun_spec = OutputBundle(out_spec)
+    assert_all_global_invariants(bun_spec, gfa_spec, fa_spec)
+    assert int(bun_spec.summary_kv["qc_short_50_149_count"]) == 1
+    assert int(bun_spec.summary_kv["qc_short_50_149_bp"]) == 100
+    assert int(bun_spec.summary_kv["qc_long_ge150_count"]) == 4
+    assert int(bun_spec.summary_kv["qc_long_ge150_bp"]) == 730
+    assert int(bun_spec.summary_kv["qc_redundancy_0.90_bp"]) == 0
+    assert int(bun_spec.summary_kv["qc_redundancy_0.95_bp"]) == 0
+    assert int(bun_spec.summary_kv["qc_redundancy_0.98_bp"]) == 0
+
+
+def test_tier5_m7_13_r2_d6_w_ref_coord_suffix_ambiguous_single_verify_and_merged_nonpansn_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D6` (CLI E2E):
+    1. `W`-line reference (`W Ref 1 Chr01 100 900`) passes CLI `panflat build` + `panflat verify`
+       with coordinate-suffixed FASTA (`>Ref#1#Chr01:100-900`) and PanSN FASTA (`>Ref#1#Chr01`)
+       across `--backbone-prefix Ref#1#Chr01:100-900`, `Ref#1#`, `Ref#0#`, and `Ref`.
+    2. Single-chromosome ambiguous `verify --backbone-prefix SampleA#1#` fails cleanly (`rc != 0`)
+       when `SampleA#1#Chr10A` + `SampleA#1#Chr10A_unplaced` coexist, while `SampleA#1#Chr10A` passes.
+    3. Merged non-PanSN `Ref_Chr01` + `Ref_Chr02` passes `panflat verify --backbone-prefix Ref_`
+       (and fails `Wrong_`), plus non-PanSN exact path tie-breaking (`RefChr01` vs `RefChr01_alt`).
+    """
+    s1 = make_complex_seq(400, seed=10501)
+    s2 = make_complex_seq(400, seed=10502)
+    s_ins = make_complex_seq(100, seed=10503)
+    s_c2 = make_complex_seq(300, seed=10504)
+    ref_800 = s1 + s2
+
+    # 1. W-line reference with :100-900 suffix in GFA & FASTA
+    wref_gfa = tmp_path / "wref.gfa"
+    wref_gfa.write_text(
+        "\n".join(
+            [
+                "H\tVN:Z:1.0",
+                f"S\t1\t{s1}",
+                f"S\t2\t{s2}",
+                f"S\t3\t{s_ins}",
+                "L\t1\t+\t2\t+\t0M",
+                "L\t1\t+\t3\t+\t0M",
+                "L\t3\t+\t2\t+\t0M",
+                "W\tRef\t1\tChr01\t100\t900\t>1>2",
+                "W\tAlt\t1\tChr01\t50\t950\t>1>3>2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    w_cs_multi_fa = tmp_path / "w_cs_multi.fa"
+    w_cs_multi_fa.write_text(
+        f">Alt#1#Chr01:50-950\n{s1 + s_ins + s2}\n>Ref#1#Chr01:100-900\n{ref_800}\n",
+        encoding="utf-8",
+    )
+    w_pansn_fa = tmp_path / "w_pansn.fa"
+    w_pansn_fa.write_text(
+        f">Alt#1#Chr01\n{s1 + s_ins + s2}\n>Ref#1#Chr01\n{ref_800}\n",
+        encoding="utf-8",
+    )
+
+    out_w_cs = tmp_path / "out_w_cs"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(wref_gfa),
+            "--ref-fa",
+            str(w_cs_multi_fa),
+            "--backbone-prefix",
+            "Ref#1#Chr01:100-900",
+            "--out-prefix",
+            str(out_w_cs),
+        ],
+        check=True,
+    )
+    out_w_ps = tmp_path / "out_w_ps"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(wref_gfa),
+            "--ref-fa",
+            str(w_pansn_fa),
+            "--backbone-prefix",
+            "Ref#1#Chr01:100-900",
+            "--out-prefix",
+            str(out_w_ps),
+        ],
+        check=True,
+    )
+    for bp_ok in ("Ref#1#Chr01:100-900", "Ref#1#Chr01", "Ref#1#", "Ref#0#", "Ref"):
+        run_verify(out_w_cs, wref_gfa, w_cs_multi_fa, extra_args=["--backbone-prefix", bp_ok], check=True)
+        run_verify(out_w_ps, wref_gfa, w_pansn_fa, extra_args=["--backbone-prefix", bp_ok], check=True)
+    p_w_bad = run_verify(
+        out_w_cs, wref_gfa, w_cs_multi_fa, extra_args=["--backbone-prefix", "Wrong#1#"], check=False
+    )
+    assert p_w_bad.returncode != 0 and "Traceback" not in p_w_bad.stderr
+
+    # 2. Single-chrom ambiguous `SampleA#1#` rejected on both `build` and `verify`
+    amb_gfa = tmp_path / "amb_single.gfa"
+    amb_gfa.write_text(
+        f"H\tVN:Z:1.0\nS\t1\t{s1}\nS\t2\t{s_c2}\n"
+        "P\tSampleA#1#Chr10A\t1+\t*\nP\tSampleA#1#Chr10A_unplaced\t2+\t*\n",
+        encoding="utf-8",
+    )
+    amb_fa = tmp_path / "amb_single.fa"
+    amb_fa.write_text(
+        f">SampleA#1#Chr10A\n{s1}\n>SampleA#1#Chr10A_unplaced\n{s_c2}\n",
+        encoding="utf-8",
+    )
+    p_amb_build = run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(amb_gfa),
+            "--ref-fa",
+            str(amb_fa),
+            "--backbone-prefix",
+            "SampleA#1#",
+            "--out-prefix",
+            str(tmp_path / "out_amb_fail"),
+        ],
+        check=False,
+    )
+    assert p_amb_build.returncode != 0 and "Traceback" not in p_amb_build.stderr
+
+    out_amb_ok = tmp_path / "out_amb_ok"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(amb_gfa),
+            "--ref-fa",
+            str(amb_fa),
+            "--backbone-prefix",
+            "SampleA#1#Chr10A",
+            "--out-prefix",
+            str(out_amb_ok),
+        ],
+        check=True,
+    )
+    run_verify(out_amb_ok, amb_gfa, amb_fa, extra_args=["--backbone-prefix", "SampleA#1#Chr10A"], check=True)
+    p_amb_ver = run_verify(
+        out_amb_ok, amb_gfa, amb_fa, extra_args=["--backbone-prefix", "SampleA#1#"], check=False
+    )
+    assert p_amb_ver.returncode != 0 and "Traceback" not in p_amb_ver.stderr
+
+    # 3. Merged non-PanSN `Ref_Chr01` + `Ref_Chr02` with `verify --backbone-prefix Ref_` + exact tie-break
+    np1_gfa = tmp_path / "np1.gfa"
+    np1_gfa.write_text(f"H\tVN:Z:1.0\nS\t1\t{s1}\nP\tRef_Chr01\t1+\t*\n", encoding="utf-8")
+    np2_gfa = tmp_path / "np2.gfa"
+    np2_gfa.write_text(f"H\tVN:Z:1.0\nS\t2\t{s_c2}\nP\tRef_Chr02\t2+\t*\n", encoding="utf-8")
+    fa_c1 = tmp_path / "plain_c1.fa"
+    fa_c1.write_text(f">Chr01\n{s1}\n", encoding="utf-8")
+    fa_c2 = tmp_path / "plain_c2.fa"
+    fa_c2.write_text(f">Chr02\n{s_c2}\n", encoding="utf-8")
+
+    np_b1 = tmp_path / "np_b1"
+    np_b2 = tmp_path / "np_b2"
+    run_panflat_cli(
+        ["build", "--gfa", str(np1_gfa), "--ref-fa", str(fa_c1), "--backbone-prefix", "Ref_", "--out-prefix", str(np_b1)],
+        check=True,
+    )
+    run_panflat_cli(
+        ["build", "--gfa", str(np2_gfa), "--ref-fa", str(fa_c2), "--backbone-prefix", "Ref_", "--out-prefix", str(np_b2)],
+        check=True,
+    )
+    np_merged = tmp_path / "np_merged"
+    run_merge([np_b1, np_b2], np_merged)
+
+    np_comb_gfa = tmp_path / "np_comb.gfa"
+    np_comb_gfa.write_text(
+        f"H\tVN:Z:1.0\nS\t1\t{s1}\nS\t2\t{s_c2}\nP\tRef_Chr01\t1+\t*\nP\tRef_Chr02\t2+\t*\n",
+        encoding="utf-8",
+    )
+    plain_multi_fa = tmp_path / "plain_multi.fa"
+    plain_multi_fa.write_text(f">Chr01\n{s1}\n>Chr02\n{s_c2}\n", encoding="utf-8")
+
+    run_verify(np_merged, np_comb_gfa, plain_multi_fa, extra_args=["--backbone-prefix", "Ref_"], check=True)
+    p_np_bad = run_verify(
+        np_merged, np_comb_gfa, plain_multi_fa, extra_args=["--backbone-prefix", "Wrong_"], check=False
+    )
+    assert p_np_bad.returncode != 0 and "Traceback" not in p_np_bad.stderr
+
+    # Exact non-PanSN tie-break: RefChr01 vs RefChr01_alt
+    tie_gfa = tmp_path / "tie.gfa"
+    tie_gfa.write_text(
+        f"H\tVN:Z:1.0\nS\t1\t{s1}\nS\t2\t{s_c2}\nP\tRefChr01\t1+\t*\nP\tRefChr01_alt\t2+\t*\n",
+        encoding="utf-8",
+    )
+    out_tie = tmp_path / "out_tie"
+    run_panflat_cli(
+        ["build", "--gfa", str(tie_gfa), "--ref-fa", str(fa_c1), "--backbone-prefix", "RefChr01", "--out-prefix", str(out_tie)],
+        check=True,
+    )
+    run_verify(out_tie, tie_gfa, fa_c1, extra_args=["--backbone-prefix", "RefChr01"], check=True)
+    assert run_verify(out_tie, tie_gfa, fa_c1, extra_args=["--backbone-prefix", "RefChr"], check=False).returncode != 0
+
+
+def test_tier5_m7_14_r2_d7_to_d12_right_nested_merge_gff_remap_isoform_status_and_cen_tamper_cli(
+    tmp_path: Path,
+) -> None:
+    """M7 Round 2 `R2-D7`, `R2-D8`, `R2-D9`, `R2-D10`, `R2-D11`, `R2-D12` (CLI E2E):
+    - CLI `flat` (`merge([Chr01, Chr02, Chr03])`), `left-nested`, and `right-nested`
+      (`merge([Chr01, merge([Chr02, Chr03])])`) produce byte-identical outputs when `Chr02`
+      has 0 unresolved rows, `Chr01`+`Chr03` share `unplaced_scaf_A` and unprefixed
+      `UNRES_000001`, and all 3 chromosomes have colliding `SV_000001`.
+    - `{merged}.ref.lifted.gff3` remaps `sv_id=` per chromosome (`SV_000001`,
+      `Chr02_SV_000001`, `Chr03_SV_000001`) and isolates isoform `sv_status` across shared
+      multi-`Parent` exons (`tx1` -> `cds_split_by_insertion`, `tx2` -> `utr_insertion`).
+    - Standalone `panflat verify --ref-gff` passes when `Parent=tx1` is reused across
+      `Chr01`, `Chr02`, `Chr03`, fails on CDS tamper, fails on malformed skipped `--ref-fa`
+      records, and fails when `{merged}.centromere.tsv` is deleted even without `--centromere-bed`.
+    """
+    import shutil
+
+    # Chr01 (nodes 11..16): extract-islands centromere + shared exon Parent=tx1,tx2 + unplaced_scaf_A
+    orf1_a = "ATG" + ("GCT" * 29)  # 90 bp
+    orf1_b = "GCT" * 30  # 90 bp (reads through into orf2 in tx1)
+    cen_intron = make_complex_seq(100, seed=10601)
+    orf2 = "ATG" + ("CTG" * 58) + "TAA"  # 180 bp
+    ins_c1 = "GGT" * 30  # 90 bp coding insertion inside exon 1
+    un_c1 = make_complex_seq(110, seed=10602)
+
+    gfa1_lines = [
+        "H\tVN:Z:1.0",
+        f"S\t11\t{orf1_a}",
+        f"S\t12\t{orf1_b}",
+        f"S\t13\t{cen_intron}",
+        f"S\t14\t{orf2}",
+        f"S\t15\t{ins_c1}",
+        f"S\t16\t{un_c1}",
+        "L\t16\t+\t11\t+\t0M",
+        "L\t11\t+\t12\t+\t0M",
+        "L\t11\t+\t15\t+\t0M",
+        "L\t15\t+\t12\t+\t0M",
+        "L\t12\t+\t13\t+\t0M",
+        "L\t13\t+\t14\t+\t0M",
+        "P\tRef#1#Chr01\t11+,12+,13+,14+\t*",
+        "P\tAlt#1#Chr01\t11+,15+,12+,13+,14+\t*",
+        "P\tunplaced_scaf_A\t16+,11+,12+,13+,14+\t*",
+    ]
+    gfa1 = tmp_path / "c1.gfa"
+    gfa1.write_text("\n".join(gfa1_lines) + "\n", encoding="utf-8")
+    ref_c1 = orf1_a + orf1_b + cen_intron + orf2
+    fa1 = tmp_path / "c1.fa"
+    fa1.write_text(f">Chr01\n{ref_c1}\n", encoding="utf-8")
+    bed1 = tmp_path / "c1.bed"
+    bed1.write_text("Chr01\t180\t280\tCEN1\n", encoding="utf-8")
+    gff1 = tmp_path / "c1.gff3"
+    gff1.write_text(
+        "##gff-version 3\n"
+        "Chr01\tsrc\tgene\t1\t460\t.\t+\t.\tID=g1\n"
+        "Chr01\tsrc\tmRNA\t1\t460\t.\t+\t.\tID=tx1;Parent=g1\n"
+        "Chr01\tsrc\tmRNA\t1\t460\t.\t+\t.\tID=tx2;Parent=g1\n"
+        "Chr01\tsrc\texon\t1\t180\t.\t+\t.\tID=ex1_shared;Parent=tx1,tx2\n"
+        "Chr01\tsrc\texon\t281\t460\t.\t+\t.\tID=ex2_shared;Parent=tx1,tx2\n"
+        "Chr01\tsrc\tCDS\t1\t180\t.\t+\t0\tID=cds1_tx1;Parent=tx1\n"
+        "Chr01\tsrc\tCDS\t281\t460\t.\t+\t0\tID=cds2_shared;Parent=tx1,tx2\n",
+        encoding="utf-8",
+    )
+    out1 = tmp_path / "p_Chr01"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa1),
+            "--ref-fa",
+            str(fa1),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--centromere-bed",
+            str(bed1),
+            "--centromere-mode",
+            "extract-islands",
+            "--ref-gff",
+            str(gff1),
+            "--out-prefix",
+            str(out1),
+        ],
+        check=True,
+    )
+
+    # Chr02 (nodes 21..25): 0 unresolved rows, centromere off, colliding ID=tx1
+    ex_c2_1 = "ATG" + ("ACC" * 29)
+    in_c2_a = make_complex_seq(60, seed=10611)
+    in_c2_b = make_complex_seq(60, seed=10612)
+    ex_c2_2 = ("ACC" * 29) + "TAA"
+    ins_c2 = make_complex_seq(75, seed=10613)
+    gfa2_lines = [
+        "H\tVN:Z:1.0",
+        f"S\t21\t{ex_c2_1}",
+        f"S\t22\t{in_c2_a}",
+        f"S\t23\t{in_c2_b}",
+        f"S\t24\t{ex_c2_2}",
+        f"S\t25\t{ins_c2}",
+        "L\t21\t+\t22\t+\t0M",
+        "L\t22\t+\t23\t+\t0M",
+        "L\t22\t+\t25\t+\t0M",
+        "L\t25\t+\t23\t+\t0M",
+        "L\t23\t+\t24\t+\t0M",
+        "P\tRef#1#Chr02\t21+,22+,23+,24+\t*",
+        "P\tAlt#1#Chr02\t21+,22+,25+,23+,24+\t*",
+    ]
+    gfa2 = tmp_path / "c2.gfa"
+    gfa2.write_text("\n".join(gfa2_lines) + "\n", encoding="utf-8")
+    ref_c2 = ex_c2_1 + in_c2_a + in_c2_b + ex_c2_2
+    fa2 = tmp_path / "c2.fa"
+    fa2.write_text(f">Chr02\n{ref_c2}\n", encoding="utf-8")
+    gff2 = tmp_path / "c2.gff3"
+    gff2.write_text(
+        "##gff-version 3\n"
+        "Chr02\tsrc\tgene\t1\t300\t.\t+\t.\tID=g1\n"
+        "Chr02\tsrc\tmRNA\t1\t300\t.\t+\t.\tID=tx1;Parent=g1\n"
+        "Chr02\tsrc\texon\t1\t90\t.\t+\t.\tID=ex1;Parent=tx1\n"
+        "Chr02\tsrc\texon\t211\t300\t.\t+\t.\tID=ex2;Parent=tx1\n"
+        "Chr02\tsrc\tCDS\t1\t90\t.\t+\t0\tID=cds1;Parent=tx1\n"
+        "Chr02\tsrc\tCDS\t211\t300\t.\t+\t0\tID=cds2;Parent=tx1\n",
+        encoding="utf-8",
+    )
+    out2 = tmp_path / "p_Chr02"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa2),
+            "--ref-fa",
+            str(fa2),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(gff2),
+            "--out-prefix",
+            str(out2),
+        ],
+        check=True,
+    )
+    assert len(OutputBundle(out2).unresolved) == 0
+
+    # Chr03 (nodes 31..36): colliding unplaced_scaf_A + colliding ID=tx1
+    ex_c3_1 = "ATG" + ("GTC" * 29)
+    in_c3_a = make_complex_seq(60, seed=10621)
+    in_c3_b = make_complex_seq(60, seed=10622)
+    ex_c3_2 = ("GTC" * 29) + "TAA"
+    ins_c3 = make_complex_seq(84, seed=10623)
+    un_c3 = make_complex_seq(130, seed=10624)
+    gfa3_lines = [
+        "H\tVN:Z:1.0",
+        f"S\t31\t{ex_c3_1}",
+        f"S\t32\t{in_c3_a}",
+        f"S\t33\t{in_c3_b}",
+        f"S\t34\t{ex_c3_2}",
+        f"S\t35\t{ins_c3}",
+        f"S\t36\t{un_c3}",
+        "L\t36\t+\t31\t+\t0M",
+        "L\t31\t+\t32\t+\t0M",
+        "L\t32\t+\t33\t+\t0M",
+        "L\t32\t+\t35\t+\t0M",
+        "L\t35\t+\t33\t+\t0M",
+        "L\t33\t+\t34\t+\t0M",
+        "P\tRef#1#Chr03\t31+,32+,33+,34+\t*",
+        "P\tAlt#1#Chr03\t31+,32+,35+,33+,34+\t*",
+        "P\tunplaced_scaf_A\t36+,31+,32+,33+,34+\t*",
+    ]
+    gfa3 = tmp_path / "c3.gfa"
+    gfa3.write_text("\n".join(gfa3_lines) + "\n", encoding="utf-8")
+    ref_c3 = ex_c3_1 + in_c3_a + in_c3_b + ex_c3_2
+    fa3 = tmp_path / "c3.fa"
+    fa3.write_text(f">Chr03\n{ref_c3}\n", encoding="utf-8")
+    gff3 = tmp_path / "c3.gff3"
+    gff3.write_text(
+        "##gff-version 3\n"
+        "Chr03\tsrc\tgene\t1\t300\t.\t+\t.\tID=g1\n"
+        "Chr03\tsrc\tmRNA\t1\t300\t.\t+\t.\tID=tx1;Parent=g1\n"
+        "Chr03\tsrc\texon\t1\t90\t.\t+\t.\tID=ex1;Parent=tx1\n"
+        "Chr03\tsrc\texon\t211\t300\t.\t+\t.\tID=ex2;Parent=tx1\n"
+        "Chr03\tsrc\tCDS\t1\t90\t.\t+\t0\tID=cds1;Parent=tx1\n"
+        "Chr03\tsrc\tCDS\t211\t300\t.\t+\t0\tID=cds2;Parent=tx1\n",
+        encoding="utf-8",
+    )
+    out3 = tmp_path / "p_Chr03"
+    run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(gfa3),
+            "--ref-fa",
+            str(fa3),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(gff3),
+            "--out-prefix",
+            str(out3),
+        ],
+        check=True,
+    )
+
+    # Rewrite SV IDs to colliding SV_000001 and unresolved IDs to unprefixed UNRES_000001
+    for chrom, out_p in (("Chr01", out1), ("Chr02", out2), ("Chr03", out3)):
+        for ext in ("sv.tsv", "genotypes.tsv", "inserts.tsv", "ref.lifted.gff3"):
+            fp = Path(f"{out_p}.{ext}")
+            fp.write_text(
+                fp.read_text(encoding="utf-8").replace(f"{chrom}_INS_1", "SV_000001"),
+                encoding="utf-8",
+            )
+        if chrom != "Chr02":
+            for ext in ("unresolved.tsv", "unresolved.fa"):
+                fp = Path(f"{out_p}.{ext}")
+                fp.write_text(
+                    fp.read_text(encoding="utf-8").replace(f"{chrom}_UNRES_1", "UNRES_000001"),
+                    encoding="utf-8",
+                )
+
+    # CLI flat vs left-nested vs right-nested 3-chromosome panflat merge
+    m_flat = tmp_path / "m_flat"
+    run_merge([out1, out2, out3], m_flat)
+
+    m12 = tmp_path / "m12"
+    run_merge([out1, out2], m12)
+    m_left = tmp_path / "m_left"
+    run_merge([m12, out3], m_left)
+
+    m23 = tmp_path / "m23"
+    run_merge([out2, out3], m23)
+    m_right = tmp_path / "m_right"
+    _, bun_right = run_merge([out1, m23], m_right)
+    assert bun_right is not None
+
+    for ext in (
+        ".pan.fa",
+        ".offsets.tsv",
+        ".ref_to_pan.chain",
+        ".sv.tsv",
+        ".genotypes.tsv",
+        ".inserts.tsv",
+        ".centromere.tsv",
+        ".ref.lifted.gff3",
+        ".unresolved.tsv",
+        ".unresolved.fa",
+    ):
+        t_f = Path(f"{m_flat}{ext}").read_text(encoding="utf-8")
+        t_l = Path(f"{m_left}{ext}").read_text(encoding="utf-8")
+        t_r = Path(f"{m_right}{ext}").read_text(encoding="utf-8")
+        assert t_f == t_l == t_r, f"Merge associativity mismatch on {ext}"
+
+    # Verify R2-D7 unresolved IDs/src_path, R2-D8 lifted GFF3 sv_id= remapping, & R2-D12 isoform sv_status
+    assert [(r["record_id"], r["src_path"]) for r in bun_right.unresolved] == [
+        ("Chr01_UNRES_000001", "Chr01::unplaced_scaf_A"),
+        ("Chr03_UNRES_000001", "Chr03::unplaced_scaf_A"),
+    ]
+    sv_ids = {r["event_id"] for r in bun_right.sv_rows}
+    assert sv_ids == {"SV_000001", "Chr02_SV_000001", "Chr03_SV_000001"}
+
+    assert bun_right.lifted_gff_rows is not None
+    mrna_by_chrom_id: dict[tuple[str, str], dict[str, str]] = {}
+    for row in bun_right.lifted_gff_rows:
+        attrs = row["attributes"]
+        if "sv_id" in attrs:
+            for tok in attrs["sv_id"].split(","):
+                assert tok in sv_ids
+        if row["type"] == "mRNA":
+            mrna_by_chrom_id[(row["seqid"], attrs["ID"])] = attrs
+
+    assert mrna_by_chrom_id[("Chr01", "tx1")]["sv_status"] == "cds_split_by_insertion"
+    assert mrna_by_chrom_id[("Chr01", "tx2")]["sv_status"] == "utr_insertion"
+    assert mrna_by_chrom_id[("Chr01", "tx1")]["sv_id"] == "SV_000001"
+    assert mrna_by_chrom_id[("Chr02", "tx1")]["sv_id"] == "Chr02_SV_000001"
+    assert mrna_by_chrom_id[("Chr03", "tx1")]["sv_id"] == "Chr03_SV_000001"
+
+    # Build combined GFA, FASTA, and GFF3 for standalone CLI panflat verify --ref-gff
+    comb_gfa_lines = ["H\tVN:Z:1.0"]
+    for chrom, glines in (("Chr01", gfa1_lines), ("Chr02", gfa2_lines), ("Chr03", gfa3_lines)):
+        for gl in glines[1:]:
+            if gl.startswith("P\tunplaced_scaf_A\t"):
+                comb_gfa_lines.append(gl.replace("P\tunplaced_scaf_A\t", f"P\t{chrom}::unplaced_scaf_A\t", 1))
+            else:
+                comb_gfa_lines.append(gl)
+    comb_gfa = tmp_path / "comb_all.gfa"
+    comb_gfa.write_text("\n".join(comb_gfa_lines) + "\n", encoding="utf-8")
+    comb_fa = tmp_path / "comb_all.fa"
+    comb_fa.write_text(f">Chr01\n{ref_c1}\n>Chr02\n{ref_c2}\n>Chr03\n{ref_c3}\n", encoding="utf-8")
+    comb_gff = tmp_path / "comb_all.gff3"
+    comb_gff.write_text(
+        gff1.read_text(encoding="utf-8")
+        + "\n".join(gff2.read_text(encoding="utf-8").splitlines()[1:])
+        + "\n"
+        + "\n".join(gff3.read_text(encoding="utf-8").splitlines()[1:])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Standalone panflat verify --ref-gff passes with colliding Parent=tx1 across all 3 chromosomes (R2-D9)
+    run_verify(m_right, comb_gfa, comb_fa, extra_args=["--ref-gff", comb_gff], check=True)
+
+    # Tamper 1: Corrupting Chr01 CDS coordinate fails verify --ref-gff despite colliding ID=tx1 on Chr02/Chr03
+    t_gff_dir = tmp_path / "tamper_gff"
+    t_gff_dir.mkdir()
+    for f in m_right.parent.glob(f"{m_right.name}.*"):
+        shutil.copy2(f, t_gff_dir / f.name)
+    t_gff_pref = t_gff_dir / m_right.name
+    Path(f"{t_gff_pref}.ref.lifted.gff3").write_text(
+        Path(f"{t_gff_pref}.ref.lifted.gff3")
+        .read_text(encoding="utf-8")
+        .replace("Chr01\tsrc\tCDS\t1\t90", "Chr01\tsrc\tCDS\t4\t90", 1),
+        encoding="utf-8",
+    )
+    p_bad_gff = run_verify(t_gff_pref, comb_gfa, comb_fa, extra_args=["--ref-gff", comb_gff], check=False)
+    assert p_bad_gff.returncode != 0 and "Traceback" not in p_bad_gff.stderr
+
+    # Tamper 2 (R2-D10): Malformed non-alphabetic skipped record in PanSN --ref-fa fails CLI verify
+    bad_pansn_fa = tmp_path / "bad_skipped_pansn.fa"
+    bad_pansn_fa.write_text(
+        f">OtherSample#1#Chr99\nACGT12345\n"
+        f">Ref#1#Chr01\n{ref_c1}\n>Ref#1#Chr02\n{ref_c2}\n>Ref#1#Chr03\n{ref_c3}\n",
+        encoding="utf-8",
+    )
+    p_bad_fa = run_verify(m_right, comb_gfa, bad_pansn_fa, check=False)
+    assert p_bad_fa.returncode != 0 and "Traceback" not in p_bad_fa.stderr
+
+    # Tamper 3 (R2-D11): Deleting merged.centromere.tsv fails CLI verify even without --centromere-bed
+    t_cen_dir = tmp_path / "tamper_cen"
+    t_cen_dir.mkdir()
+    for f in m_right.parent.glob(f"{m_right.name}.*"):
+        shutil.copy2(f, t_cen_dir / f.name)
+    t_cen_pref = t_cen_dir / m_right.name
+    Path(f"{t_cen_pref}.centromere.tsv").unlink()
+    p_no_cen = run_verify(t_cen_pref, comb_gfa, comb_fa, check=False)
+    assert p_no_cen.returncode != 0 and "Traceback" not in p_no_cen.stderr

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from array import array
+from bisect import bisect_right
 import collections
 from dataclasses import dataclass
 import hashlib
@@ -17,13 +18,16 @@ import numpy as np
 from panflat.gfa_io import parse_fasta, revcomp
 from panflat.models import (
     CENTROMERE_TSV_COLUMNS,
+    MAX_COMPACT_NID,
     UNRESOLVED_REASONS,
     BuildConfig,
     ChromosomeBuildResult,
     CompactNodeStore,
     InvariantViolationError,
+    LazyStepOffsetSequence,
     LazyStepTuple,
     VerificationReport,
+    is_compact_nid_str,
 )
 
 OFFSETS_HEADER: list[str] = [
@@ -99,6 +103,12 @@ _CODON_TABLE: dict[str, str] = {
     "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
 }
 
+_VERIFY_FAST_P_RE = re.compile(
+    r"^[1-9][0-9]{0,8}[+-](?:,[1-9][0-9]{0,8}[+-])*$", re.ASCII
+)
+_VERIFY_FAST_W_RE = re.compile(r"^(?:[><][1-9][0-9]{0,8})+$", re.ASCII)
+_REVCOMP_BYTES_TABLE = bytes.maketrans(b"ACGTNRYSWKMBDHV", b"TGCANYRSWMKVHDB")
+
 
 def _translate_cds_seq(cds_seq: str, phase: int = 0) -> str:
     seq = cds_seq[phase:].upper()
@@ -132,12 +142,41 @@ def _merge_intervals(intervals: Sequence[tuple[int, int]], max_len: int) -> int:
     return min(max_len, max(0, total))
 
 
+def _reconstruct_ref_seq_from_result(result: ChromosomeBuildResult, pan_up: str) -> str:
+    """Reconstruct contiguous uppercase reference sequence from `(pan_up, result.step_offsets)`."""
+    so = result.step_offsets
+    if len(so) == 0 or not pan_up:
+        return ""
+    if isinstance(so, LazyStepOffsetSequence):
+        n_st = len(so)
+        slot_breaks = (np.flatnonzero(so.slot_ins_lens[1:] > 0) + 1).tolist()
+        blk_starts = [0, *slot_breaks]
+        blk_ends = [*slot_breaks, n_st]
+        return "".join(
+            pan_up[int(so.pan_starts[b_s]) : int(so.pan_ends[b_e - 1])]
+            for b_s, b_e in zip(blk_starts, blk_ends)
+        )
+    parts: list[str] = []
+    cur_ps = so[0].pan_start
+    cur_pe = so[0].pan_end
+    for row in so[1:]:
+        if row.slot_ins_len > 0:
+            parts.append(pan_up[cur_ps:cur_pe])
+            cur_ps = row.pan_start
+        cur_pe = row.pan_end
+    parts.append(pan_up[cur_ps:cur_pe])
+    return "".join(parts)
+
+
 def run_qc(
     result: ChromosomeBuildResult,
     config: BuildConfig | None = None,
 ) -> dict[str, Any]:
     """
     Compute `--qc` alignment redundancy metrics for inserted pieces (§7, F26).
+    Uses 2-stage self-masking (`pan_no_long` + bitwise dyadic halving across `long_rows`)
+    so 100% self-hits never suppress ~90–92% homologs via `minimap2` `pri_ratio = 0.80`,
+    while keeping index builds `O(1)` in chromosome size (`O(|pan.fa| + log M * sum |piece|)`).
     """
     short_lengths: list[int] = []
     long_rows: list[dict[str, Any]] = []
@@ -172,34 +211,130 @@ def run_qc(
     }
 
     pan_up = result.pan_seq.upper()
-    piece_hits_by_idx: list[list[tuple[int, int, float]]] = []
+    piece_hits_by_idx: list[list[tuple[int, int, float]]] = [
+        [] for _ in long_rows
+    ]
+    stage1_ref_hits_by_idx: list[list[tuple[int, int, float]]] = [
+        [] for _ in long_rows
+    ]
+    has_step_offsets = len(result.step_offsets) > 0
     if long_rows and pan_up:
+        piece_seqs: list[str] = []
+        piece_lens: list[int] = []
         for r in long_rows:
             p_s = int(r["pan_start"])
             p_e = int(r["pan_end"])
-            piece_len = p_e - p_s
-            seq = str(r.get("seq") or pan_up[p_s:p_e]).upper()
-            masked_pan = pan_up[:p_s] + ("N" * piece_len) + pan_up[p_e:]
-            aligner_asm20 = mappy.Aligner(
-                seq=masked_pan, preset="asm20", best_n=50
-            )
-            aligner_short = mappy.Aligner(
-                seq=masked_pan,
+            piece_lens.append(p_e - p_s)
+            piece_seqs.append(str(r.get("seq") or pan_up[p_s:p_e]).upper())
+
+        if has_step_offsets:
+            stage1_target_seq = _reconstruct_ref_seq_from_result(result, pan_up)
+        else:
+            pan_buf = bytearray(pan_up.encode("ascii"))
+            for r in long_rows:
+                p_s = int(r["pan_start"])
+                p_e = int(r["pan_end"])
+                pan_buf[p_s:p_e] = b"N" * (p_e - p_s)
+            stage1_target_seq = pan_buf.decode("ascii")
+            del pan_buf
+
+        need_short = any(pl <= 500 for pl in piece_lens)
+
+        # Stage 1: Query every long piece against contiguous reference sequence
+        aligner_asm20 = (
+            mappy.Aligner(seq=stage1_target_seq, preset="asm20", best_n=50)
+            if stage1_target_seq
+            else None
+        )
+        aligner_short = (
+            mappy.Aligner(
+                seq=stage1_target_seq,
                 k=13,
                 w=5,
                 min_cnt=2,
                 min_chain_score=20,
                 best_n=50,
             )
-            hits_info: list[tuple[int, int, float]] = []
-            for hit in list(aligner_asm20.map(seq)) + list(
-                aligner_short.map(seq)
-            ):
-                if hit.blen <= 0:
+            if (stage1_target_seq and need_short)
+            else None
+        )
+        for idx_r, seq in enumerate(piece_seqs):
+            raw_hits = (
+                list(aligner_asm20.map(seq))
+                if aligner_asm20 is not None
+                else []
+            )
+            if aligner_short is not None and piece_lens[idx_r] <= 500:
+                raw_hits.extend(aligner_short.map(seq))
+            hits_info = piece_hits_by_idx[idx_r]
+            ref_hits_info = stage1_ref_hits_by_idx[idx_r]
+            for hit in raw_hits:
+                if hit.blen < 150:
                     continue
-                identity = hit.mlen / hit.blen
-                hits_info.append((hit.q_st, hit.q_en, identity))
-            piece_hits_by_idx.append(hits_info)
+                h_tup = (hit.q_st, hit.q_en, hit.mlen / hit.blen)
+                hits_info.append(h_tup)
+                if has_step_offsets:
+                    ref_hits_info.append(h_tup)
+        del aligner_asm20, aligner_short, stage1_target_seq
+
+        # Stage 2: Bitwise dyadic halving across long pieces for exact piece-to-piece hits without self-hits
+        n_long = len(long_rows)
+        if n_long >= 2:
+            sep = "N" * 200
+            n_bits = (n_long - 1).bit_length()
+            for bit_idx in range(n_bits):
+                for target_bit in (0, 1):
+                    target_seqs = [
+                        piece_seqs[j]
+                        for j in range(n_long)
+                        if ((j >> bit_idx) & 1) == target_bit
+                    ]
+                    if not target_seqs:
+                        continue
+                    t_starts: list[int] = []
+                    t_ends: list[int] = []
+                    t_chunks: list[str] = []
+                    cur_off = 0
+                    for idx_t, t_seq in enumerate(target_seqs):
+                        if idx_t > 0:
+                            t_chunks.append(sep)
+                            cur_off += len(sep)
+                        t_starts.append(cur_off)
+                        t_ends.append(cur_off + len(t_seq))
+                        t_chunks.append(t_seq)
+                        cur_off += len(t_seq)
+                    subset_seq = "".join(t_chunks)
+                    sub_asm20 = mappy.Aligner(
+                        seq=subset_seq, preset="asm20", best_n=50
+                    )
+                    sub_short = (
+                        mappy.Aligner(
+                            seq=subset_seq,
+                            k=13,
+                            w=5,
+                            min_cnt=2,
+                            min_chain_score=20,
+                            best_n=50,
+                        )
+                        if need_short
+                        else None
+                    )
+                    for idx_q in range(n_long):
+                        if ((idx_q >> bit_idx) & 1) == target_bit:
+                            continue
+                        q_seq = piece_seqs[idx_q]
+                        p_hits = list(sub_asm20.map(q_seq))
+                        if sub_short is not None and piece_lens[idx_q] <= 500:
+                            p_hits.extend(sub_short.map(q_seq))
+                        hits_info = piece_hits_by_idx[idx_q]
+                        for hit in p_hits:
+                            if hit.blen < 150:
+                                continue
+                            pos_t = bisect_right(t_starts, hit.r_st) - 1
+                            if pos_t >= 0 and hit.r_en <= t_ends[pos_t]:
+                                hits_info.append(
+                                    (hit.q_st, hit.q_en, hit.mlen / hit.blen)
+                                )
 
     for tau in (0.90, 0.95, 0.98):
         red_bp = 0
@@ -217,6 +352,48 @@ def run_qc(
         metrics[f"qc_redundancy_{tau:.2f}_bp"] = red_bp
         metrics[f"qc_redundancy_{tau:.2f}_pct"] = f"{pct:.4f}"
         metrics[f"qc_redundancy_{tau:.2f}_ratio"] = f"{ratio:.6f}"
+
+    # Spec §7 item 5: Separate CEN_ISLAND whole-reference hit statistics
+    cen_event_ids = {
+        ev.event_id
+        for ev in result.sv_events
+        if ev.event_type == "CEN_ISLAND"
+    }
+    cen_long_indices = [
+        idx_r
+        for idx_r, r in enumerate(long_rows)
+        if str(r.get("event_id", "")) in cen_event_ids
+    ]
+    cen_long_rows = [long_rows[idx_r] for idx_r in cen_long_indices]
+    cen_long_count = len(cen_long_rows)
+    cen_long_bp = sum(
+        int(r["pan_end"]) - int(r["pan_start"]) for r in cen_long_rows
+    )
+    metrics["qc_cen_island_ge150_count"] = cen_long_count
+    metrics["qc_cen_island_ge150_bp"] = cen_long_bp
+    metrics["qc_cen_island_long_ge150_count"] = cen_long_count
+    metrics["qc_cen_island_long_ge150_bp"] = cen_long_bp
+
+    cen_hits_by_idx: list[list[tuple[int, int, float]]] = [
+        stage1_ref_hits_by_idx[idx_r] if has_step_offsets else []
+        for idx_r in cen_long_indices
+    ]
+
+    for tau in (0.90, 0.95, 0.98):
+        c_bp = 0
+        for idx_c, r in enumerate(cen_long_rows):
+            piece_len = int(r["pan_end"]) - int(r["pan_start"])
+            cov_ivs = [
+                (q_s, q_e)
+                for q_s, q_e, ident in cen_hits_by_idx[idx_c]
+                if ident >= tau
+            ]
+            c_bp += _merge_intervals(cov_ivs, piece_len)
+        c_pct = (100.0 * c_bp / cen_long_bp) if cen_long_bp > 0 else 0.0
+        c_ratio = (c_bp / cen_long_bp) if cen_long_bp > 0 else 0.0
+        metrics[f"qc_cen_island_ref_hit_{tau:.2f}_bp"] = c_bp
+        metrics[f"qc_cen_island_ref_hit_{tau:.2f}_pct"] = f"{c_pct:.4f}"
+        metrics[f"qc_cen_island_ref_hit_{tau:.2f}_ratio"] = f"{c_ratio:.6f}"
 
     return metrics
 
@@ -250,23 +427,89 @@ def _parse_fasta_allow_empty(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     records: dict[str, str] = {}
+    seen_names: set[str] = set()
     cur_name: str | None = None
+    cur_has_seq = False
     chunks: list[str] = []
     with path.open("r", encoding="utf-8") as fh:
-        for raw_line in fh:
+        for line_no, raw_line in enumerate(fh, start=1):
             line = raw_line.strip()
             if not line:
                 continue
             if line.startswith(">"):
                 if cur_name is not None:
-                    records[cur_name] = "".join(chunks).upper()
-                cur_name = line[1:].strip().split()[0]
+                    if not cur_has_seq:
+                        raise InvariantViolationError(
+                            f"Empty sequence for FASTA record '{cur_name}' in '{path}'"
+                        )
+                    records[cur_name] = "".join(chunks)
+                hdr_body = line[1:].strip()
+                if not hdr_body:
+                    raise InvariantViolationError(
+                        f"Empty FASTA header at line {line_no} in '{path}'"
+                    )
+                seq_name = hdr_body.split()[0]
+                if seq_name in seen_names:
+                    raise InvariantViolationError(
+                        f"Duplicate FASTA sequence name '{seq_name}' in '{path}'"
+                    )
+                seen_names.add(seq_name)
+                cur_name = seq_name
+                cur_has_seq = False
                 chunks = []
             else:
-                chunks.append("".join(line.split()))
+                if cur_name is None:
+                    raise InvariantViolationError(
+                        f"FASTA sequence data before header at line {line_no} in '{path}'"
+                    )
+                chunk = (
+                    line
+                    if (line.isascii() and line.isalpha())
+                    else "".join(line.split())
+                )
+                if not chunk:
+                    continue
+                if not (chunk.isascii() and chunk.isalpha()):
+                    raise InvariantViolationError(
+                        f"Non-alphabetic characters in FASTA record '{cur_name}' in '{path}'"
+                    )
+                cur_has_seq = True
+                chunks.append(chunk.upper())
     if cur_name is not None:
-        records[cur_name] = "".join(chunks).upper()
+        if not cur_has_seq:
+            raise InvariantViolationError(
+                f"Empty sequence for FASTA record '{cur_name}' in '{path}'"
+            )
+        records[cur_name] = "".join(chunks)
     return records
+
+
+@dataclass(frozen=True)
+class _GFAPathMeta:
+    """Lightweight metadata for a GFA `P` path or `W` walk used in `--backbone-prefix` verification."""
+
+    src_path: str
+    pan_name: str
+    sample: str
+    hap: str
+    hap_id: str
+    seqid: str
+    is_w_line: bool
+
+
+def _parse_pansn_meta(path_name: str) -> tuple[str, str, str, str]:
+    if "#" in path_name:
+        parts = path_name.split("#")
+        if len(parts) >= 3:
+            sample = parts[0].strip()
+            hap = parts[1].strip()
+            seqid = "#".join(parts[2:]).strip()
+        else:
+            sample = parts[0].strip()
+            hap = parts[1].strip()
+            seqid = parts[1].strip()
+        return sample, hap, f"{sample}#{hap}", seqid
+    return path_name, "1", path_name, path_name
 
 
 @dataclass
@@ -281,6 +524,7 @@ class _SparsePathSlices:
 def _parse_gfa_paths_and_walks(
     gfa_path: Path,
     required_slices_by_path: Mapping[str, set[tuple[int, int]]] | None = None,
+    out_path_metas: list[_GFAPathMeta] | None = None,
 ) -> tuple[Mapping[str, str], dict[str, Any]]:
     """Independently parse GFA S, P, W lines into `(nodes, path_seqs)`."""
     file_size = gfa_path.stat().st_size
@@ -292,25 +536,33 @@ def _parse_gfa_paths_and_walks(
         expected_nid = 1
         all_seq_int = True
         max_nid = 0
-        raw_pw_lines: list[bytes] = []
+        pw_offsets: list[int] = []
 
         with gfa_path.open("rb") as fh:
-            for raw_b in fh:
+            while True:
+                line_off = fh.tell()
+                raw_b = fh.readline()
                 if not raw_b:
-                    continue
+                    break
                 b0 = raw_b[0]
                 if b0 == 76:  # b'L'
                     continue
                 if b0 == 83 and raw_b[1:2] == b"\t":  # b'S\t'
                     t1 = raw_b.find(b"\t", 2)
-                    if t1 < 0:
-                        continue
+                    if t1 <= 2:
+                        raise InvariantViolationError(
+                            "Malformed S line in GFA (missing segment ID or sequence)"
+                        )
                     nid_b = raw_b[2:t1]
-                    if not nid_b.isdigit():
+                    if not (
+                        1 <= len(nid_b) <= 9
+                        and nid_b.isdigit()
+                        and nid_b[0] != 48
+                    ):
                         all_seq_int = False
                         break
                     nid_int = int(nid_b)
-                    if nid_int != expected_nid:
+                    if nid_int != expected_nid or nid_int > MAX_COMPACT_NID:
                         all_seq_int = False
                         break
                     t2 = raw_b.find(b"\t", t1 + 1)
@@ -319,12 +571,16 @@ def _parse_gfa_paths_and_walks(
                         if t2 < 0
                         else raw_b[t1 + 1 : t2]
                     ).upper()
+                    if not seq_b or not seq_b.isalpha() or not seq_b.isascii():
+                        raise InvariantViolationError(
+                            f"Invalid or missing segment sequence for node '{nid_int}' in GFA"
+                        )
                     seq_buf.extend(seq_b)
                     node_lens_arr.append(len(seq_b))
                     expected_nid += 1
                     max_nid = nid_int
                 elif (b0 == 80 or b0 == 87) and raw_b[1:2] == b"\t":  # b'P\t' or b'W\t'
-                    raw_pw_lines.append(raw_b)
+                    pw_offsets.append(line_off)
 
         if all_seq_int and max_nid > 0:
             node_lens = np.frombuffer(node_lens_arr, dtype=np.int32).copy()
@@ -341,7 +597,9 @@ def _parse_gfa_paths_and_walks(
             )
             del seq_buf
             path_seqs_sparse: dict[str, Any] = {}
-            w_re = re.compile(r"([><])(\d+)")
+            fast_metas: list[_GFAPathMeta] = []
+            w_re = re.compile(r"([><])([1-9][0-9]{0,8})", re.ASCII)
+            fast_ok = True
 
             def _matching_reqs(
                 key1: str, key2: str | None = None
@@ -369,7 +627,14 @@ def _parse_gfa_paths_and_walks(
                 reqs: set[tuple[int, int]],
                 base_offset: int,
             ) -> tuple[int, dict[tuple[int, int], str]]:
-                step_lens = node_lens[np.abs(codes)]
+                nids_abs = np.abs(codes)
+                if int(nids_abs.shape[0]) > 0 and (
+                    int(nids_abs.min()) <= 0 or int(nids_abs.max()) > max_nid
+                ):
+                    raise InvariantViolationError(
+                        "GFA path/walk references unknown segment ID"
+                    )
+                step_lens = node_lens[nids_abs]
                 n_c = int(codes.shape[0])
                 cum_bp = np.empty(n_c + 1, dtype=np.int64)
                 cum_bp[0] = 0
@@ -399,71 +664,139 @@ def _parse_gfa_paths_and_walks(
                             ]
                 return total_len, sl_map
 
-            for raw_b in raw_pw_lines:
-                raw = raw_b.decode("utf-8")
-                parts = raw.rstrip("\r\n").split("\t")
-                rec_type = parts[0]
-                if rec_type == "P" and len(parts) >= 3:
-                    pname = parts[1]
-                    reqs = _matching_reqs(pname)
-                    if not reqs:
-                        path_seqs_sparse[pname] = _SparsePathSlices(0, 0, {})
-                        continue
-                    step_str = parts[2].strip()
-                    nids = np.fromstring(
-                        step_str.translate({43: None, 45: None}),
-                        dtype=np.int32,
-                        sep=",",
-                    )
-                    signs = np.frombuffer(
-                        step_str.encode("ascii").translate(
-                            None, b"0123456789, \t\r\n"
-                        ),
-                        dtype=np.uint8,
-                    )
-                    codes = np.where(signs == 45, -nids, nids).astype(
-                        np.int32, copy=False
-                    )
-                    del step_str, nids, signs
-                    total_len, sl_map = _extract_reqs_from_codes(codes, reqs, 0)
-                    path_seqs_sparse[pname] = _SparsePathSlices(
-                        0, total_len, sl_map
-                    )
-                elif rec_type == "W" and len(parts) >= 7:
-                    sample, hap, seqid = parts[1], parts[2], parts[3]
-                    start = 0 if parts[4] == "*" else int(parts[4])
-                    end = -1 if parts[5] == "*" else int(parts[5])
-                    key_plain = f"{sample}#{hap}#{seqid}"
-                    codes = np.asarray(
-                        [
-                            int(m.group(2))
-                            if m.group(1) == ">"
-                            else -int(m.group(2))
-                            for m in w_re.finditer(parts[6])
-                        ],
-                        dtype=np.int32,
-                    )
-                    walk_len = int(node_lens[np.abs(codes)].sum())
-                    computed_end = start + walk_len if end < 0 else end
-                    key_with_coords = (
-                        f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
-                    )
-                    reqs = _matching_reqs(key_with_coords, key_plain)
-                    if not reqs:
-                        sp_empty = _SparsePathSlices(start, walk_len, {})
-                        path_seqs_sparse[key_with_coords] = sp_empty
+            with gfa_path.open("rb") as fh_pw:
+                for off_pos in pw_offsets:
+                    fh_pw.seek(off_pos)
+                    raw = fh_pw.readline().decode("utf-8")
+                    parts = raw.rstrip("\r\n").split("\t")
+                    rec_type = parts[0]
+                    if rec_type == "P" and len(parts) >= 3:
+                        pname = parts[1]
+                        step_str = parts[2].strip()
+                        if not _VERIFY_FAST_P_RE.match(step_str):
+                            fast_ok = False
+                            break
+                        s_p, h_p, hid_p, seq_p = _parse_pansn_meta(pname)
+                        pan_n = f"{s_p}#{h_p}#{seq_p}" if "#" in pname else pname
+                        fast_metas.append(
+                            _GFAPathMeta(pname, pan_n, s_p, h_p, hid_p, seq_p, False)
+                        )
+                        reqs = _matching_reqs(pname)
+                        if not reqs:
+                            path_seqs_sparse[pname] = _SparsePathSlices(
+                                0, 0, {}
+                            )
+                            continue
+                        nids = np.fromstring(
+                            step_str.translate({43: None, 45: None}),
+                            dtype=np.int64,
+                            sep=",",
+                        )
+                        if int(nids.shape[0]) > 0 and int(nids.max()) > max_nid:
+                            fast_ok = False
+                            break
+                        nids32 = nids.astype(np.int32)
+                        signs = np.frombuffer(
+                            step_str.encode("ascii").translate(
+                                None, b"0123456789, \t\r\n"
+                            ),
+                            dtype=np.uint8,
+                        )
+                        codes = np.where(signs == 45, -nids32, nids32).astype(
+                            np.int32, copy=False
+                        )
+                        del step_str, nids, nids32, signs
+                        total_len, sl_map = _extract_reqs_from_codes(
+                            codes, reqs, 0
+                        )
+                        path_seqs_sparse[pname] = _SparsePathSlices(
+                            0, total_len, sl_map
+                        )
+                    elif rec_type == "W" and len(parts) >= 7:
+                        sample, hap, seqid = parts[1], parts[2], parts[3]
+                        start = 0 if parts[4] == "*" else int(parts[4])
+                        end = -1 if parts[5] == "*" else int(parts[5])
+                        walk_str = parts[6].strip()
+                        if not _VERIFY_FAST_W_RE.match(walk_str):
+                            fast_ok = False
+                            break
+                        key_plain = f"{sample}#{hap}#{seqid}"
+                        if end >= 0:
+                            key_with_coords = (
+                                f"{sample}#{hap}#{seqid}:{start}-{end}"
+                            )
+                            fast_metas.append(
+                                _GFAPathMeta(
+                                    key_with_coords,
+                                    key_plain,
+                                    sample,
+                                    hap,
+                                    f"{sample}#{hap}",
+                                    seqid,
+                                    True,
+                                )
+                            )
+                            reqs = _matching_reqs(key_with_coords, key_plain)
+                            if not reqs:
+                                sp_empty = _SparsePathSlices(
+                                    start, max(0, end - start), {}
+                                )
+                                path_seqs_sparse[key_with_coords] = sp_empty
+                                if key_plain not in path_seqs_sparse:
+                                    path_seqs_sparse[key_plain] = sp_empty
+                                continue
+                        codes64 = np.asarray(
+                            [
+                                int(m.group(2))
+                                if m.group(1) == ">"
+                                else -int(m.group(2))
+                                for m in w_re.finditer(walk_str)
+                            ],
+                            dtype=np.int64,
+                        )
+                        if (
+                            int(codes64.shape[0]) > 0
+                            and int(np.abs(codes64).max()) > max_nid
+                        ):
+                            fast_ok = False
+                            break
+                        codes = codes64.astype(np.int32)
+                        walk_len = int(node_lens[np.abs(codes)].sum())
+                        computed_end = start + walk_len if end < 0 else end
+                        key_with_coords = (
+                            f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
+                        )
+                        if end < 0:
+                            fast_metas.append(
+                                _GFAPathMeta(
+                                    key_with_coords,
+                                    key_plain,
+                                    sample,
+                                    hap,
+                                    f"{sample}#{hap}",
+                                    seqid,
+                                    True,
+                                )
+                            )
+                        reqs = _matching_reqs(key_with_coords, key_plain)
+                        if not reqs:
+                            sp_empty = _SparsePathSlices(start, walk_len, {})
+                            path_seqs_sparse[key_with_coords] = sp_empty
+                            if key_plain not in path_seqs_sparse:
+                                path_seqs_sparse[key_plain] = sp_empty
+                            continue
+                        total_len, sl_map = _extract_reqs_from_codes(
+                            codes, reqs, start
+                        )
+                        sp_obj = _SparsePathSlices(start, total_len, sl_map)
+                        path_seqs_sparse[key_with_coords] = sp_obj
                         if key_plain not in path_seqs_sparse:
-                            path_seqs_sparse[key_plain] = sp_empty
-                        continue
-                    total_len, sl_map = _extract_reqs_from_codes(
-                        codes, reqs, start
-                    )
-                    sp_obj = _SparsePathSlices(start, total_len, sl_map)
-                    path_seqs_sparse[key_with_coords] = sp_obj
-                    if key_plain not in path_seqs_sparse:
-                        path_seqs_sparse[key_plain] = sp_obj
+                            path_seqs_sparse[key_plain] = sp_obj
 
-            return node_store, path_seqs_sparse
+            if fast_ok:
+                if out_path_metas is not None:
+                    out_path_metas.extend(fast_metas)
+                return node_store, path_seqs_sparse
 
     nodes: dict[str, str] = {}
     raw_p: list[tuple[str, str]] = []
@@ -476,7 +809,17 @@ def _parse_gfa_paths_and_walks(
         parts = raw.rstrip("\r\n").split("\t")
         rec_type = parts[0]
         if rec_type == "S" and len(parts) >= 3:
-            nodes[parts[1]] = parts[2].upper()
+            nid_s = parts[1].strip()
+            seq_s = parts[2].strip()
+            if not seq_s or not (seq_s.isascii() and seq_s.isalpha()):
+                raise InvariantViolationError(
+                    f"Invalid or missing segment sequence for node '{nid_s}' in GFA"
+                )
+            if nid_s in nodes:
+                raise InvariantViolationError(
+                    f"Duplicate S-line segment ID '{nid_s}' in GFA"
+                )
+            nodes[nid_s] = seq_s.upper()
         elif rec_type == "P" and len(parts) >= 3:
             raw_p.append((parts[1], parts[2]))
         elif rec_type == "W" and len(parts) >= 7:
@@ -488,27 +831,59 @@ def _parse_gfa_paths_and_walks(
 
     path_seqs: dict[str, tuple[int, str]] = {}
     for pname, step_str in raw_p:
-        chunks: list[str] = []
+        if out_path_metas is not None:
+            s_p, h_p, hid_p, seq_p = _parse_pansn_meta(pname)
+            pan_n = f"{s_p}#{h_p}#{seq_p}" if "#" in pname else pname
+            out_path_metas.append(
+                _GFAPathMeta(pname, pan_n, s_p, h_p, hid_p, seq_p, False)
+            )
+        chunks = []
         for token in step_str.split(","):
             tok = token.strip()
             if not tok:
                 continue
             nid, orient = tok[:-1], tok[-1]
+            if orient not in ("+", "-") or nid not in nodes:
+                raise InvariantViolationError(
+                    f"Malformed or unknown step '{tok}' in P line '{pname}'"
+                )
             seq = nodes[nid]
             chunks.append(seq if orient == "+" else revcomp(seq))
         path_seqs[pname] = (0, "".join(chunks))
 
+    w_full_re = re.compile(r"^(?:[><][^><\s]+)+$")
     w_step_re = re.compile(r"([><])([^><\s]+)")
     for sample, hap, seqid, start, end, walk_str in raw_w:
+        walk_clean = walk_str.strip()
+        if not walk_clean or not w_full_re.match(walk_clean):
+            raise InvariantViolationError(
+                f"Malformed W-line walk string '{walk_clean}' for '{sample}#{hap}#{seqid}'"
+            )
         chunks = []
-        for match in w_step_re.finditer(walk_str):
+        for match in w_step_re.finditer(walk_clean):
             orient_sym, nid = match.group(1), match.group(2)
+            if nid not in nodes:
+                raise InvariantViolationError(
+                    f"Unknown node '{nid}' in W line for '{sample}#{hap}#{seqid}'"
+                )
             seq = nodes[nid]
             chunks.append(seq if orient_sym == ">" else revcomp(seq))
         full_seq = "".join(chunks)
         computed_end = start + len(full_seq) if end < 0 else end
         key_with_coords = f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
         key_plain = f"{sample}#{hap}#{seqid}"
+        if out_path_metas is not None:
+            out_path_metas.append(
+                _GFAPathMeta(
+                    key_with_coords,
+                    key_plain,
+                    sample,
+                    hap,
+                    f"{sample}#{hap}",
+                    seqid,
+                    True,
+                )
+            )
         path_seqs[key_with_coords] = (start, full_seq)
         if key_plain not in path_seqs:
             path_seqs[key_plain] = (start, full_seq)
@@ -562,7 +937,7 @@ def _extract_source_slice(
 
 def _parse_src_interval(spec: str) -> tuple[int, int]:
     s = spec.strip()
-    if ":" in s and not s.split(":")[0].isdigit():
+    if ":" in s:
         s = s.rsplit(":", 1)[-1]
     if "-" in s:
         a, b = s.split("-", 1)
@@ -576,12 +951,12 @@ def _parse_src_interval(spec: str) -> tuple[int, int]:
 def _reconstruct_gff3_transcripts_and_proteins(
     seqs: Mapping[str, str],
     gff_path: Path,
-) -> tuple[dict[str, str], dict[str, str]]:
-    exons_by_parent: dict[str, list[dict[str, Any]]] = collections.defaultdict(
-        list
+) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], str]]:
+    exons_by_parent: dict[tuple[str, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
     )
-    cds_by_parent: dict[str, list[dict[str, Any]]] = collections.defaultdict(
-        list
+    cds_by_parent: dict[tuple[str, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
     )
 
     for raw in gff_path.read_text(encoding="utf-8").splitlines():
@@ -619,15 +994,17 @@ def _reconstruct_gff3_transcripts_and_proteins(
             "strand": parts[6],
             "phase": parts[7],
         }
+        parent_ids = [x.strip() for x in parent.split(",") if x.strip()]
         if row["type"] == "exon":
-            exons_by_parent[parent].append(row)
+            for p_id in parent_ids:
+                exons_by_parent[(row["seqid"], p_id)].append(row)
         elif row["type"] == "CDS":
-            cds_by_parent[parent].append(row)
+            for p_id in parent_ids:
+                cds_by_parent[(row["seqid"], p_id)].append(row)
 
-    transcripts: dict[str, str] = {}
-    for parent, ex_list in exons_by_parent.items():
+    transcripts: dict[tuple[str, str], str] = {}
+    for (seqid, parent), ex_list in exons_by_parent.items():
         strand = ex_list[0]["strand"]
-        seqid = ex_list[0]["seqid"]
         if seqid not in seqs:
             raise InvariantViolationError(
                 f"GFF3 seqid '{seqid}' missing from FASTA"
@@ -644,12 +1021,11 @@ def _reconstruct_gff3_transcripts_and_proteins(
                 )
             seg = chrom_seq[r["start"] - 1 : r["end"]]
             parts_seq.append(seg if strand == "+" else revcomp(seg))
-        transcripts[parent] = "".join(parts_seq)
+        transcripts[(seqid, parent)] = "".join(parts_seq)
 
-    proteins: dict[str, str] = {}
-    for parent, cds_list in cds_by_parent.items():
+    proteins: dict[tuple[str, str], str] = {}
+    for (seqid, parent), cds_list in cds_by_parent.items():
         strand = cds_list[0]["strand"]
-        seqid = cds_list[0]["seqid"]
         if seqid not in seqs:
             raise InvariantViolationError(
                 f"GFF3 seqid '{seqid}' missing from FASTA"
@@ -670,18 +1046,264 @@ def _reconstruct_gff3_transcripts_and_proteins(
             phase = int(r["phase"]) if r["phase"] != "." else 0
             if expected_phase is not None and phase != expected_phase:
                 raise InvariantViolationError(
-                    f"CDS phase propagation mismatch on '{parent}': expected {expected_phase}, got {phase}"
+                    f"CDS phase propagation mismatch on '{parent}' ({seqid}): expected {expected_phase}, got {phase}"
                 )
             expected_phase = (3 - ((len(seg_oriented) - phase) % 3)) % 3
             parts_seq.append(seg_oriented)
         first_phase = (
             int(ordered[0]["phase"]) if ordered[0]["phase"] != "." else 0
         )
-        proteins[parent] = _translate_cds_seq(
+        proteins[(seqid, parent)] = _translate_cds_seq(
             "".join(parts_seq), phase=first_phase
         )
 
     return transcripts, proteins
+
+
+_W_COORD_SUFFIX_RE = re.compile(r":[0-9]+-[0-9]+$", re.ASCII)
+
+
+def _strip_w_coord_suffix(name: str) -> str:
+    return _W_COORD_SUFFIX_RE.sub("", name)
+
+
+def _match_gfa_paths_by_backbone_prefix(
+    metas: Sequence[_GFAPathMeta],
+    prefix: str,
+) -> list[_GFAPathMeta]:
+    """Match GFA `P`/`W` path metadata against `--backbone-prefix` using §2.1 PanSN rules."""
+    if not prefix:
+        return []
+    matched: list[_GFAPathMeta] = []
+    if prefix.endswith("#"):
+        for m in metas:
+            if m.src_path.startswith(prefix) or m.pan_name.startswith(prefix):
+                matched.append(m)
+        if len(matched) == 0 and (
+            prefix.endswith("#0#") or prefix.endswith("#1#")
+        ):
+            base_sample = prefix[:-3]
+            if base_sample and "#" not in base_sample:
+                sample_pansn = [
+                    m
+                    for m in metas
+                    if ("#" in m.src_path or m.is_w_line)
+                    and m.sample == base_sample
+                ]
+                hap1 = [m for m in sample_pansn if m.hap == "1"]
+                if len(hap1) == 1:
+                    matched = hap1
+                elif len(hap1) == 0:
+                    hap0 = [m for m in sample_pansn if m.hap == "0"]
+                    if len(hap0) == 1:
+                        matched = hap0
+    elif "#" in prefix:
+        for m in metas:
+            if (
+                m.src_path == prefix
+                or m.pan_name == prefix
+                or m.src_path.startswith(f"{prefix}#")
+                or m.pan_name.startswith(f"{prefix}#")
+                or m.src_path.startswith(f"{prefix}:")
+            ):
+                matched.append(m)
+    else:
+        for m in metas:
+            if "#" in m.src_path or m.is_w_line:
+                if m.sample == prefix:
+                    matched.append(m)
+            else:
+                if m.src_path.startswith(prefix):
+                    matched.append(m)
+        if len(matched) > 1:
+            exact_matches = [m for m in matched if m.src_path == prefix]
+            if len(exact_matches) == 1:
+                matched = exact_matches
+            else:
+                pansn_matches = [
+                    m for m in matched if ("#" in m.src_path or m.is_w_line)
+                ]
+                if len(pansn_matches) == len(matched):
+                    hap1 = [m for m in pansn_matches if m.hap == "1"]
+                    if len(hap1) == 1:
+                        matched = hap1
+                    elif len(hap1) == 0:
+                        hap0 = [m for m in pansn_matches if m.hap == "0"]
+                        if len(hap0) == 1:
+                            matched = hap0
+    return matched
+
+
+def _match_fasta_candidates_by_bp(
+    target_chrom: str,
+    candidates: Mapping[str, str],
+    bp: str,
+) -> list[tuple[str, str]]:
+    """Return candidate `(header, seq)` pairs matching `bp` for `target_chrom` with `#`-boundary and `#0#` fallback."""
+    if not bp:
+        return []
+
+    def _matches_hdr(hdr: str, pref: str) -> bool:
+        if not pref:
+            return False
+        if "#" in hdr:
+            h_sample, _, _, h_seqid = _parse_pansn_meta(hdr)
+            h_seqid_base = _strip_w_coord_suffix(h_seqid)
+            hdr_base = _strip_w_coord_suffix(hdr)
+            pref_base = _strip_w_coord_suffix(pref)
+            chrom_ok = (
+                h_seqid == target_chrom
+                or h_seqid_base == target_chrom
+                or hdr.endswith(f"#{target_chrom}")
+                or hdr_base.endswith(f"#{target_chrom}")
+            )
+            if pref.endswith("#"):
+                return hdr.startswith(pref) and chrom_ok
+            if "#" in pref:
+                if pref != pref_base:
+                    if hdr != hdr_base:
+                        return hdr == pref and chrom_ok
+                    return hdr == pref_base and chrom_ok
+                return (
+                    hdr == pref
+                    or hdr_base == pref
+                    or hdr == f"{pref}#{target_chrom}"
+                    or hdr_base == f"{pref}#{target_chrom}"
+                ) and chrom_ok
+            return h_sample == pref and chrom_ok
+        if pref.endswith("#") or "#" in pref:
+            return False
+        return hdr == target_chrom and hdr.startswith(pref)
+
+    pref_hits = [
+        (h, seq) for h, seq in candidates.items() if _matches_hdr(h, bp)
+    ]
+    if not pref_hits and (bp.endswith("#0#") or bp.endswith("#1#")):
+        base_sample = bp[:-3]
+        if base_sample and "#" not in base_sample:
+            pref_hits = [
+                (h, seq)
+                for h, seq in candidates.items()
+                if "#" in h and _matches_hdr(h, base_sample)
+            ]
+
+    if len(pref_hits) > 1:
+        base_s = (
+            bp[:-3]
+            if (bp.endswith("#0#") or bp.endswith("#1#"))
+            else bp.rstrip("#")
+        )
+        if "#" not in base_s:
+
+            def _is_hap_for_tc(hdr_val: str, want_hap: str) -> bool:
+                if "#" not in hdr_val:
+                    return False
+                s_m, h_m, _, sq_m = _parse_pansn_meta(hdr_val)
+                return (
+                    s_m == base_s
+                    and h_m == want_hap
+                    and (
+                        sq_m == target_chrom
+                        or _strip_w_coord_suffix(sq_m) == target_chrom
+                    )
+                )
+
+            hap1 = [
+                (h, seq) for h, seq in pref_hits if _is_hap_for_tc(h, "1")
+            ]
+            if len(hap1) == 1:
+                return hap1
+            if len(hap1) == 0:
+                hap0 = [
+                    (h, seq) for h, seq in pref_hits if _is_hap_for_tc(h, "0")
+                ]
+                if len(hap0) == 1:
+                    return hap0
+    return pref_hits
+
+
+def _resolve_chrom_by_explicit_bp(
+    target_chrom: str,
+    candidates: Mapping[str, str],
+    bp: str,
+    total_fasta_records: int,
+    all_target_chroms: set[str],
+) -> str | None:
+    """Resolve reference sequence for `target_chrom` under an explicit `--backbone-prefix` override."""
+    if not bp:
+        return None
+    hits = _match_fasta_candidates_by_bp(target_chrom, candidates, bp)
+    if len(hits) == 1:
+        return hits[0][1]
+    if len(hits) > 1:
+        return None
+
+    # No PanSN header matched `bp`. If `--ref-fa` contains PanSN headers for `target_chrom`, fail strictly.
+    has_pansn_for_chrom = any(
+        "#" in h
+        and h != target_chrom
+        and (
+            _parse_pansn_meta(h)[3] == target_chrom
+            or _strip_w_coord_suffix(_parse_pansn_meta(h)[3]) == target_chrom
+            or h.endswith(f"#{target_chrom}")
+            or _strip_w_coord_suffix(h).endswith(f"#{target_chrom}")
+        )
+        for h in candidates
+    )
+    if has_pansn_for_chrom:
+        return None
+
+    # Plain chromosome-named `--ref-fa` (e.g. single-record `>Chr01` or plain multi-chrom `>Chr01`, `>Chr02`):
+    # GFA path verification enforces `bp` separately.
+    if len(all_target_chroms) == 1 and total_fasta_records == 1:
+        return candidates.get(target_chrom)
+    if (
+        len(all_target_chroms) > 1
+        and all("#" not in h for h in candidates)
+        and all_target_chroms.issubset(candidates.keys())
+    ):
+        return candidates.get(target_chrom)
+    return None
+
+
+def _resolve_chrom_from_candidates(
+    target_chrom: str,
+    candidates: Mapping[str, str],
+    bp: str,
+    rp: str,
+    rh: str,
+) -> str | None:
+    if rp:
+        rp_clean = _strip_w_coord_suffix(rp)
+        if rp in candidates:
+            return candidates[rp]
+        if rp_clean in candidates:
+            return candidates[rp_clean]
+    if rh and f"{rh}#{target_chrom}" in candidates:
+        return candidates[f"{rh}#{target_chrom}"]
+    if target_chrom in candidates:
+        return candidates[target_chrom]
+
+    if bp:
+        pref_hits = _match_fasta_candidates_by_bp(target_chrom, candidates, bp)
+        if len(pref_hits) == 1:
+            return pref_hits[0][1]
+
+    suf_hits = [
+        (h, seq)
+        for h, seq in candidates.items()
+        if ("#" in target_chrom and target_chrom.endswith(f"#{h}"))
+        or (
+            "#" in h
+            and (
+                h.endswith(f"#{target_chrom}")
+                or _strip_w_coord_suffix(h).endswith(f"#{target_chrom}")
+            )
+        )
+    ]
+    if len(suf_hits) == 1:
+        return suf_hits[0][1]
+    return None
 
 
 def _load_ref_records_for_verify(
@@ -689,80 +1311,206 @@ def _load_ref_records_for_verify(
     pan_records: Mapping[str, str],
     summary_chrom: str | None,
     backbone_prefix: str | None = None,
+    ref_path: str | None = None,
+    ref_hap: str | None = None,
+    summary_kv: Mapping[str, str] | None = None,
+    explicit_backbone: bool = False,
 ) -> dict[str, str]:
     """
     Load reference FASTA records for `verify_build_outputs`.
-    When `summary_chrom` is a single chromosome present in `pan_records` and `ref_fa_file`
-    is a multi-FASTA, streams only the matching reference chromosome (including PanSN `#`-suffix match).
+    Supports single-chromosome builds (streaming only candidate records for `target_chrom`)
+    and multi-chromosome `panflat merge` bundles verified against PanSN multi-FASTAs.
     """
-    if (
-        summary_chrom
-        and summary_chrom != "ALL"
-        and summary_chrom in pan_records
-        and len(pan_records) == 1
-    ):
-        exact_seq: str | None = None
-        prefix_matches: list[tuple[str, str]] = []
-        suffix_matches: list[tuple[str, str]] = []
+    if not pan_records:
+        return parse_fasta(str(ref_fa_file))
+
+    target_chroms = list(pan_records.keys())
+    target_set = set(target_chroms)
+    skv = summary_kv or {}
+    global_bp = (backbone_prefix or "").strip()
+    global_rp = "" if explicit_backbone else (ref_path or "").strip()
+    global_rh = "" if explicit_backbone else (ref_hap or "").strip()
+
+    if explicit_backbone and not global_bp:
+        raise InvariantViolationError(
+            "Explicit --backbone-prefix must not be empty"
+        )
+
+    wanted_exact: set[str] = set(target_set)
+    if explicit_backbone and global_bp and "#" in global_bp and not global_bp.endswith("#"):
+        wanted_exact.add(global_bp)
+        wanted_exact.add(_strip_w_coord_suffix(global_bp))
+    if global_rp:
+        wanted_exact.add(global_rp)
+        wanted_exact.add(_strip_w_coord_suffix(global_rp))
+    if not explicit_backbone:
+        for tc in target_chroms:
+            c_rp = skv.get(f"{tc}:ref_path", "").strip()
+            c_rh = skv.get(f"{tc}:ref_hap", "").strip()
+            if c_rp:
+                wanted_exact.add(c_rp)
+                wanted_exact.add(_strip_w_coord_suffix(c_rp))
+            if c_rh:
+                wanted_exact.add(f"{c_rh}#{tc}")
+            if global_rh:
+                wanted_exact.add(f"{global_rh}#{tc}")
+
+    def _is_relevant_hdr(hdr: str) -> bool:
+        hdr_base = _strip_w_coord_suffix(hdr)
+        if hdr in wanted_exact or hdr_base in wanted_exact:
+            return True
+        if "#" in hdr:
+            _, _, _, h_seqid = _parse_pansn_meta(hdr)
+            h_seqid_base = _strip_w_coord_suffix(h_seqid)
+            suf = hdr.rsplit("#", 1)[-1]
+            suf_base = _strip_w_coord_suffix(suf)
+            if (
+                h_seqid in target_set
+                or h_seqid_base in target_set
+                or suf in target_set
+                or suf_base in target_set
+            ):
+                return True
+        for tc in target_chroms:
+            if "#" in tc and tc.endswith(f"#{hdr}"):
+                return True
+        return False
+
+    if len(pan_records) == 1:
+        # Stream only relevant candidate records so >1GB multi-chromosome FASTAs stay small in RAM,
+        # while strictly validating FASTA syntax across all records (kept and skipped).
+        candidates: dict[str, str] = {}
+        first_hdr: str | None = None
         cur_name: str | None = None
-        keep_mode: str | None = None
+        cur_has_seq = False
+        keep = False
         chunks: list[str] = []
-        bp = (backbone_prefix or "").strip()
-
-        def _check_hdr(hdr: str) -> str | None:
-            if hdr == summary_chrom:
-                return "exact"
-            if bp and hdr.startswith(bp) and hdr.endswith(f"#{summary_chrom}"):
-                return "prefix"
-            if "#" in summary_chrom and summary_chrom.endswith(f"#{hdr}"):
-                return "suffix"
-            if "#" in hdr and hdr.endswith(f"#{summary_chrom}"):
-                return "suffix"
-            return None
-
+        seen_hdrs: set[str] = set()
+        saw_any = False
         with ref_fa_file.open("r", encoding="utf-8") as fh:
-            for raw in fh:
+            for line_no, raw in enumerate(fh, start=1):
                 line = raw.strip()
                 if not line:
                     continue
+                saw_any = True
                 if line.startswith(">"):
-                    if cur_name is not None and keep_mode is not None:
-                        s_val = "".join(chunks).upper()
-                        if keep_mode == "exact":
-                            exact_seq = s_val
-                        elif keep_mode == "prefix":
-                            prefix_matches.append((cur_name, s_val))
-                        else:
-                            suffix_matches.append((cur_name, s_val))
-                    cur_name = line[1:].strip().split()[0]
+                    if cur_name is not None:
+                        if not cur_has_seq:
+                            raise InvariantViolationError(
+                                f"Empty FASTA sequence for '{cur_name}' in '{ref_fa_file}'"
+                            )
+                        if keep:
+                            candidates[cur_name] = "".join(chunks)
+                    hdr_body = line[1:].strip()
+                    cur_name = hdr_body.split()[0] if hdr_body else ""
                     if not cur_name:
-                        raise InvariantViolationError("Empty FASTA header")
-                    keep_mode = _check_hdr(cur_name)
+                        raise InvariantViolationError(
+                            f"Empty FASTA header at line {line_no} in '{ref_fa_file}'"
+                        )
+                    if cur_name in seen_hdrs:
+                        raise InvariantViolationError(
+                            f"Duplicate FASTA header '{cur_name}' in '{ref_fa_file}'"
+                        )
+                    seen_hdrs.add(cur_name)
+                    if len(seen_hdrs) == 1:
+                        first_hdr = cur_name
+                        keep = True
+                    else:
+                        if (
+                            len(seen_hdrs) == 2
+                            and first_hdr is not None
+                            and not _is_relevant_hdr(first_hdr)
+                        ):
+                            candidates.pop(first_hdr, None)
+                        keep = _is_relevant_hdr(cur_name)
+                    cur_has_seq = False
                     chunks = []
-                elif keep_mode is not None:
-                    chunks.append("".join(line.split()))
+                else:
+                    if cur_name is None:
+                        raise InvariantViolationError(
+                            f"FASTA sequence data before header at line {line_no} in '{ref_fa_file}'"
+                        )
+                    if line.isascii() and line.isalpha():
+                        cur_has_seq = True
+                        if keep:
+                            chunks.append(line.upper())
+                    else:
+                        chunk = "".join(line.split())
+                        if not chunk:
+                            continue
+                        if not (chunk.isascii() and chunk.isalpha()):
+                            raise InvariantViolationError(
+                                f"Non-alphabetic characters in FASTA record '{cur_name}' in '{ref_fa_file}'"
+                            )
+                        cur_has_seq = True
+                        if keep:
+                            chunks.append(chunk.upper())
+        if not saw_any:
+            raise InvariantViolationError(f"Empty FASTA file '{ref_fa_file}'")
+        if cur_name is not None:
+            if not cur_has_seq:
+                raise InvariantViolationError(
+                    f"Empty FASTA sequence for '{cur_name}' in '{ref_fa_file}'"
+                )
+            if keep:
+                candidates[cur_name] = "".join(chunks)
 
-        if cur_name is not None and keep_mode is not None:
-            s_val = "".join(chunks).upper()
-            if keep_mode == "exact":
-                exact_seq = s_val
-            elif keep_mode == "prefix":
-                prefix_matches.append((cur_name, s_val))
-            else:
-                suffix_matches.append((cur_name, s_val))
+        tc = target_chroms[0]
+        if explicit_backbone:
+            resolved_exp = _resolve_chrom_by_explicit_bp(
+                tc, candidates, global_bp, len(seen_hdrs), target_set
+            )
+            if resolved_exp is None:
+                raise InvariantViolationError(
+                    f"No unique reference FASTA record matching --backbone-prefix '{global_bp}' for chromosome '{tc}'"
+                )
+            return {tc: resolved_exp}
 
-        if exact_seq is not None:
-            return {summary_chrom: exact_seq}
-        if len(prefix_matches) == 1:
-            return {summary_chrom: prefix_matches[0][1]}
-        if len(prefix_matches) > 1 and bp:
-            for h_name, h_seq in prefix_matches:
-                if h_name in (f"{bp}#1#{summary_chrom}", f"{bp}#0#{summary_chrom}"):
-                    return {summary_chrom: h_seq}
-        if len(suffix_matches) == 1:
-            return {summary_chrom: suffix_matches[0][1]}
+        resolved = _resolve_chrom_from_candidates(
+            tc,
+            candidates,
+            global_bp or skv.get(f"{tc}:backbone_prefix", "").strip(),
+            global_rp or skv.get(f"{tc}:ref_path", "").strip(),
+            global_rh or skv.get(f"{tc}:ref_hap", "").strip(),
+        )
+        if resolved is not None:
+            return {tc: resolved}
+        return parse_fasta(str(ref_fa_file))
 
-    return parse_fasta(str(ref_fa_file))
+    raw_records = parse_fasta(str(ref_fa_file))
+    if explicit_backbone:
+        resolved_exp_multi: dict[str, str] = {}
+        for tc in target_chroms:
+            seq_tc = _resolve_chrom_by_explicit_bp(
+                tc, raw_records, global_bp, len(raw_records), target_set
+            )
+            if seq_tc is None:
+                raise InvariantViolationError(
+                    f"No unique reference FASTA record matching --backbone-prefix '{global_bp}' for chromosome '{tc}'"
+                )
+            resolved_exp_multi[tc] = seq_tc
+        return resolved_exp_multi
+
+    if set(raw_records.keys()) == target_set:
+        return raw_records
+
+    resolved_multi: dict[str, str] = {}
+    all_resolved = True
+    for tc in target_chroms:
+        c_bp = global_bp or skv.get(f"{tc}:backbone_prefix", "").strip()
+        c_rp = global_rp if len(target_chroms) == 1 else skv.get(f"{tc}:ref_path", "").strip()
+        c_rh = global_rh if len(target_chroms) == 1 else skv.get(f"{tc}:ref_hap", "").strip()
+        seq_tc = _resolve_chrom_from_candidates(
+            tc, raw_records, c_bp, c_rp, c_rh
+        )
+        if seq_tc is None:
+            all_resolved = False
+            break
+        resolved_multi[tc] = seq_tc
+
+    if all_resolved and resolved_multi:
+        return resolved_multi
+    return raw_records
 
 
 def verify_build_outputs(
@@ -773,6 +1521,7 @@ def verify_build_outputs(
     centromere_bed_path: str | Path | None = None,
     spacer_n: int | None = None,
     raise_on_error: bool = False,
+    backbone_prefix: str | None = None,
 ) -> VerificationReport:
     """
     Verify Global Invariants I, II, III, GFA SHA-256, unresolved provenance,
@@ -876,26 +1625,44 @@ def verify_build_outputs(
             f"GFA SHA-256 mismatch: summary.tsv has {recorded_sha}, actual is {actual_sha}",
         )
 
-    eff_spacer_n = (
-        spacer_n
-        if spacer_n is not None
-        else int(summary_kv.get("spacer_n", "100"))
-    )
+    if spacer_n is not None:
+        eff_spacer_n = spacer_n
+    elif "spacer_n" in summary_kv and summary_kv["spacer_n"].isdigit():
+        eff_spacer_n = int(summary_kv["spacer_n"])
+    else:
+        eff_spacer_n = next(
+            (
+                int(v)
+                for k, v in summary_kv.items()
+                if k.endswith(":spacer_n") and v.isdigit()
+            ),
+            100,
+        )
 
     is_large_offsets = offsets_path.stat().st_size > 2_000_000
+    explicit_backbone = backbone_prefix is not None
+    gfa_path_metas: list[_GFAPathMeta] = []
 
     try:
         pan_records = parse_fasta(str(pan_fa_path))
+        eff_backbone_prefix = (
+            backbone_prefix
+            if explicit_backbone
+            else summary_kv.get("backbone_prefix")
+        )
         ref_records = _load_ref_records_for_verify(
             ref_fa_file,
             pan_records,
             summary_kv.get("chrom"),
-            summary_kv.get("backbone_prefix"),
+            eff_backbone_prefix,
+            ref_path=None if explicit_backbone else summary_kv.get("ref_path"),
+            ref_hap=None if explicit_backbone else summary_kv.get("ref_hap"),
+            summary_kv=summary_kv,
+            explicit_backbone=explicit_backbone,
         )
         sv_hdr, sv_rows = _parse_tsv_file(sv_path)
         ins_hdr, ins_rows = _parse_tsv_file(inserts_path)
         unres_hdr, unres_rows = _parse_tsv_file(unresolved_path)
-        unres_fa = _parse_fasta_allow_empty(unresolved_fa_path)
 
         req_slices: dict[str, set[tuple[int, int]]] = collections.defaultdict(set)
         for r in ins_rows:
@@ -912,7 +1679,62 @@ def verify_build_outputs(
             except Exception:
                 pass
 
-        gfa_nodes, path_seqs = _parse_gfa_paths_and_walks(gfa_file, req_slices)
+        gfa_nodes, path_seqs = _parse_gfa_paths_and_walks(
+            gfa_file, req_slices, out_path_metas=gfa_path_metas
+        )
+        if explicit_backbone:
+            bp_clean = (backbone_prefix or "").strip()
+            is_multi_chrom_bundle = len(pan_records) > 1 or (
+                summary_kv.get("chrom_count", "").isdigit()
+                and int(summary_kv["chrom_count"]) > 1
+            )
+            for tc in pan_records:
+                if is_multi_chrom_bundle:
+                    rec_rp_tc = summary_kv.get(f"{tc}:ref_path", "").strip()
+                    cand_metas = [
+                        m
+                        for m in gfa_path_metas
+                        if m.seqid == tc
+                        or _strip_w_coord_suffix(m.seqid) == tc
+                        or m.src_path == tc
+                        or m.pan_name == tc
+                        or (rec_rp_tc and m.src_path == rec_rp_tc)
+                    ]
+                    matched_m = _match_gfa_paths_by_backbone_prefix(
+                        cand_metas, bp_clean
+                    )
+                else:
+                    matched_m = _match_gfa_paths_by_backbone_prefix(
+                        gfa_path_metas, bp_clean
+                    )
+                if len(matched_m) != 1:
+                    _err(
+                        "INV1",
+                        f"Expected 1 GFA reference path matching --backbone-prefix '{bp_clean}' for '{tc}', found {len(matched_m)}",
+                    )
+                else:
+                    m_ref = matched_m[0]
+                    rec_rp = summary_kv.get(f"{tc}:ref_path", "").strip() or (
+                        summary_kv.get("ref_path", "").strip()
+                        if len(pan_records) == 1
+                        else ""
+                    )
+                    rec_rh = summary_kv.get(f"{tc}:ref_hap", "").strip() or (
+                        summary_kv.get("ref_hap", "").strip()
+                        if len(pan_records) == 1
+                        else ""
+                    )
+                    if rec_rp and m_ref.src_path != rec_rp:
+                        _err(
+                            "INV1",
+                            f"GFA reference path '{m_ref.src_path}' matched by --backbone-prefix '{bp_clean}' does not match recorded ref_path '{rec_rp}' for '{tc}'",
+                        )
+                    elif rec_rh and m_ref.hap_id != rec_rh:
+                        _err(
+                            "INV1",
+                            f"GFA reference haplotype '{m_ref.hap_id}' matched by --backbone-prefix '{bp_clean}' does not match recorded ref_hap '{rec_rh}' for '{tc}'",
+                        )
+
         if not is_large_offsets:
             offsets_hdr, offsets_rows = _parse_tsv_file(offsets_path)
         else:
@@ -1004,7 +1826,7 @@ def verify_build_outputs(
                 cols = raw_cols_by_chrom[c_name]
                 try:
                     cols[0].append(int(parts[1]))
-                    if not cols[2] and parts[2].isdigit():
+                    if not cols[2] and is_compact_nid_str(parts[2]):
                         cols[1].append(int(parts[2]))
                     else:
                         if not cols[2] and len(cols[1]) > 0:
@@ -1041,6 +1863,10 @@ def verify_build_outputs(
     else:
         for r in offsets_rows:
             offsets_by_chrom[r["chrom"]].append(r)
+
+    ins_by_chrom: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
+    for r in ins_rows:
+        ins_by_chrom[r["chrom"]].append(r)
 
     # 1. Global Invariant I: Reference Base Preservation
     for ref_chrom, ref_seq in ref_records.items():
@@ -1104,31 +1930,91 @@ def verify_build_outputs(
                             f"Reference base mismatch in block steps [{b_s}, {b_e})",
                         )
                         break
-                if isinstance(gfa_nodes, CompactNodeStore):
-                    nids_int = (
-                        co.nids
-                        if isinstance(co.nids, np.ndarray)
-                        else np.asarray(co.nids, dtype=np.int32)
-                    )
-                    if bool(np.any((nids_int <= 0) | (nids_int >= int(gfa_nodes.node_lens.shape[0])) | (gfa_nodes.node_lens[nids_int] == 0))):
+                if isinstance(gfa_nodes, CompactNodeStore) and isinstance(
+                    co.nids, np.ndarray
+                ):
+                    nids_int = co.nids
+                    nl_arr = gfa_nodes._node_lens
+                    if bool(
+                        np.any(
+                            (nids_int <= 0)
+                            | (nids_int >= int(nl_arr.shape[0]))
+                            | (nl_arr[np.clip(nids_int, 0, int(nl_arr.shape[0]) - 1)] == 0)
+                        )
+                    ):
                         _err("INV1", "Reference step node missing from GFA")
-                    elif not bool(np.array_equal(gfa_nodes.node_lens[nids_int], co.r_e - co.r_s)):
-                        _err("INV1", "GFA node length mismatch with ref step range")
+                    elif not bool(
+                        np.array_equal(nl_arr[nids_int], co.r_e - co.r_s)
+                    ):
+                        _err(
+                            "INV1",
+                            "GFA node length mismatch with ref step range",
+                        )
+                    else:
+                        seq_bytes = gfa_nodes._seq_bytes
+                        off_starts = gfa_nodes._offsets[nids_int].tolist()
+                        off_ends = gfa_nodes._offsets[nids_int + 1].tolist()
+                        ref_bytes = ref_up.encode("ascii")
+                        for nid_i, os_i, oe_i, rs_i, re_i in zip(
+                            nids_int.tolist(),
+                            off_starts,
+                            off_ends,
+                            co.r_s.tolist(),
+                            co.r_e.tolist(),
+                        ):
+                            nb = seq_bytes[os_i:oe_i]
+                            rb = ref_bytes[rs_i:re_i]
+                            if (
+                                nb != rb
+                                and nb.translate(_REVCOMP_BYTES_TABLE)[::-1] != rb
+                            ):
+                                _err(
+                                    "INV1",
+                                    f"GFA node '{nid_i}' sequence does not match ref[{rs_i}:{re_i}]",
+                                )
+                                break
                 else:
                     for idx_n, nid in enumerate(co.nids):
-                        if str(nid) not in gfa_nodes:
-                            _err("INV1", f"Reference step node '{nid}' missing from GFA")
+                        nid_s = str(nid)
+                        if nid_s not in gfa_nodes:
+                            _err(
+                                "INV1",
+                                f"Reference step node '{nid_s}' missing from GFA",
+                            )
+                            break
+                        rs_i = int(co.r_s[idx_n])
+                        re_i = int(co.r_e[idx_n])
+                        node_seq = gfa_nodes[nid_s]
+                        if len(node_seq) != re_i - rs_i:
+                            _err(
+                                "INV1",
+                                "GFA node length mismatch with ref step range",
+                            )
+                            break
+                        ref_slice = ref_up[rs_i:re_i]
+                        if node_seq != ref_slice and revcomp(node_seq) != ref_slice:
+                            _err(
+                                "INV1",
+                                f"GFA node '{nid_s}' sequence does not match ref[{rs_i}:{re_i}]",
+                            )
                             break
             if int(co.r_e[-1]) != len(ref_up):
                 _err(
                     "INV1",
                     f"offsets.tsv ends at ref {int(co.r_e[-1])}, expected {len(ref_up)}",
                 )
-            if int(co.p_e[-1]) != len(pan_up):
-                _err(
-                    "INV1",
-                    f"offsets.tsv ends at pan {int(co.p_e[-1])}, expected pan_len={len(pan_up)}",
+            last_pe_fast = int(co.p_e[-1])
+            if last_pe_fast != len(pan_up):
+                has_trailing_ins = any(
+                    int(r.get("pan_start", "-1")) >= last_pe_fast
+                    for r in ins_by_chrom.get(ref_chrom, ())
+                    if str(r.get("pan_start", "")).isdigit()
                 )
+                if last_pe_fast > len(pan_up) or not has_trailing_ins:
+                    _err(
+                        "INV1",
+                        f"offsets.tsv ends at pan {last_pe_fast}, expected pan_len={len(pan_up)}",
+                    )
             checked_ref_steps += n_st
             continue
 
@@ -1208,15 +2094,18 @@ def verify_build_outputs(
                 f"offsets.tsv ends at ref {expected_ref_pos}, expected {len(ref_up)}",
             )
         if prev_pan_end != len(pan_up):
-            _err(
-                "INV1",
-                f"offsets.tsv ends at pan {prev_pan_end}, expected pan_len={len(pan_up)}",
+            has_trailing_ins_s = any(
+                int(r.get("pan_start", "-1")) >= prev_pan_end
+                for r in ins_by_chrom.get(ref_chrom, ())
+                if str(r.get("pan_start", "")).isdigit()
             )
+            if prev_pan_end > len(pan_up) or not has_trailing_ins_s:
+                _err(
+                    "INV1",
+                    f"offsets.tsv ends at pan {prev_pan_end}, expected pan_len={len(pan_up)}",
+                )
 
     # 2. Global Invariant II: Piece Provenance, Spacers & Full Partition
-    ins_by_chrom: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
-    for r in ins_rows:
-        ins_by_chrom[r["chrom"]].append(r)
 
     for ref_chrom, pan_seq in pan_records.items():
         pan_up = pan_seq.upper()
@@ -1373,10 +2262,12 @@ def verify_build_outputs(
     chain_text = chain_path.read_text(encoding="utf-8")
     chain_headers: list[dict[str, Any]] = []
     chain_blocks_list: list[list[tuple[int, int, int]]] = []
-    comment_blocks: list[tuple[int, int, int]] = []
-    comment_steps: list[tuple[int, int, int, int, int, int]] = []
+    chain_comment_blocks_list: list[list[tuple[int, int, int]]] = []
+    chain_comment_steps_list: list[list[tuple[int, int, int, int, int, int]]] = []
 
     cur_blocks: list[tuple[int, int, int]] | None = None
+    cur_c_blocks: list[tuple[int, int, int]] | None = None
+    cur_c_steps: list[tuple[int, int, int, int, int, int]] | None = None
     for raw_line in chain_text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -1384,26 +2275,38 @@ def verify_build_outputs(
         if line.startswith("#"):
             c_parts = line.split("\t")
             if c_parts[0] == "# block" and len(c_parts) >= 4:
-                try:
-                    comment_blocks.append(
-                        (int(c_parts[1]), int(c_parts[2]), int(c_parts[3]))
+                if cur_c_blocks is None:
+                    _err(
+                        "INV3",
+                        f"Orphan # block comment before chain header: {line}",
                     )
-                except ValueError:
-                    _err("INV3", f"Malformed # block comment in chain: {line}")
-            elif c_parts[0] == "# step" and len(c_parts) >= 7:
-                try:
-                    comment_steps.append(
-                        (
-                            int(c_parts[1]),
-                            int(c_parts[2]),
-                            int(c_parts[3]),
-                            int(c_parts[4]),
-                            int(c_parts[5]),
-                            int(c_parts[6]),
+                else:
+                    try:
+                        cur_c_blocks.append(
+                            (int(c_parts[1]), int(c_parts[2]), int(c_parts[3]))
                         )
+                    except ValueError:
+                        _err("INV3", f"Malformed # block comment in chain: {line}")
+            elif c_parts[0] == "# step" and len(c_parts) >= 7:
+                if cur_c_steps is None:
+                    _err(
+                        "INV3",
+                        f"Orphan # step comment before chain header: {line}",
                     )
-                except ValueError:
-                    _err("INV3", f"Malformed # step comment in chain: {line}")
+                else:
+                    try:
+                        cur_c_steps.append(
+                            (
+                                int(c_parts[1]),
+                                int(c_parts[2]),
+                                int(c_parts[3]),
+                                int(c_parts[4]),
+                                int(c_parts[5]),
+                                int(c_parts[6]),
+                            )
+                        )
+                    except ValueError:
+                        _err("INV3", f"Malformed # step comment in chain: {line}")
             continue
 
         parts = line.split()
@@ -1413,6 +2316,8 @@ def verify_build_outputs(
                 continue
             if cur_blocks is not None:
                 chain_blocks_list.append(cur_blocks)
+                chain_comment_blocks_list.append(cur_c_blocks or [])
+                chain_comment_steps_list.append(cur_c_steps or [])
             try:
                 chain_headers.append(
                     {
@@ -1432,7 +2337,13 @@ def verify_build_outputs(
                 )
             except ValueError as exc:
                 _err("INV3", f"Invalid integer in chain header: {exc}")
+                cur_blocks = None
+                cur_c_blocks = None
+                cur_c_steps = None
+                continue
             cur_blocks = []
+            cur_c_blocks = []
+            cur_c_steps = []
         elif cur_blocks is not None:
             try:
                 if len(parts) == 3:
@@ -1448,23 +2359,45 @@ def verify_build_outputs(
 
     if cur_blocks is not None:
         chain_blocks_list.append(cur_blocks)
+        chain_comment_blocks_list.append(cur_c_blocks or [])
+        chain_comment_steps_list.append(cur_c_steps or [])
 
     if not chain_headers:
         _err("INV3", "ref_to_pan.chain contains no chain headers")
 
-    all_computed_blocks: list[tuple[int, int, int]] = []
-    chain_by_chrom = {
-        ch["tName"]: (ch, blks)
-        for ch, blks in zip(chain_headers, chain_blocks_list)
-    }
+    chain_by_chrom: dict[
+        str,
+        tuple[
+            dict[str, Any],
+            list[tuple[int, int, int]],
+            list[tuple[int, int, int]],
+            list[tuple[int, int, int, int, int, int]],
+        ],
+    ] = {}
+    for ch, blks, c_blks, c_steps in zip(
+        chain_headers,
+        chain_blocks_list,
+        chain_comment_blocks_list,
+        chain_comment_steps_list,
+    ):
+        t_name = ch["tName"]
+        if t_name in chain_by_chrom:
+            _err("INV3", f"Duplicate chain header for chromosome '{t_name}'")
+        else:
+            chain_by_chrom[t_name] = (ch, blks, c_blks, c_steps)
 
-    for ref_chrom, ref_seq in ref_records.items():
+    for ref_chrom in ref_records:
         if ref_chrom not in chain_by_chrom or ref_chrom not in pan_records:
             _err("INV3", f"Missing chain for chromosome '{ref_chrom}'")
+
+    for ref_chrom, pan_seq_raw in pan_records.items():
+        if ref_chrom not in chain_by_chrom or ref_chrom not in ref_records:
+            if ref_chrom not in chain_by_chrom:
+                _err("INV3", f"Missing chain for chromosome '{ref_chrom}'")
             continue
-        ch, blocks = chain_by_chrom[ref_chrom]
-        ref_up = ref_seq.upper()
-        pan_up = pan_records[ref_chrom].upper()
+        ch, blocks, c_blks, c_steps = chain_by_chrom[ref_chrom]
+        ref_up = ref_records[ref_chrom].upper()
+        pan_up = pan_seq_raw.upper()
 
         if ch["tName"] != ref_chrom or ch["qName"] != ref_chrom:
             _err(
@@ -1476,21 +2409,36 @@ def verify_build_outputs(
                 "INV3",
                 f"Chain target bounds ({ch['tStart']}, {ch['tEnd']}, {ch['tSize']}) != (0, {len(ref_up)}, {len(ref_up)})",
             )
-        if ch["qSize"] != len(pan_up) or ch["qStart"] != 0 or ch["qEnd"] != len(pan_up):
-            _err(
-                "INV3",
-                f"Chain query bounds ({ch['qStart']}, {ch['qEnd']}, {ch['qSize']}) != (0, {len(pan_up)}, {len(pan_up)})",
-            )
-
         if is_large_offsets:
             co = compact_offsets_by_chrom.get(ref_chrom)
+            chrom_offsets = []
             offset_by_ref_start = {}
+            expected_q_end = (
+                int(co.p_e[-1])
+                if co is not None and int(co.p_e.shape[0]) > 0
+                else len(pan_up)
+            )
         else:
             co = None
             chrom_offsets = offsets_by_chrom.get(ref_chrom, [])
             offset_by_ref_start = {
                 int(r["ref_start"]): r for r in chrom_offsets if "ref_start" in r
             }
+            expected_q_end = (
+                int(chrom_offsets[-1]["pan_end"])
+                if chrom_offsets and str(chrom_offsets[-1].get("pan_end", "")).isdigit()
+                else len(pan_up)
+            )
+
+        if (
+            ch["qSize"] != len(pan_up)
+            or ch["qStart"] != 0
+            or ch["qEnd"] != expected_q_end
+        ):
+            _err(
+                "INV3",
+                f"Chain query bounds ({ch['qStart']}, {ch['qEnd']}, {ch['qSize']}) != (0, {expected_q_end}, {len(pan_up)})",
+            )
 
         t_cur = ch["tStart"]
         q_cur = ch["qStart"]
@@ -1498,6 +2446,7 @@ def verify_build_outputs(
         blk_t_starts: list[int] = []
         blk_t_ends: list[int] = []
         blk_q_starts: list[int] = []
+        computed_blocks_for_chrom: list[tuple[int, int, int]] = []
 
         for b_idx, (size, dt, dq) in enumerate(blocks):
             if size <= 0:
@@ -1519,7 +2468,7 @@ def verify_build_outputs(
                     f"Chain block {b_idx} sequence mismatch at ref[{t_cur}:{t_cur + size}] vs pan[{q_cur}:{q_cur + size}]",
                 )
 
-            all_computed_blocks.append((t_cur, t_cur + size, dq))
+            computed_blocks_for_chrom.append((t_cur, t_cur + size, dq))
             blk_t_starts.append(t_cur)
             blk_t_ends.append(t_cur + size)
             blk_q_starts.append(q_cur)
@@ -1642,32 +2591,50 @@ def verify_build_outputs(
                         f"Spot-check base mismatch at ref={r_pos}: pan[{p_chain}] != ref[{r_pos}]",
                     )
 
-    if comment_blocks:
-        if comment_blocks != all_computed_blocks:
-            _err(
-                "INV3",
-                f"Chain # block footer metadata does not match chain blocks: {comment_blocks} != {all_computed_blocks}",
-            )
+        if c_blks:
+            if c_blks != computed_blocks_for_chrom:
+                _err(
+                    "INV3",
+                    f"Chain # block footer metadata does not match chain blocks for '{ref_chrom}': {c_blks} != {computed_blocks_for_chrom}",
+                )
 
-    if comment_steps and not is_large_offsets:
-        expected_steps = [
-            (
-                int(r["ref_step"]),
-                int(r["ref_start"]),
-                int(r["ref_end"]),
-                int(r["pan_start"]),
-                int(r["pan_end"]),
-                int(r["slot_ins_len"]),
-            )
-            for r in offsets_rows
-        ]
-        if comment_steps != expected_steps:
-            _err(
-                "INV3",
-                "Chain # step footer metadata does not match offsets.tsv",
-            )
+        if c_steps:
+            if co is not None:
+                expected_steps = list(
+                    zip(
+                        co.step_idx.tolist(),
+                        co.r_s.tolist(),
+                        co.r_e.tolist(),
+                        co.p_s.tolist(),
+                        co.p_e.tolist(),
+                        co.slot_ins.tolist(),
+                    )
+                )
+            else:
+                expected_steps = [
+                    (
+                        int(r["ref_step"]),
+                        int(r["ref_start"]),
+                        int(r["ref_end"]),
+                        int(r["pan_start"]),
+                        int(r["pan_end"]),
+                        int(r["slot_ins_len"]),
+                    )
+                    for r in chrom_offsets
+                ]
+            if c_steps != expected_steps:
+                _err(
+                    "INV3",
+                    f"Chain # step footer metadata does not match offsets.tsv for '{ref_chrom}'",
+                )
 
     # 4. Unresolved Provenance & FASTA Check
+    unres_fa: dict[str, str] = {}
+    try:
+        unres_fa = _parse_fasta_allow_empty(unresolved_fa_path)
+    except Exception as exc:
+        _err("UNRES", f"Malformed unresolved.fa '{unresolved_fa_path}': {exc}")
+
     for urow in unres_rows:
         try:
             u_s = int(urow["src_start"])
@@ -1713,6 +2680,16 @@ def verify_build_outputs(
         checked_unresolved += 1
 
     # 5. Centromere Accounting & Local Offset Delta Check
+    cen_expected = centromere_bed_path is not None or any(
+        v not in ("off", "")
+        for k, v in summary_kv.items()
+        if k == "centromere_mode" or k.endswith(":centromere_mode")
+    )
+    if cen_expected and not centromere_path.is_file():
+        _err(
+            "CEN",
+            f"Centromere processing active, but '{centromere_path}' is missing",
+        )
     if centromere_path.is_file():
         cen_hdr, cen_rows = _parse_tsv_file(centromere_path)
         if cen_hdr != list(CENTROMERE_TSV_COLUMNS):
@@ -1947,14 +2924,30 @@ def verify_build_outputs(
                     )
 
                 if cen_events_for_reg:
-                    v_mount_info = _find_by_ref_start(r_e)
-                    if v_mount_info is None:
+                    slot_ins_len: int | None = None
+                    if r_e == ref_total_len and chrom in pan_records:
+                        if is_large_offsets:
+                            co_c = compact_offsets_by_chrom.get(chrom)
+                            last_pe_c = (
+                                int(co_c.p_e[-1])
+                                if co_c is not None and int(co_c.p_e.shape[0]) > 0
+                                else 0
+                            )
+                        else:
+                            c_offs = offsets_by_chrom.get(chrom, [])
+                            last_pe_c = int(c_offs[-1]["pan_end"]) if c_offs else 0
+                        slot_ins_len = len(pan_records[chrom]) - last_pe_c
+                    else:
+                        v_mount_info = _find_by_ref_start(r_e)
+                        if v_mount_info is not None:
+                            slot_ins_len = v_mount_info[2]
+
+                    if slot_ins_len is None:
                         _err(
                             "CEN",
                             f"CEN_ISLAND mounted at ref_end={r_e} which is missing from offsets.tsv",
                         )
                     else:
-                        slot_ins_len = v_mount_info[2]
                         cen_ev_ids = {ev["event_id"] for ev in cen_events_for_reg}
                         cen_pieces = [
                             ins

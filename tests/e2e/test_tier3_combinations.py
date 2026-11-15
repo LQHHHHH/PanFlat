@@ -15,13 +15,9 @@ Covers >= 26 pairwise and multi-subsystem interactions across:
 from __future__ import annotations
 
 from pathlib import Path
-import random
 import shutil
 
-import pytest
-
 from tests.e2e.helpers import (
-    OutputBundle,
     SyntheticInputBuilder,
     assert_all_global_invariants,
     assert_centromere_accounting_and_offsets,

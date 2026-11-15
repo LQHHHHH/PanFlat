@@ -266,18 +266,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ref_fa_path=config.ref_fa,
                 ref_gff_path=config.ref_gff,
                 centromere_bed_path=config.centromere_bed,
+                backbone_prefix=config.backbone_prefix,
                 spacer_n=config.spacer_n,
                 raise_on_error=True,
             )
             return 0
 
         if args.subcommand == "verify":
+            if args.spacer_n is not None and args.spacer_n < 0:
+                raise CLIArgumentError(
+                    f"--spacer-n must be >= 0, got {args.spacer_n}"
+                )
             report = verify_build_outputs(
                 prefix=args.prefix,
                 gfa_path=args.gfa,
                 ref_fa_path=args.ref_fa,
                 ref_gff_path=args.ref_gff,
                 centromere_bed_path=args.centromere_bed,
+                backbone_prefix=args.backbone_prefix,
                 spacer_n=args.spacer_n,
                 raise_on_error=False,
             )

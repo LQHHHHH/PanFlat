@@ -140,7 +140,7 @@ def project_steps_onto_backbone(
     backbone_or_provenance: Sequence[Step] | Sequence[StepProvenance] | GFAGraph,
     nodes_or_backbone: Mapping[str, str] | Sequence[Step] | int | None = None,
     nodes: Mapping[str, str] | int | None = None,
-    lo: int = 0,
+    lo: int | None = None,
     hi: int | None = None,
     *,
     provenance: Sequence[StepProvenance] | None = None,
@@ -159,7 +159,7 @@ def project_steps_onto_backbone(
     resolved_branch_prov: Sequence[StepProvenance] | None = provenance
     resolved_backbone: Sequence[Step] | None = backbone_steps
     resolved_nodes: Mapping[str, str] | None = None
-    eff_lo: int = lo
+    eff_lo: int = 0 if lo is None else lo
     eff_hi: int | None = hi
 
     if isinstance(fragment_or_steps, PathFragment):
@@ -180,6 +180,8 @@ def project_steps_onto_backbone(
                 resolved_nodes = nodes
             if isinstance(nodes, int):
                 eff_lo = nodes
+                if lo is not None and hi is None:
+                    eff_hi = lo
     else:
         resolved_branch_steps = fragment_or_steps
         if isinstance(backbone_or_provenance, GFAGraph):
@@ -195,6 +197,8 @@ def project_steps_onto_backbone(
             resolved_nodes = nodes_or_backbone
             if isinstance(nodes, int):
                 eff_lo = nodes
+                if lo is not None and hi is None:
+                    eff_hi = lo
         else:
             # Form 3: (branch_steps, branch_provenance, backbone_steps, nodes, [lo, [hi]])
             resolved_branch_prov = backbone_or_provenance  # type: ignore[assignment]
@@ -209,8 +213,14 @@ def project_steps_onto_backbone(
         )
 
     if resolved_branch_prov is None:
-        if isinstance(resolved_branch_steps, LazyStepTuple) and isinstance(
-            resolved_nodes, CompactNodeStore
+        if (
+            isinstance(resolved_branch_steps, LazyStepTuple)
+            and isinstance(resolved_nodes, CompactNodeStore)
+            and len(resolved_nodes._extra) == 0
+            and (
+                int(resolved_branch_steps._codes.shape[0]) == 0
+                or int(np.abs(resolved_branch_steps._codes).max()) <= resolved_nodes._max_nid
+            )
         ):
             resolved_branch_prov = LazyProvenanceTuple(
                 src_hap=" synthetic#1",
@@ -255,18 +265,27 @@ def project_steps_onto_backbone(
         and isinstance(resolved_backbone, LazyStepTuple)
         and isinstance(resolved_nodes, CompactNodeStore)
         and len(resolved_nodes._extra) == 0
+        and (
+            int(resolved_branch_steps._codes.shape[0]) == 0
+            or int(np.abs(resolved_branch_steps._codes).max()) <= resolved_nodes._max_nid
+        )
     ):
         br_codes = resolved_branch_steps._codes
         if int(br_codes.shape[0]) == 0 or eff_lo >= eff_hi_val:
             return []
 
         max_nid = resolved_nodes._max_nid
+        br_nids = np.abs(br_codes)
         if eff_lo == 0 and eff_hi_val == n_b_total and n_b_total > 10_000:
             nid_to_rank, nid_to_sign = _get_lazy_backbone_anchor_arrays(
                 resolved_backbone, max_nid
             )
-            br_nids = np.abs(br_codes)
-            ranks = nid_to_rank[br_nids]
+            r_arr_len = int(nid_to_rank.shape[0])
+            ranks = np.where(
+                br_nids < r_arr_len,
+                nid_to_rank[np.minimum(br_nids, max(0, r_arr_len - 1))],
+                -1,
+            )
             hit_mask = ranks >= 0
             branch_step_idx = np.flatnonzero(hit_mask).astype(np.int32)
             if int(branch_step_idx.shape[0]) == 0:
@@ -290,9 +309,10 @@ def project_steps_onto_backbone(
                 return []
             uniq_rel_idx = first_idx[uniq_mask]
             uniq_ranks = (eff_lo + uniq_rel_idx).astype(np.int32)
-            uniq_b_signs = np.where(b_codes[uniq_rel_idx] > 0, 1, -1).astype(np.int8)
+            uniq_b_signs = np.where(
+                b_codes[uniq_rel_idx] > 0, 1, -1
+            ).astype(np.int8)
 
-            br_nids = np.abs(br_codes)
             pos = np.searchsorted(uniq_b_nids, br_nids)
             n_u = int(uniq_b_nids.shape[0])
             hit_mask = (pos < n_u) & (
@@ -444,12 +464,17 @@ def _extract_contiguous_nonref_slices(
     if n == 0:
         return results
 
-    if isinstance(steps, LazyStepTuple) and isinstance(
-        global_ref_nodes, CompactRefNodeSet
+    if (
+        isinstance(steps, LazyStepTuple)
+        and isinstance(global_ref_nodes, CompactRefNodeSet)
+        and len(global_ref_nodes._extra) == 0
     ):
         codes = steps._codes
         nids = np.abs(codes)
-        ref_mask = global_ref_nodes._mask[nids]
+        m_len = int(global_ref_nodes._mask.shape[0])
+        ref_mask = (nids < m_len) & global_ref_nodes._mask[
+            np.minimum(nids, max(0, m_len - 1))
+        ]
         nonref_indices = np.flatnonzero(~ref_mask)
         if int(nonref_indices.shape[0]) == 0:
             return results
@@ -812,7 +837,7 @@ def normalize_inversions_top_level(
             )
             for sub_steps, sub_provs, merged_prov, seq_str in slices:
                 chain_novel_slices[c_idx].append((sub_steps, sub_provs))
-                rec_id = f"UNRES_{rec_counter}"
+                rec_id = f"{graph.ref_chrom}_UNRES_{rec_counter}"
                 rec_counter += 1
                 unresolved_records.append(
                     UnresolvedRecord(
@@ -1767,10 +1792,30 @@ def compute_raw_visit_counts(steps: Sequence[Step]) -> Mapping[str, int]:
     """Return raw visit counts per node_id across full steps in `steps` (§3.7)."""
     if isinstance(steps, LazyStepTuple) and len(steps) > 50_000:
         nids = np.abs(steps._codes)
-        cnts = np.bincount(nids)
-        multi_nids = np.flatnonzero(cnts >= 2).astype(np.int32)
-        multi_counts = cnts[multi_nids].astype(np.int32)
-        return CompactVisitCounts(multi_nids=multi_nids, multi_counts=multi_counts)
+        n_steps = int(nids.shape[0])
+        if n_steps == 0:
+            return {}
+        max_n = int(nids.max())
+        if max_n <= max(65_536, 4 * n_steps):
+            cnts = np.bincount(nids)
+            visited_mask = cnts >= 1
+            multi_nids = np.flatnonzero(cnts >= 2).astype(np.int32)
+            multi_counts = cnts[multi_nids].astype(np.int32)
+            return CompactVisitCounts(
+                multi_nids=multi_nids,
+                multi_counts=multi_counts,
+                visited_bits=np.packbits(visited_mask),
+                max_visited_nid=max_n,
+                total_visited=int(np.count_nonzero(visited_mask)),
+            )
+        uniq_nids, u_cnts = np.unique(nids, return_counts=True)
+        m_mask = u_cnts >= 2
+        return CompactVisitCounts(
+            multi_nids=uniq_nids[m_mask].astype(np.int32),
+            multi_counts=u_cnts[m_mask].astype(np.int32),
+            visited_nids=uniq_nids.astype(np.int32),
+            total_visited=int(uniq_nids.shape[0]),
+        )
 
     counts: collections.Counter[str] = collections.Counter()
     for st in steps:

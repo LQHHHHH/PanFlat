@@ -52,13 +52,13 @@ from panflat.models import (
     LazyStepTuple,
     PathFragment,
     Piece,
-    ProjectedAnchor,
     ReverseChainRecord,
     Step,
     StepOffsetRow,
     StepProvenance,
     SVEvent,
     UnresolvedRecord,
+    is_compact_nid_str,
 )
 from panflat.normalizer import (
     _extract_full_period,
@@ -103,6 +103,17 @@ StepSliceKey = tuple[tuple[str, Literal["+", "-"], int, int | None, bool], ...]
 def _is_full_step(step: Step) -> bool:
     """Return True iff `step` is a full, unsliced GFA node traversal."""
     return (not step.is_partial) and step.slice_start == 0 and step.slice_end is None
+
+
+def _step_bp_len(step: Step, nodes: Mapping[str, str]) -> int:
+    """Return effective base length of `step` (full or partial slice)."""
+    full_len = (
+        nodes.node_len(step.node_id)
+        if isinstance(nodes, CompactNodeStore)
+        else len(nodes[step.node_id])
+    )
+    end = step.slice_end if step.slice_end is not None else full_len
+    return end - step.slice_start
 
 
 def make_provenance_key(
@@ -486,6 +497,7 @@ def extract_candidate_blocks(
     cand_id_prefix: str = "cand",
     base_source_order: int = 0,
     claimed_source_intervals: AbstractSet[tuple[str, int, int]] = frozenset(),
+    precomputed_b_sets: tuple[AbstractSet[str], set[str], set[str]] | None = None,
 ) -> list[CandidateBlock]:
     """
     §3.1 & §3.5 (`F15`, `T4`, `T9`, `T11`, `T19`): Extract candidate blocks from a terminal deviation.
@@ -509,6 +521,7 @@ def extract_candidate_blocks(
         is_top_level
         and isinstance(backbone_steps, LazyStepTuple)
         and isinstance(global_ref_nodes, CompactRefNodeSet)
+        and len(global_ref_nodes._extra) == 0
     ):
         b_interval_nodes: AbstractSet[str] = global_ref_nodes
         multicopy_local_nonref_nodes: set[str] = set()
@@ -518,85 +531,91 @@ def extract_candidate_blocks(
             isinstance(dev.branch_steps, LazyStepTuple)
             and isinstance(dev.branch_provenance, LazyProvenanceTuple)
             and isinstance(nodes, CompactNodeStore)
+            and len(nodes._extra) == 0
             and not dev.branch_provenance.has_internal_discontinuity()
         ):
             br_codes = dev.branch_steps._codes
             br_nids = np.abs(br_codes)
-            nonref_idx = np.flatnonzero(~global_ref_nodes._mask[br_nids])
-            if int(nonref_idx.shape[0]) == 0:
-                return []
-            gaps_nr = np.flatnonzero(np.diff(nonref_idx) > 1)
-            n_nr_runs = int(gaps_nr.shape[0]) + 1
-            nr_starts = np.empty(n_nr_runs, dtype=np.int32)
-            nr_ends = np.empty(n_nr_runs, dtype=np.int32)
-            nr_starts[0] = nonref_idx[0]
-            if int(gaps_nr.shape[0]) > 0:
-                nr_starts[1:] = nonref_idx[gaps_nr + 1]
-                nr_ends[:-1] = nonref_idx[gaps_nr] + 1
-            nr_ends[-1] = nonref_idx[-1] + 1
+            if int(br_nids.max()) <= nodes._max_nid:
+                m_len = int(global_ref_nodes._mask.shape[0])
+                ref_m = (br_nids < m_len) & global_ref_nodes._mask[
+                    np.minimum(br_nids, max(0, m_len - 1))
+                ]
+                nonref_idx = np.flatnonzero(~ref_m)
+                if int(nonref_idx.shape[0]) == 0:
+                    return []
+                gaps_nr = np.flatnonzero(np.diff(nonref_idx) > 1)
+                n_nr_runs = int(gaps_nr.shape[0]) + 1
+                nr_starts = np.empty(n_nr_runs, dtype=np.int32)
+                nr_ends = np.empty(n_nr_runs, dtype=np.int32)
+                nr_starts[0] = nonref_idx[0]
+                if int(gaps_nr.shape[0]) > 0:
+                    nr_starts[1:] = nonref_idx[gaps_nr + 1]
+                    nr_ends[:-1] = nonref_idx[gaps_nr] + 1
+                nr_ends[-1] = nonref_idx[-1] + 1
 
-            node_lens_arr = nodes._node_lens
-            kept_nr_bounds: list[tuple[int, int]] = []
-            for s_i, e_i in zip(nr_starts.tolist(), nr_ends.tolist()):
-                if int(node_lens_arr[br_nids[s_i:e_i]].sum()) >= min_sv_len:
-                    kept_nr_bounds.append((s_i, e_i))
-            if not kept_nr_bounds:
-                return []
+                node_lens_arr = nodes._node_lens
+                kept_nr_bounds: list[tuple[int, int]] = []
+                for s_i, e_i in zip(nr_starts.tolist(), nr_ends.tolist()):
+                    if int(node_lens_arr[br_nids[s_i:e_i]].sum()) >= min_sv_len:
+                        kept_nr_bounds.append((s_i, e_i))
+                if not kept_nr_bounds:
+                    return []
 
-            if hi_ab <= lo_ab:
-                top_undecomposable_repeat = False
-            else:
-                b_ab_nids = np.abs(backbone_steps._codes[lo_ab:hi_ab])
-                u_ab, cnt_ab = np.unique(b_ab_nids, return_counts=True)
-                b_ab_has_multicopy = bool(np.any(cnt_ab > 1))
-                if not b_ab_has_multicopy:
+                if hi_ab <= lo_ab:
                     top_undecomposable_repeat = False
                 else:
-                    b_ab_has_no_unique = not bool(np.any(cnt_ab == 1))
-                    if b_ab_has_no_unique:
-                        top_undecomposable_repeat = True
+                    b_ab_nids = np.abs(backbone_steps._codes[lo_ab:hi_ab])
+                    u_ab, cnt_ab = np.unique(b_ab_nids, return_counts=True)
+                    b_ab_has_multicopy = bool(np.any(cnt_ab > 1))
+                    if not b_ab_has_multicopy:
+                        top_undecomposable_repeat = False
                     else:
-                        top_undecomposable_repeat = bool(
-                            np.any(np.isin(br_nids, u_ab[cnt_ab > 1]))
-                        )
+                        b_ab_has_no_unique = not bool(np.any(cnt_ab == 1))
+                        if b_ab_has_no_unique:
+                            top_undecomposable_repeat = True
+                        else:
+                            top_undecomposable_repeat = bool(
+                                np.any(np.isin(br_nids, u_ab[cnt_ab > 1]))
+                            )
 
-            candidates_fast: list[CandidateBlock] = []
-            order_idx_fast = base_source_order
-            for s_i, e_i in kept_nr_bounds:
-                sub_st_lazy = dev.branch_steps[s_i:e_i]
-                sub_pr_lazy = dev.branch_provenance[s_i:e_i]
-                if not already_screened and claimed_source_intervals:
-                    merged_p = merge_contiguous_provenance(sub_pr_lazy)
-                    if any(
-                        (p.src_path, p.src_start, p.src_end)
-                        in claimed_source_intervals
-                        for p, _ in merged_p
-                    ):
+                candidates_fast: list[CandidateBlock] = []
+                order_idx_fast = base_source_order
+                for s_i, e_i in kept_nr_bounds:
+                    sub_st_lazy = dev.branch_steps[s_i:e_i]
+                    sub_pr_lazy = dev.branch_provenance[s_i:e_i]
+                    if not already_screened and claimed_source_intervals:
+                        merged_p = merge_contiguous_provenance(sub_pr_lazy)
+                        if any(
+                            (p.src_path, p.src_start, p.src_end)
+                            in claimed_source_intervals
+                            for p, _ in merged_p
+                        ):
+                            continue
+                    seq = sub_st_lazy.spell(nodes)
+                    if len(seq) < min_sv_len:
                         continue
-                seq = sub_st_lazy.spell(nodes)
-                if len(seq) < min_sv_len:
-                    continue
-                cand_id = f"{cand_id_prefix}_{order_idx_fast + 1}"
-                candidates_fast.append(
-                    CandidateBlock(
-                        candidate_id=cand_id,
-                        hap_id=dev.hap_id,
-                        src_path=dev.src_path,
-                        left_anchor_rank=dev.left_anchor_rank,
-                        right_anchor_rank=dev.right_anchor_rank,
-                        source_order=order_idx_fast,
-                        steps=tuple(sub_st_lazy),
-                        provenance=tuple(sub_pr_lazy),
-                        seq=seq,
-                        piece_boundaries=(),
-                        repeat_screened=already_screened,
-                        partial_content=False,
-                        repeat_residual=top_undecomposable_repeat,
-                        multi_hit=bool(dev.multi_hit_nodes),
+                    cand_id = f"{cand_id_prefix}_{order_idx_fast + 1}"
+                    candidates_fast.append(
+                        CandidateBlock(
+                            candidate_id=cand_id,
+                            hap_id=dev.hap_id,
+                            src_path=dev.src_path,
+                            left_anchor_rank=dev.left_anchor_rank,
+                            right_anchor_rank=dev.right_anchor_rank,
+                            source_order=order_idx_fast,
+                            steps=tuple(sub_st_lazy),
+                            provenance=tuple(sub_pr_lazy),
+                            seq=seq,
+                            piece_boundaries=(),
+                            repeat_screened=already_screened,
+                            partial_content=False,
+                            repeat_residual=top_undecomposable_repeat,
+                            multi_hit=bool(dev.multi_hit_nodes),
+                        )
                     )
-                )
-                order_idx_fast += 1
-            return candidates_fast
+                    order_idx_fast += 1
+                return candidates_fast
 
         if hi_ab <= lo_ab:
             top_undecomposable_repeat = False
@@ -618,10 +637,8 @@ def extract_candidate_blocks(
                     )
                     top_undecomposable_repeat = branch_touches_b_ab_multicopy
     else:
-        cache_key = (id(backbone_steps), lo, eff_hi, id(global_ref_nodes))
-        cached_b_sets = getattr(extract_candidate_blocks, "_b_sets_cache", None)
-        if cached_b_sets is not None and cached_b_sets[0] == cache_key:
-            _, b_interval_nodes, base_mc_nonref, base_sc_nonref = cached_b_sets
+        if precomputed_b_sets is not None:
+            b_interval_nodes, base_mc_nonref, base_sc_nonref = precomputed_b_sets
         else:
             b_interval_counts = collections.Counter(
                 st.node_id for st in backbone_steps[lo:eff_hi] if _is_full_step(st)
@@ -637,11 +654,6 @@ def extract_candidate_blocks(
                 for nid in b_interval_nodes
                 if nid not in global_ref_nodes and nid not in base_mc_nonref
             }
-            setattr(
-                extract_candidate_blocks,
-                "_b_sets_cache",
-                (cache_key, b_interval_nodes, base_mc_nonref, base_sc_nonref),
-            )
 
         if hi_ab <= lo_ab:
             multicopy_local_nonref_nodes = base_mc_nonref
@@ -791,11 +803,16 @@ def _extract_contiguous_nonref_runs_for_unresolved(
     if len(steps) == 0:
         return results
 
-    if isinstance(steps, LazyStepTuple) and isinstance(
-        global_ref_nodes, CompactRefNodeSet
+    if (
+        isinstance(steps, LazyStepTuple)
+        and isinstance(global_ref_nodes, CompactRefNodeSet)
+        and len(global_ref_nodes._extra) == 0
     ):
         nids = np.abs(steps._codes)
-        ref_mask = global_ref_nodes._mask[nids]
+        m_len = int(global_ref_nodes._mask.shape[0])
+        ref_mask = (nids < m_len) & global_ref_nodes._mask[
+            np.minimum(nids, max(0, m_len - 1))
+        ]
         nonref_indices = np.flatnonzero(~ref_mask)
         if int(nonref_indices.shape[0]) == 0:
             return results
@@ -894,7 +911,7 @@ def screen_and_fold_candidate(
                 sum(
                     st.step_len(graph.nodes)
                     for st in raw_cand.steps
-                    if st.node_id.isdigit() and int(st.node_id) in m_set
+                    if is_compact_nid_str(st.node_id) and int(st.node_id) in m_set
                 )
                 / raw_len
             )
@@ -1040,7 +1057,7 @@ def screen_and_fold_candidate(
                         sum(
                             st.step_len(graph.nodes)
                             for st in k_steps
-                            if st.node_id.isdigit() and int(st.node_id) in m_set_k
+                            if is_compact_nid_str(st.node_id) and int(st.node_id) in m_set_k
                         )
                         / k_len
                     )
@@ -1429,6 +1446,25 @@ def _solve_multi_member_component(
     b_steps = b_sec.steps
     b_prov = b_sec.exemplar.provenance
     n_b = len(b_steps)
+    sec_b_counts = collections.Counter(
+        st.node_id for st in b_steps if _is_full_step(st)
+    )
+    sec_b_interval_nodes = set(sec_b_counts.keys())
+    sec_mc_nonref = {
+        nid
+        for nid, cnt in sec_b_counts.items()
+        if cnt > 1 and nid not in graph.global_ref_nodes
+    }
+    sec_sc_nonref = {
+        nid
+        for nid in sec_b_interval_nodes
+        if nid not in graph.global_ref_nodes and nid not in sec_mc_nonref
+    }
+    sec_b_sets: tuple[AbstractSet[str], set[str], set[str]] = (
+        sec_b_interval_nodes,
+        sec_mc_nonref,
+        sec_sc_nonref,
+    )
 
     child_group_cands: dict[
         tuple[int | Literal["START"], int | Literal["END"]], list[ExtractedCandidate]
@@ -1532,6 +1568,7 @@ def _solve_multi_member_component(
                 already_screened=True,
                 cand_id_prefix=f"{d_ex.candidate_id}_sub",
                 base_source_order=next_child_order,
+                precomputed_b_sets=sec_b_sets,
             )
             next_child_order += len(raw_blocks)
 
@@ -2393,6 +2430,10 @@ def assemble_pan_and_offsets(
             pan_chunks.append(chunk)
             pan_cursor += len(chunk)
 
+        trailing_blocks_fast = list(slot_blocks_by_step.get(n_ref, ()))
+        if trailing_blocks_fast:
+            _emit_slot_blocks_at_step(n_ref, trailing_blocks_fast)
+
         pan_seq = "".join(pan_chunks)
         ref_starts = ref_cum_off[:-1]
         ref_ends = ref_cum_off[1:]
@@ -2425,7 +2466,7 @@ def assemble_pan_and_offsets(
                 return int(pan_starts[idx]) + (r_coord - int(ref_starts[idx]))
             if n_ref > 0 and r_coord == 0:
                 return int(pan_starts[0])
-            return len(pan_seq)
+            return int(pan_ends[-1]) if n_ref > 0 else len(pan_seq)
 
         updated_events_fast: list[SVEvent] = []
         for ev in sv_events:
@@ -2478,6 +2519,10 @@ def assemble_pan_and_offsets(
                 slot_ins_len=slot_ins_len,
             )
         )
+
+    trailing_blocks = list(slot_blocks_by_step.get(n_ref, ()))
+    if trailing_blocks:
+        _emit_slot_blocks_at_step(n_ref, trailing_blocks)
 
     pan_seq = "".join(pan_chunks)
 
@@ -2806,7 +2851,6 @@ def run_chromosome_pipeline(
                 r_ends = mc_r[1:]
                 b_lens = b_ends - b_starts
                 r_lens = r_ends - r_starts
-                n_gaps = int(b_lens.shape[0])
                 exact_ref_match_mask = (b_lens == 0) & (r_lens == 0)
                 unnorm_ranges = inv_res.unnormalized_branch_ranges
                 f_codes_arr = norm_frag.steps._codes
@@ -2906,9 +2950,15 @@ def run_chromosome_pipeline(
             and isinstance(norm_frag.steps, LazyStepTuple)
             and isinstance(ref_steps, LazyStepTuple)
             and graph._node_lens is not None
+            and (
+                int(norm_frag.steps._codes.shape[0]) == 0
+                or int(np.abs(norm_frag.steps._codes).max())
+                < int(graph._node_lens.shape[0])
+            )
             and graph._ref_cum_offsets is not None
             and graph._nid_to_ref_rank is not None
             and isinstance(graph.global_ref_nodes, CompactRefNodeSet)
+            and len(graph.global_ref_nodes._extra) == 0
         ):
             raw_devs: list[DeviationSegment] = []
             n_frag_steps = len(norm_frag.steps)
@@ -2977,14 +3027,27 @@ def run_chromosome_pipeline(
                     frag_cum_bp[0] = 0
                     np.cumsum(f_lens, dtype=np.int64, out=frag_cum_bp[1:])
 
-                    f_is_ref = graph.global_ref_nodes._mask[f_nids].astype(np.int32)
+                    m_len_ref = int(graph.global_ref_nodes._mask.shape[0])
+                    f_is_ref = (
+                        (f_nids < m_len_ref)
+                        & graph.global_ref_nodes._mask[
+                            np.minimum(f_nids, max(0, m_len_ref - 1))
+                        ]
+                    ).astype(np.int32)
                     frag_cum_ref = np.empty(n_frag_steps + 1, dtype=np.int32)
                     frag_cum_ref[0] = 0
                     np.cumsum(f_is_ref, dtype=np.int32, out=frag_cum_ref[1:])
 
-                    f_is_uniq_ref = (graph._nid_to_ref_rank[f_nids] >= 0).astype(
-                        np.int32
-                    )
+                    r_rank_len = int(graph._nid_to_ref_rank.shape[0])
+                    f_is_uniq_ref = (
+                        (f_nids < r_rank_len)
+                        & (
+                            graph._nid_to_ref_rank[
+                                np.minimum(f_nids, max(0, r_rank_len - 1))
+                            ]
+                            >= 0
+                        )
+                    ).astype(np.int32)
                     frag_cum_uniq_ref = np.empty(
                         n_frag_steps + 1, dtype=np.int32
                     )
@@ -3008,10 +3071,11 @@ def run_chromosome_pipeline(
                         frag_cum_uniq_ref[b_ends] - frag_cum_uniq_ref[b_starts]
                     )
 
-                    # Keep only non-identical pairs that can produce an SV >= min_sv_len, DUP_TRA, or local re-anchoring
+                    # Keep only non-identical pairs that can produce an SV >= min_sv_len, LARGE_JUMP, DUP_TRA, or local re-anchoring
                     cand_mask = (
                         (b_bp >= config.min_sv_len)
                         | (r_bp >= config.min_sv_len)
+                        | (r_bp > config.max_jump)
                         | (b_uniq_ref_hits > 0)
                         | ((r_bp > 0) & (b_ref_hits > 0))
                     )
@@ -3030,6 +3094,7 @@ def run_chromosome_pipeline(
                         if (
                             int(b_bp[k]) < config.min_sv_len
                             and int(r_bp[k]) < config.min_sv_len
+                            and int(r_bp[k]) <= config.max_jump
                             and int(b_uniq_ref_hits[k]) == 0
                         ):
                             if b_e - b_s == 1 and r_right - r_s == 1:
@@ -3128,14 +3193,16 @@ def run_chromosome_pipeline(
                 can_reanchor
                 and isinstance(dev.branch_steps, LazyStepTuple)
                 and isinstance(graph.global_ref_nodes, CompactRefNodeSet)
+                and len(graph.global_ref_nodes._extra) == 0
             ):
-                can_reanchor = bool(
-                    np.any(
-                        graph.global_ref_nodes._mask[
-                            np.abs(dev.branch_steps._codes)
-                        ]
+                br_nids_ra = np.abs(dev.branch_steps._codes)
+                m_len_ra = int(graph.global_ref_nodes._mask.shape[0])
+                if int(br_nids_ra.shape[0]) == 0:
+                    can_reanchor = False
+                elif int(br_nids_ra.max()) < m_len_ra:
+                    can_reanchor = bool(
+                        np.any(graph.global_ref_nodes._mask[br_nids_ra])
                     )
-                )
 
             if can_reanchor and not _shares_canonical_tandem_unit(
                 ref_steps[rank_a + 1 : rank_b], dev.branch_steps
@@ -3165,52 +3232,103 @@ def run_chromosome_pipeline(
                         (analysis, tdev.detached())
                     )
                 else:
-                    if (
-                        t_span_bp < config.min_sv_len
-                        and isinstance(tdev.branch_steps, LazyStepTuple)
-                        and isinstance(ref_steps, LazyStepTuple)
-                        and graph._node_lens is not None
-                        and graph._nid_to_ref_rank is not None
-                    ):
-                        t_nids = np.abs(tdev.branch_steps._codes)
-                        t_alt_bp = int(graph._node_lens[t_nids].sum())
-                        if t_alt_bp < config.min_sv_len:
-                            has_uniq_ref = bool(
-                                np.any(graph._nid_to_ref_rank[t_nids] >= 0)
+                    if t_span_bp < config.min_sv_len:
+                        if (
+                            isinstance(tdev.branch_steps, LazyStepTuple)
+                            and isinstance(ref_steps, LazyStepTuple)
+                            and graph._node_lens is not None
+                            and (
+                                int(tdev.branch_steps._codes.shape[0]) == 0
+                                or int(np.abs(tdev.branch_steps._codes).max())
+                                < int(graph._node_lens.shape[0])
                             )
-                            if not has_uniq_ref:
-                                r_slice_c = ref_steps._codes[ta + 1 : tb]
-                                t_slice_c = tdev.branch_steps._codes
-                                same_tokens = (
-                                    (ta + 1 < tb)
-                                    and (int(t_nids.shape[0]) > 0)
-                                    and (
-                                        int(t_slice_c.min())
-                                        == int(r_slice_c.min())
-                                    )
-                                    and (
-                                        int(t_slice_c.max())
-                                        == int(r_slice_c.max())
-                                    )
-                                    and bool(
-                                        np.array_equal(
-                                            np.unique(t_slice_c),
-                                            np.unique(r_slice_c),
+                            and graph._nid_to_ref_rank is not None
+                        ):
+                            t_nids = np.abs(tdev.branch_steps._codes)
+                            t_alt_bp = int(graph._node_lens[t_nids].sum())
+                            if t_alt_bp < config.min_sv_len:
+                                r_rank_len_t = int(
+                                    graph._nid_to_ref_rank.shape[0]
+                                )
+                                has_uniq_ref = bool(
+                                    np.any(
+                                        (t_nids < r_rank_len_t)
+                                        & (
+                                            graph._nid_to_ref_rank[
+                                                np.minimum(
+                                                    t_nids,
+                                                    max(0, r_rank_len_t - 1),
+                                                )
+                                            ]
+                                            >= 0
                                         )
                                     )
                                 )
-                                if not same_tokens:
-                                    continue
+                                if not has_uniq_ref:
+                                    r_slice_c = ref_steps._codes[ta + 1 : tb]
+                                    t_slice_c = tdev.branch_steps._codes
+                                    same_tokens = (
+                                        (ta + 1 < tb)
+                                        and (int(t_nids.shape[0]) > 0)
+                                        and (
+                                            int(t_slice_c.min())
+                                            == int(r_slice_c.min())
+                                        )
+                                        and (
+                                            int(t_slice_c.max())
+                                            == int(r_slice_c.max())
+                                        )
+                                        and bool(
+                                            np.array_equal(
+                                                np.unique(t_slice_c),
+                                                np.unique(r_slice_c),
+                                            )
+                                        )
+                                    )
+                                    if not same_tokens:
+                                        continue
+                        else:
+                            t_alt_bp = sum(
+                                _step_bp_len(st, graph.nodes)
+                                for st in tdev.branch_steps
+                            )
+                            if t_alt_bp < config.min_sv_len:
+                                has_uniq_ref = any(
+                                    _is_full_step(st)
+                                    and st.node_id in graph.unique_ref_step_by_node
+                                    for st in tdev.branch_steps
+                                )
+                                if not has_uniq_ref:
+                                    r_slice_steps = ref_steps[ta + 1 : tb]
+                                    same_tokens = (
+                                        (ta + 1 < tb)
+                                        and bool(tdev.branch_steps)
+                                        and {
+                                            (st.node_id, st.orient)
+                                            for st in tdev.branch_steps
+                                            if _is_full_step(st)
+                                        }
+                                        == {
+                                            (st.node_id, st.orient)
+                                            for st in r_slice_steps
+                                            if _is_full_step(st)
+                                        }
+                                    )
+                                    if not same_tokens:
+                                        continue
                     keep_prov = True
                     if (
                         isinstance(tdev.branch_steps, LazyStepTuple)
                         and isinstance(graph.global_ref_nodes, CompactRefNodeSet)
+                        and len(graph.global_ref_nodes._extra) == 0
                         and graph._node_lens is not None
                     ):
                         t_nids_p = np.abs(tdev.branch_steps._codes)
+                        m_len_p = int(graph.global_ref_nodes._mask.shape[0])
+                        nl_len_p = int(graph._node_lens.shape[0])
                         if int(t_nids_p.shape[0]) == 0:
                             keep_prov = False
-                        else:
+                        elif int(t_nids_p.max()) < min(m_len_p, nl_len_p):
                             nonref_m = ~graph.global_ref_nodes._mask[t_nids_p]
                             if (
                                 not bool(np.any(nonref_m))
@@ -3600,7 +3718,18 @@ def run_chromosome_pipeline(
                 and graph._ref_cum_offsets is not None
             ):
                 br_nids_dt = np.abs(dev.branch_steps._codes)
-                r_ancs = graph._nid_to_ref_rank[br_nids_dt]
+                r_rank_len_dt = int(graph._nid_to_ref_rank.shape[0])
+                r_ancs = (
+                    np.where(
+                        br_nids_dt < r_rank_len_dt,
+                        graph._nid_to_ref_rank[
+                            np.minimum(br_nids_dt, max(0, r_rank_len_dt - 1))
+                        ],
+                        -1,
+                    )
+                    if r_rank_len_dt > 0
+                    else np.full(br_nids_dt.shape, -1, dtype=np.int32)
+                )
                 out_mask = (r_ancs >= 0) & ((r_ancs < rank_a) | (r_ancs > rank_b))
                 if bool(np.any(out_mask)):
                     cand_r = r_ancs[out_mask]
@@ -3682,11 +3811,17 @@ def run_chromosome_pipeline(
                 if cnv_c is not None:
                     full_cnv_calls.append((ca, dev, cnv_c))
 
+            full_cnv_dev_ids: set[int] = set()
+            emitted_full_cnv_keys: set[
+                tuple[int, int, tuple[tuple[str, str], ...]]
+            ] = set()
             if full_cnv_calls:
                 first_cnv = full_cnv_calls[0][2]
                 target_u = first_cnv.unit_tokens
                 k_ref = first_cnv.k_ref
                 unit_bp = first_cnv.unit_bp
+                full_cnv_dev_ids = {id(dev) for _, dev, _ in full_cnv_calls}
+                emitted_full_cnv_keys.add((rank_a + 1, rank_b, target_u))
 
                 dev_by_contig_id = {id(ca): dev for ca, dev in devs_at_pair}
                 cnv_calls_by_hap: dict[str, list[str]] = collections.defaultdict(list)
@@ -3757,323 +3892,345 @@ def run_chromosome_pipeline(
                         event=cnv_ev,
                     )
                 )
+
+            del_intervals: dict[
+                tuple[int, int], list[tuple[_ContigAnalysis, DeviationSegment]]
+            ] = collections.defaultdict(list)
+            partial_cnv_intervals: dict[
+                tuple[int, int, tuple[tuple[str, str], ...]],
+                list[tuple[_ContigAnalysis, DeviationSegment, CNVCall]],
+            ] = collections.defaultdict(list)
+
+            is_fast_b = (
+                isinstance(b_slice_steps, LazyStepTuple)
+                and graph._ref_cum_offsets is not None
+            )
+            if is_fast_b:
+                assert isinstance(b_slice_steps, LazyStepTuple)
+                assert graph._ref_cum_offsets is not None
+                b_codes_abs = np.abs(b_slice_steps._codes)
+                b_u_nids = np.unique(b_codes_abs)
+                ref_cum = graph._ref_cum_offsets
             else:
-                del_intervals: dict[
-                    tuple[int, int], list[tuple[_ContigAnalysis, DeviationSegment]]
-                ] = collections.defaultdict(list)
-                partial_cnv_intervals: dict[
-                    tuple[int, int, tuple[tuple[str, str], ...]],
-                    list[tuple[_ContigAnalysis, DeviationSegment, CNVCall]],
-                ] = collections.defaultdict(list)
+                b_codes_abs = np.empty(0, dtype=np.int32)
+                b_u_nids = np.empty(0, dtype=np.int32)
+                ref_cum = np.empty(0, dtype=np.int64)
 
-                if (
-                    isinstance(b_slice_steps, LazyStepTuple)
-                    and graph._ref_cum_offsets is not None
+            b_nids_str: set[str] | None = None
+
+            for ca, dev in devs_at_pair:
+                if id(dev) in full_cnv_dev_ids or _shares_canonical_tandem_unit(
+                    b_slice_steps, dev.branch_steps
                 ):
-                    b_codes_abs = np.abs(b_slice_steps._codes)
-                    b_u_nids = np.unique(b_codes_abs)
-                    ref_cum = graph._ref_cum_offsets
+                    continue
 
-                    for ca, dev in devs_at_pair:
-                        if _shares_canonical_tandem_unit(
-                            b_slice_steps, dev.branch_steps
-                        ):
-                            continue
-                        if not isinstance(dev.branch_steps, LazyStepTuple):
-                            continue
-                        br_codes_abs = np.abs(dev.branch_steps._codes)
-                        br_u_nids = np.unique(br_codes_abs)
-                        shared_int = np.intersect1d(
-                            b_u_nids, br_u_nids, assume_unique=True
-                        )
-                        if int(shared_int.shape[0]) == 0:
-                            del_bp = ref_e_open - ref_s_open
-                            if del_bp >= config.min_sv_len:
-                                del_intervals[(rank_a + 1, rank_b)].append(
-                                    (ca, dev)
-                                )
-                        else:
-                            b_is_shared = np.isin(b_codes_abs, shared_int)
-                            unsh_rel = np.flatnonzero(~b_is_shared)
-                            if int(unsh_rel.shape[0]) > 0:
-                                gaps_u = np.flatnonzero(np.diff(unsh_rel) > 1)
-                                n_u_runs = int(gaps_u.shape[0]) + 1
-                                u_starts = np.empty(n_u_runs, dtype=np.int32)
-                                u_ends = np.empty(n_u_runs, dtype=np.int32)
-                                u_starts[0] = unsh_rel[0]
-                                if int(gaps_u.shape[0]) > 0:
-                                    u_starts[1:] = unsh_rel[gaps_u + 1]
-                                    u_ends[:-1] = unsh_rel[gaps_u] + 1
-                                u_ends[-1] = unsh_rel[-1] + 1
-                                for u_s_rel, u_e_rel in zip(
-                                    u_starts.tolist(), u_ends.tolist()
-                                ):
-                                    d_lo = rank_a + 1 + u_s_rel
-                                    d_hi = rank_a + 1 + u_e_rel
-                                    if (
-                                        int(ref_cum[d_hi]) - int(ref_cum[d_lo])
-                                        >= config.min_sv_len
-                                    ):
-                                        del_intervals[(d_lo, d_hi)].append(
-                                            (ca, dev)
-                                        )
-
-                            sh_rel = np.flatnonzero(b_is_shared)
-                            n_sh = int(sh_rel.shape[0])
-                            if (
-                                n_sh > 0
-                                and int(sh_rel[-1]) - int(sh_rel[0]) + 1 == n_sh
-                            ):
-                                b_sh_lazy = LazyStepTuple(
-                                    b_slice_steps._codes[
-                                        int(sh_rel[0]) : int(sh_rel[-1]) + 1
-                                    ]
-                                )
-                                br_is_sh = np.isin(br_codes_abs, shared_int)
-                                br_sh_lazy = LazyStepTuple(
-                                    dev.branch_steps._codes[br_is_sh]
-                                )
-                                sh_cnv = detect_canonical_cnv(
-                                    b_sh_lazy,
-                                    br_sh_lazy,
-                                    graph.nodes,
-                                    config.min_sv_len,
-                                )
-                                if sh_cnv is not None:
-                                    partial_cnv_intervals[
-                                        (
-                                            rank_a + 1 + int(sh_rel[0]),
-                                            rank_a + 1 + int(sh_rel[-1]) + 1,
-                                            sh_cnv.unit_tokens,
-                                        )
-                                    ].append((ca, dev, sh_cnv))
-                else:
-                    if isinstance(b_slice_steps, LazyStepTuple):
-                        b_nids = {
-                            str(x)
-                            for x in np.unique(
-                                np.abs(b_slice_steps._codes)
-                            ).tolist()
-                        }
+                if is_fast_b and isinstance(dev.branch_steps, LazyStepTuple):
+                    assert isinstance(b_slice_steps, LazyStepTuple)
+                    br_codes_abs = np.abs(dev.branch_steps._codes)
+                    br_u_nids = np.unique(br_codes_abs)
+                    shared_int = np.intersect1d(
+                        b_u_nids, br_u_nids, assume_unique=True
+                    )
+                    if int(shared_int.shape[0]) == 0:
+                        del_bp = ref_e_open - ref_s_open
+                        if del_bp >= config.min_sv_len:
+                            del_intervals[(rank_a + 1, rank_b)].append(
+                                (ca, dev)
+                            )
                     else:
-                        b_nids = {
-                            st.node_id
-                            for st in b_slice_steps
-                            if _is_full_step(st)
-                        }
+                        b_is_shared = np.isin(b_codes_abs, shared_int)
+                        unsh_rel = np.flatnonzero(~b_is_shared)
+                        if int(unsh_rel.shape[0]) > 0:
+                            gaps_u = np.flatnonzero(np.diff(unsh_rel) > 1)
+                            n_u_runs = int(gaps_u.shape[0]) + 1
+                            u_starts = np.empty(n_u_runs, dtype=np.int32)
+                            u_ends = np.empty(n_u_runs, dtype=np.int32)
+                            u_starts[0] = unsh_rel[0]
+                            if int(gaps_u.shape[0]) > 0:
+                                u_starts[1:] = unsh_rel[gaps_u + 1]
+                                u_ends[:-1] = unsh_rel[gaps_u] + 1
+                            u_ends[-1] = unsh_rel[-1] + 1
+                            for u_s_rel, u_e_rel in zip(
+                                u_starts.tolist(), u_ends.tolist()
+                            ):
+                                d_lo = rank_a + 1 + u_s_rel
+                                d_hi = rank_a + 1 + u_e_rel
+                                if (
+                                    int(ref_cum[d_hi]) - int(ref_cum[d_lo])
+                                    >= config.min_sv_len
+                                ):
+                                    del_intervals[(d_lo, d_hi)].append(
+                                        (ca, dev)
+                                    )
 
-                    for ca, dev in devs_at_pair:
-                        if _shares_canonical_tandem_unit(
-                            b_slice_steps, dev.branch_steps
+                        sh_rel = np.flatnonzero(b_is_shared)
+                        n_sh = int(sh_rel.shape[0])
+                        if (
+                            n_sh > 0
+                            and int(sh_rel[-1]) - int(sh_rel[0]) + 1 == n_sh
                         ):
-                            continue
-
-                        if isinstance(dev.branch_steps, LazyStepTuple):
-                            br_nids = {
+                            b_sh_lazy = LazyStepTuple(
+                                b_slice_steps._codes[
+                                    int(sh_rel[0]) : int(sh_rel[-1]) + 1
+                                ]
+                            )
+                            br_is_sh = np.isin(br_codes_abs, shared_int)
+                            br_sh_lazy = LazyStepTuple(
+                                dev.branch_steps._codes[br_is_sh]
+                            )
+                            sh_cnv = detect_canonical_cnv(
+                                b_sh_lazy,
+                                br_sh_lazy,
+                                graph.nodes,
+                                config.min_sv_len,
+                            )
+                            if sh_cnv is not None:
+                                p_key = (
+                                    rank_a + 1 + int(sh_rel[0]),
+                                    rank_a + 1 + int(sh_rel[-1]) + 1,
+                                    sh_cnv.unit_tokens,
+                                )
+                                if p_key not in emitted_full_cnv_keys:
+                                    partial_cnv_intervals[p_key].append(
+                                        (ca, dev, sh_cnv)
+                                    )
+                else:
+                    if b_nids_str is None:
+                        if isinstance(b_slice_steps, LazyStepTuple):
+                            b_nids_str = {
                                 str(x)
                                 for x in np.unique(
-                                    np.abs(dev.branch_steps._codes)
+                                    np.abs(b_slice_steps._codes)
                                 ).tolist()
                             }
                         else:
-                            br_nids = {
+                            b_nids_str = {
                                 st.node_id
-                                for st in dev.branch_steps
+                                for st in b_slice_steps
                                 if _is_full_step(st)
                             }
-                        shared_nids = b_nids & br_nids
 
-                        if not shared_nids:
-                            del_bp = ref_e_open - ref_s_open
-                            if del_bp >= config.min_sv_len:
-                                del_intervals[(rank_a + 1, rank_b)].append(
-                                    (ca, dev)
-                                )
-                        else:
-                            cur_del_start: int | None = None
-                            for offset_idx, b_st in enumerate(b_slice_steps):
-                                r_step = rank_a + 1 + offset_idx
-                                if b_st.node_id not in shared_nids:
-                                    if cur_del_start is None:
-                                        cur_del_start = r_step
-                                else:
-                                    if cur_del_start is not None:
-                                        d_s = graph.ref_step_ranges[
-                                            cur_del_start
-                                        ][0]
-                                        d_e = graph.ref_step_ranges[
-                                            r_step - 1
-                                        ][1]
-                                        if d_e - d_s >= config.min_sv_len:
-                                            del_intervals[
-                                                (cur_del_start, r_step)
-                                            ].append((ca, dev))
-                                        cur_del_start = None
-                            if cur_del_start is not None:
-                                d_s = graph.ref_step_ranges[cur_del_start][0]
-                                d_e = graph.ref_step_ranges[rank_b - 1][1]
-                                if d_e - d_s >= config.min_sv_len:
-                                    del_intervals[
-                                        (cur_del_start, rank_b)
-                                    ].append((ca, dev))
+                    if isinstance(dev.branch_steps, LazyStepTuple):
+                        br_nids = {
+                            str(x)
+                            for x in np.unique(
+                                np.abs(dev.branch_steps._codes)
+                            ).tolist()
+                        }
+                    else:
+                        br_nids = {
+                            st.node_id
+                            for st in dev.branch_steps
+                            if _is_full_step(st)
+                        }
+                    shared_nids = b_nids_str & br_nids
 
-                            b_shared_indices = [
-                                rank_a + 1 + i
-                                for i, st in enumerate(b_slice_steps)
+                    if not shared_nids:
+                        del_bp = ref_e_open - ref_s_open
+                        if del_bp >= config.min_sv_len:
+                            del_intervals[(rank_a + 1, rank_b)].append(
+                                (ca, dev)
+                            )
+                    else:
+                        cur_del_start: int | None = None
+                        for offset_idx, b_st in enumerate(b_slice_steps):
+                            r_step = rank_a + 1 + offset_idx
+                            if b_st.node_id not in shared_nids:
+                                if cur_del_start is None:
+                                    cur_del_start = r_step
+                            else:
+                                if cur_del_start is not None:
+                                    d_s = graph.ref_step_ranges[
+                                        cur_del_start
+                                    ][0]
+                                    d_e = graph.ref_step_ranges[
+                                        r_step - 1
+                                    ][1]
+                                    if d_e - d_s >= config.min_sv_len:
+                                        del_intervals[
+                                            (cur_del_start, r_step)
+                                        ].append((ca, dev))
+                                    cur_del_start = None
+                        if cur_del_start is not None:
+                            d_s = graph.ref_step_ranges[cur_del_start][0]
+                            d_e = graph.ref_step_ranges[rank_b - 1][1]
+                            if d_e - d_s >= config.min_sv_len:
+                                del_intervals[
+                                    (cur_del_start, rank_b)
+                                ].append((ca, dev))
+
+                        b_shared_indices = [
+                            rank_a + 1 + i
+                            for i, st in enumerate(b_slice_steps)
+                            if st.node_id in shared_nids
+                        ]
+                        if (
+                            b_shared_indices
+                            and b_shared_indices[-1]
+                            - b_shared_indices[0]
+                            + 1
+                            == len(b_shared_indices)
+                        ):
+                            b_sh_steps = [
+                                st
+                                for st in b_slice_steps
                                 if st.node_id in shared_nids
                             ]
-                            if (
-                                b_shared_indices
-                                and b_shared_indices[-1]
-                                - b_shared_indices[0]
-                                + 1
-                                == len(b_shared_indices)
-                            ):
-                                b_sh_steps = [
-                                    st
-                                    for st in b_slice_steps
-                                    if st.node_id in shared_nids
-                                ]
-                                br_sh_steps = [
-                                    st
-                                    for st in dev.branch_steps
-                                    if _is_full_step(st)
-                                    and st.node_id in shared_nids
-                                ]
-                                sh_cnv = detect_canonical_cnv(
-                                    b_sh_steps,
-                                    br_sh_steps,
-                                    graph.nodes,
-                                    config.min_sv_len,
+                            br_sh_steps = [
+                                st
+                                for st in dev.branch_steps
+                                if _is_full_step(st)
+                                and st.node_id in shared_nids
+                            ]
+                            sh_cnv = detect_canonical_cnv(
+                                b_sh_steps,
+                                br_sh_steps,
+                                graph.nodes,
+                                config.min_sv_len,
+                            )
+                            if sh_cnv is not None:
+                                p_key = (
+                                    b_shared_indices[0],
+                                    b_shared_indices[-1] + 1,
+                                    sh_cnv.unit_tokens,
                                 )
-                                if sh_cnv is not None:
-                                    partial_cnv_intervals[
-                                        (
-                                            b_shared_indices[0],
-                                            b_shared_indices[-1] + 1,
-                                            sh_cnv.unit_tokens,
-                                        )
-                                    ].append((ca, dev, sh_cnv))
+                                if p_key not in emitted_full_cnv_keys:
+                                    partial_cnv_intervals[p_key].append(
+                                        (ca, dev, sh_cnv)
+                                    )
 
-                for (del_r_lo, del_r_hi), del_entries in sorted(
-                    del_intervals.items()
+            for (del_r_lo, del_r_hi), del_entries in sorted(
+                del_intervals.items()
+            ):
+                d_ref_s = graph.ref_step_ranges[del_r_lo][0]
+                d_ref_e = graph.ref_step_ranges[del_r_hi - 1][1]
+                d_len = d_ref_e - d_ref_s
+                del_contig_ids = {id(ca) for ca, _ in del_entries}
+                del_calls: dict[str, list[str]] = collections.defaultdict(list)
+                for hap_id, ca_list in contigs_by_hap.items():
+                    for ca in ca_list:
+                        if id(ca) in del_contig_ids:
+                            del_calls[hap_id].append("1")
+                        elif _contig_covers_anchor_pair(ca, rank_a, rank_b):
+                            del_calls[hap_id].append("0")
+                        else:
+                            del_calls[hap_id].append(".")
+                del_gt = _resolve_haplotype_genotypes(
+                    graph.all_haplotypes, ref_hap_id, "0", del_calls
+                )
+                del_carriers = sorted(h for h, g in del_gt.items() if g == "1")
+                if not del_carriers:
+                    del_carriers = sorted(
+                        {ca.raw_fragment.hap_id for ca, _ in del_entries}
+                    )
+                n_car = sum(1 for g in del_gt.values() if g not in ("0", "."))
+                n_cal = sum(1 for g in del_gt.values() if g != ".")
+                has_mh = any(
+                    bool(dev.multi_hit_nodes) or ca.lis_multi_hit
+                    for ca, dev in del_entries
+                )
+                mh_tag = ",multi_hit=1" if has_mh else ""
+                del_ev = SVEvent(
+                    chrom=graph.ref_chrom,
+                    pan_start=0,
+                    pan_end=0,
+                    event_id="",
+                    event_type="DEL",
+                    ref_start=d_ref_s,
+                    ref_end=d_ref_e,
+                    anchors=f"{del_r_lo - 1}..{del_r_hi}",
+                    alleles_str=f"1:len={d_len},src={del_carriers[0]},n={len(del_carriers)}{mh_tag}",
+                    n_carrier=n_car,
+                    n_called=n_cal,
+                    region_id=".",
+                    genotypes=del_gt,
+                    pieces=(),
+                )
+                pending_events.append(
+                    _PendingNormalEvent(
+                        locus_start=d_ref_s,
+                        locus_end=d_ref_e,
+                        event=del_ev,
+                    )
+                )
+
+            for (
+                cnv_r_lo,
+                cnv_r_hi,
+                u_toks,
+            ), p_cnv_entries in sorted(partial_cnv_intervals.items()):
+                c_ref_s = graph.ref_step_ranges[cnv_r_lo][0]
+                c_ref_e = graph.ref_step_ranges[cnv_r_hi - 1][1]
+                first_c = p_cnv_entries[0][2]
+                k_ref = first_c.k_ref
+                unit_bp = first_c.unit_bp
+                carrier_map = {
+                    id(ca): c_call.k_alt for ca, _, c_call in p_cnv_entries
+                }
+                p_cnv_calls: dict[str, list[str]] = collections.defaultdict(list)
+                for hap_id, ca_list in contigs_by_hap.items():
+                    for ca in ca_list:
+                        if id(ca) in carrier_map:
+                            p_cnv_calls[hap_id].append(str(carrier_map[id(ca)]))
+                        elif _contig_covers_anchor_pair(ca, rank_a, rank_b) and all(
+                            r in ca.covered_ranks for r in range(cnv_r_lo, cnv_r_hi)
+                        ):
+                            p_cnv_calls[hap_id].append(str(k_ref))
+                        else:
+                            p_cnv_calls[hap_id].append(".")
+                p_cnv_gt = _resolve_haplotype_genotypes(
+                    graph.all_haplotypes, ref_hap_id, str(k_ref), p_cnv_calls
+                )
+                n_car = sum(
+                    1 for g in p_cnv_gt.values() if g not in (".", str(k_ref))
+                )
+                n_cal = sum(1 for g in p_cnv_gt.values() if g != ".")
+                has_mh = any(
+                    bool(dev.multi_hit_nodes) or ca.lis_multi_hit
+                    for ca, dev, _ in p_cnv_entries
+                )
+                mh_tag = ",multi_hit=1" if has_mh else ""
+                unit_str = ",".join(f"{nid}{o}" for nid, o in u_toks)
+                p_alt_counts: dict[int, list[str]] = collections.defaultdict(list)
+                for h_id, g_val in sorted(p_cnv_gt.items()):
+                    if g_val not in (".", str(k_ref)):
+                        p_alt_counts[int(g_val)].append(h_id)
+                if not p_alt_counts:
+                    p_alt_counts[first_c.k_alt].append(
+                        p_cnv_entries[0][0].raw_fragment.hap_id
+                    )
+                p_allele_parts: list[str] = []
+                for a_i, (k_val, h_list) in enumerate(
+                    sorted(p_alt_counts.items(), key=lambda x: (-len(x[1]), x[0])),
+                    start=1,
                 ):
-                    d_ref_s = graph.ref_step_ranges[del_r_lo][0]
-                    d_ref_e = graph.ref_step_ranges[del_r_hi - 1][1]
-                    d_len = d_ref_e - d_ref_s
-                    del_contig_ids = {id(ca) for ca, _ in del_entries}
-                    del_calls: dict[str, list[str]] = collections.defaultdict(list)
-                    for hap_id, ca_list in contigs_by_hap.items():
-                        for ca in ca_list:
-                            if id(ca) in del_contig_ids:
-                                del_calls[hap_id].append("1")
-                            elif _contig_covers_anchor_pair(ca, rank_a, rank_b):
-                                del_calls[hap_id].append("0")
-                            else:
-                                del_calls[hap_id].append(".")
-                    del_gt = _resolve_haplotype_genotypes(
-                        graph.all_haplotypes, ref_hap_id, "0", del_calls
+                    p_allele_parts.append(
+                        f"{a_i}:len={k_val * unit_bp},src={h_list[0]},n={len(h_list)},"
+                        f"unit={unit_str},k_ref={k_ref},k_alt={k_val}{mh_tag}"
                     )
-                    del_carriers = sorted(h for h, g in del_gt.items() if g == "1")
-                    if not del_carriers:
-                        del_carriers = sorted(
-                            {ca.raw_fragment.hap_id for ca, _ in del_entries}
-                        )
-                    n_car = sum(1 for g in del_gt.values() if g not in ("0", "."))
-                    n_cal = sum(1 for g in del_gt.values() if g != ".")
-                    has_mh = any(
-                        bool(dev.multi_hit_nodes) or ca.lis_multi_hit
-                        for ca, dev in del_entries
+                p_cnv_ev = SVEvent(
+                    chrom=graph.ref_chrom,
+                    pan_start=0,
+                    pan_end=0,
+                    event_id="",
+                    event_type="CNV",
+                    ref_start=c_ref_s,
+                    ref_end=c_ref_e,
+                    anchors=f"{cnv_r_lo - 1}..{cnv_r_hi}",
+                    alleles_str=";".join(p_allele_parts),
+                    n_carrier=n_car,
+                    n_called=n_cal,
+                    region_id=".",
+                    genotypes=p_cnv_gt,
+                    pieces=(),
+                )
+                pending_events.append(
+                    _PendingNormalEvent(
+                        locus_start=c_ref_s,
+                        locus_end=c_ref_e,
+                        event=p_cnv_ev,
                     )
-                    mh_tag = ",multi_hit=1" if has_mh else ""
-                    del_ev = SVEvent(
-                        chrom=graph.ref_chrom,
-                        pan_start=0,
-                        pan_end=0,
-                        event_id="",
-                        event_type="DEL",
-                        ref_start=d_ref_s,
-                        ref_end=d_ref_e,
-                        anchors=f"{del_r_lo - 1}..{del_r_hi}",
-                        alleles_str=f"1:len={d_len},src={del_carriers[0]},n={len(del_carriers)}{mh_tag}",
-                        n_carrier=n_car,
-                        n_called=n_cal,
-                        region_id=".",
-                        genotypes=del_gt,
-                        pieces=(),
-                    )
-                    pending_events.append(
-                        _PendingNormalEvent(
-                            locus_start=d_ref_s,
-                            locus_end=d_ref_e,
-                            event=del_ev,
-                        )
-                    )
-
-                for (
-                    cnv_r_lo,
-                    cnv_r_hi,
-                    u_toks,
-                ), p_cnv_entries in sorted(partial_cnv_intervals.items()):
-                    c_ref_s = graph.ref_step_ranges[cnv_r_lo][0]
-                    c_ref_e = graph.ref_step_ranges[cnv_r_hi - 1][1]
-                    first_c = p_cnv_entries[0][2]
-                    k_ref = first_c.k_ref
-                    unit_bp = first_c.unit_bp
-                    carrier_map = {
-                        id(ca): c_call.k_alt for ca, _, c_call in p_cnv_entries
-                    }
-                    p_cnv_calls: dict[str, list[str]] = collections.defaultdict(list)
-                    for hap_id, ca_list in contigs_by_hap.items():
-                        for ca in ca_list:
-                            if id(ca) in carrier_map:
-                                p_cnv_calls[hap_id].append(str(carrier_map[id(ca)]))
-                            elif _contig_covers_anchor_pair(ca, rank_a, rank_b) and all(
-                                r in ca.covered_ranks for r in range(cnv_r_lo, cnv_r_hi)
-                            ):
-                                p_cnv_calls[hap_id].append(str(k_ref))
-                            else:
-                                p_cnv_calls[hap_id].append(".")
-                    p_cnv_gt = _resolve_haplotype_genotypes(
-                        graph.all_haplotypes, ref_hap_id, str(k_ref), p_cnv_calls
-                    )
-                    n_car = sum(
-                        1 for g in p_cnv_gt.values() if g not in (".", str(k_ref))
-                    )
-                    n_cal = sum(1 for g in p_cnv_gt.values() if g != ".")
-                    has_mh = any(
-                        bool(dev.multi_hit_nodes) or ca.lis_multi_hit
-                        for ca, dev, _ in p_cnv_entries
-                    )
-                    mh_tag = ",multi_hit=1" if has_mh else ""
-                    unit_str = ",".join(f"{nid}{o}" for nid, o in u_toks)
-                    ex_hap = p_cnv_entries[0][0].raw_fragment.hap_id
-                    p_cnv_ev = SVEvent(
-                        chrom=graph.ref_chrom,
-                        pan_start=0,
-                        pan_end=0,
-                        event_id="",
-                        event_type="CNV",
-                        ref_start=c_ref_s,
-                        ref_end=c_ref_e,
-                        anchors=f"{cnv_r_lo - 1}..{cnv_r_hi}",
-                        alleles_str=(
-                            f"1:len={first_c.k_alt * unit_bp},src={ex_hap},n={max(1, n_car)},"
-                            f"unit={unit_str},k_ref={k_ref},k_alt={first_c.k_alt}{mh_tag}"
-                        ),
-                        n_carrier=n_car,
-                        n_called=n_cal,
-                        region_id=".",
-                        genotypes=p_cnv_gt,
-                        pieces=(),
-                    )
-                    pending_events.append(
-                        _PendingNormalEvent(
-                            locus_start=c_ref_s,
-                            locus_end=c_ref_e,
-                            event=p_cnv_ev,
-                        )
-                    )
+                )
 
         # (iii) INS event & InsertionSlotBlock when G(a, b) has >= 1 non-backbone representative
         if sol is not None and sol.non_backbone_reps:
@@ -4200,7 +4357,7 @@ def run_chromosome_pipeline(
                 r.repeat_residual for r in sol.non_backbone_reps
             )
             group_has_mh = any(r.multi_hit for r in sol.non_backbone_reps) or any(
-                bool(dev.multi_hit_nodes) for _, dev in devs_at_pair
+                kc.multi_hit for kc in guard_res.kept_candidates
             )
 
             allele_entries: list[str] = []
@@ -4402,6 +4559,8 @@ def run_chromosome_pipeline(
     summary_metrics: dict[str, Any] = {
         **cen_out.summary_metrics,
         "chrom": graph.ref_chrom,
+        "ref_path": graph.ref_fragment.src_path,
+        "ref_hap": graph.ref_fragment.hap_id,
         "gfa_path": str(graph.gfa_path),
         "gfa_sha256": graph.gfa_sha256,
         "ref_len": len(graph.ref_seq),

@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from tests.e2e.helpers import (
+    InputPaths,
     OutputBundle,
     SyntheticInputBuilder,
     assert_all_global_invariants,
@@ -30,9 +31,7 @@ from tests.e2e.helpers import (
     revcomp,
     run_build,
     run_merge,
-    run_panflat_cli,
     run_verify,
-    translate_cds,
 )
 
 

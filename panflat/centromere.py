@@ -29,6 +29,7 @@ from panflat.models import (
     StepProvenance,
     SVEvent,
     UnresolvedRecord,
+    is_compact_nid_str,
 )
 from panflat.repeat_guard import (
     REPEAT_KMER_SIZE,
@@ -288,12 +289,17 @@ def _extract_nonref_runs(
     if n == 0:
         return runs
 
-    if isinstance(steps, LazyStepTuple) and isinstance(
-        global_ref_nodes, CompactRefNodeSet
+    if (
+        isinstance(steps, LazyStepTuple)
+        and isinstance(global_ref_nodes, CompactRefNodeSet)
+        and len(global_ref_nodes._extra) == 0
     ):
         codes = steps._codes
         nids = np.abs(codes)
-        ref_mask = global_ref_nodes._mask[nids]
+        m_len = int(global_ref_nodes._mask.shape[0])
+        ref_mask = (nids < m_len) & global_ref_nodes._mask[
+            np.minimum(nids, max(0, m_len - 1))
+        ]
         nonref_indices = np.flatnonzero(~ref_mask)
         if int(nonref_indices.shape[0]) == 0:
             return runs
@@ -476,8 +482,16 @@ def partition_fragments_by_centromere(
             internal_only_ref_nodes: AbstractSet[str] = CompactRefNodeSet(
                 internal_only_mask
             )
-            u_nid_int = int(u_node) if (u_node is not None and u_node.isdigit()) else -1
-            v_nid_int = int(v_node) if (v_node is not None and v_node.isdigit()) else -1
+            u_nid_int = (
+                int(u_node)
+                if (u_node is not None and is_compact_nid_str(u_node, max_nid_len - 1))
+                else -1
+            )
+            v_nid_int = (
+                int(v_node)
+                if (v_node is not None and is_compact_nid_str(v_node, max_nid_len - 1))
+                else -1
+            )
         else:
             outside_mask = None
             internal_only_mask = None
@@ -926,7 +940,7 @@ def partition_fragments_by_centromere(
         for u_i, v_i in cuts:
             if u_i >= 0 and cur_start <= u_i:
                 stage1_subfrags.append(_slice_path_fragment(frag, cur_start, u_i + 1))
-            cur_start = v_i
+            cur_start = max(cur_start, v_i)
         if cur_start < n_steps:
             stage1_subfrags.append(_slice_path_fragment(frag, cur_start, n_steps))
 
@@ -942,7 +956,12 @@ def partition_fragments_by_centromere(
             and graph._ref_cum_offsets is not None
         ):
             sf_nids = np.abs(sub_frag.steps._codes)
-            sf_ranks = graph._nid_to_ref_rank[sf_nids]
+            r_len = int(graph._nid_to_ref_rank.shape[0])
+            sf_ranks = np.where(
+                sf_nids < r_len,
+                graph._nid_to_ref_rank[np.minimum(sf_nids, max(0, r_len - 1))],
+                -1,
+            )
             hit_pos = np.flatnonzero(sf_ranks >= 0).astype(np.int32)
             if int(hit_pos.shape[0]) < 2:
                 normal_fragments.append(sub_frag)
@@ -951,8 +970,6 @@ def partition_fragments_by_centromere(
             r_lo_arr = np.minimum(hit_ranks[:-1], hit_ranks[1:])
             r_hi_arr = np.maximum(hit_ranks[:-1], hit_ranks[1:])
             cum_off = graph._ref_cum_offsets
-            span_s_arr = cum_off[r_lo_arr]
-            # Wait: graph.ref_step_ranges[r_lo][1] is cum_off[r_lo + 1]!
             span_s_arr = cum_off[r_lo_arr + 1]
             span_e_arr = cum_off[r_hi_arr]
             crossed_mask = np.zeros(int(r_lo_arr.shape[0]), dtype=bool)

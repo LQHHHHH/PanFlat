@@ -82,6 +82,31 @@ CENTROMERE_TSV_COLUMNS: tuple[str, ...] = (
     "supported_events",
 )
 
+MAX_COMPACT_NID: int = 50_000_000
+
+
+def is_canonical_pos_int_str(key: object) -> bool:
+    """Return True iff `key` is a canonical positive ASCII decimal integer string ('1', '2', ..., no leading '0')."""
+    return (
+        isinstance(key, str)
+        and bool(key)
+        and key.isascii()
+        and key.isdigit()
+        and key[0] != "0"
+    )
+
+
+def is_compact_nid_str(key: object, limit: int = MAX_COMPACT_NID) -> bool:
+    """Return True iff `key` is a canonical positive integer string in `1..limit`."""
+    if limit < 1 or not is_canonical_pos_int_str(key):
+        return False
+    s: str = key  # type: ignore[assignment]
+    if limit <= 99_999_999 and len(s) > 8:
+        return False
+    if len(s) > 18 and limit < 10**18:
+        return False
+    return int(s) <= limit
+
 
 @dataclass(frozen=True, slots=True)
 class Step:
@@ -653,21 +678,19 @@ class CompactNodeStore(collections.abc.Mapping[str, str]):
             self._count = int_cnt + len(self._extra)
 
     def __getitem__(self, key: str) -> str:
-        if isinstance(key, str) and key.isdigit():
+        if is_compact_nid_str(key, self._max_nid):
             nid = int(key)
-            if 1 <= nid <= self._max_nid:
-                s = int(self._offsets[nid])
-                e = int(self._offsets[nid + 1])
-                if e > s:
-                    return self._seq_bytes[s:e].decode("ascii")
+            s = int(self._offsets[nid])
+            e = int(self._offsets[nid + 1])
+            if e > s:
+                return self._seq_bytes[s:e].decode("ascii")
         return self._extra[key]
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
             return False
-        if key.isdigit():
-            nid = int(key)
-            if 1 <= nid <= self._max_nid and int(self._node_lens[nid]) > 0:
+        if is_compact_nid_str(key, self._max_nid):
+            if int(self._node_lens[int(key)]) > 0:
                 return True
         return key in self._extra
 
@@ -676,12 +699,10 @@ class CompactNodeStore(collections.abc.Mapping[str, str]):
         return self._node_lens
 
     def node_len(self, key: str) -> int:
-        if key.isdigit():
-            nid = int(key)
-            if 1 <= nid <= self._max_nid:
-                length = int(self._node_lens[nid])
-                if length > 0:
-                    return length
+        if is_compact_nid_str(key, self._max_nid):
+            length = int(self._node_lens[int(key)])
+            if length > 0:
+                return length
         return len(self._extra[key])
 
     def node_len_int(self, nid: int) -> int:
@@ -732,10 +753,8 @@ class CompactLinkSet(collections.abc.Set[tuple[str, str, str, str]]):
             return False
         u, uo, v, vo = item
         if (
-            isinstance(u, str)
-            and isinstance(v, str)
-            and u.isdigit()
-            and v.isdigit()
+            is_compact_nid_str(u)
+            and is_compact_nid_str(v)
             and uo in ("+", "-")
             and vo in ("+", "-")
         ):
@@ -818,7 +837,14 @@ class CompactLinkSet(collections.abc.Set[tuple[str, str, str, str]]):
         return -1
 
     def __len__(self) -> int:
-        return int(self._canon_links.shape[0]) * 2 + len(self._extra)
+        arr = self._canon_links
+        n_arr = int(arr.shape[0])
+        if n_arr == 0:
+            return len(self._extra)
+        uc = arr >> np.uint64(32)
+        vc = arr & np.uint64(0xFFFFFFFF)
+        n_self_rev = int(np.count_nonzero(vc == (uc ^ np.uint64(1))))
+        return n_arr * 2 - n_self_rev + len(self._extra)
 
     def __iter__(self) -> Iterator[tuple[str, str, str, str]]:
         for val in self._canon_links.tolist():
@@ -900,14 +926,18 @@ class LazyStepTuple(collections.abc.Sequence[Step]):
             offsets = nodes._offsets
             node_lens = nodes._node_lens
             max_nid = nodes._max_nid
+            extra = nodes._extra
             parts_fast: list[str] = []
             for c in self._codes.tolist():
                 nid = c if c > 0 else -c
-                if nid < 1 or nid > max_nid or int(node_lens[nid]) <= 0:
+                if 1 <= nid <= max_nid and int(node_lens[nid]) > 0:
+                    s = int(offsets[nid])
+                    e = int(offsets[nid + 1])
+                    raw = seq_bytes[s:e].decode("ascii")
+                elif str(nid) in extra:
+                    raw = extra[str(nid)]
+                else:
                     raise InputContractError(f"Unknown node ID '{nid}' in step walk")
-                s = int(offsets[nid])
-                e = int(offsets[nid + 1])
-                raw = seq_bytes[s:e].decode("ascii")
                 parts_fast.append(
                     raw if c > 0 else raw.translate(_REVCOMP_ASCII_TABLE)[::-1]
                 )
@@ -921,12 +951,12 @@ class LazyStepTuple(collections.abc.Sequence[Step]):
             )
         return "".join(parts)
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: object) -> Any:
         if self is other:
             return True
         if isinstance(other, LazyStepTuple):
             return bool(np.array_equal(self._codes, other._codes))
-        if isinstance(other, (tuple, list)):
+        if isinstance(other, tuple):
             if int(self._codes.shape[0]) != len(other):
                 return False
             for c, st in zip(self._codes.tolist(), other):
@@ -942,10 +972,10 @@ class LazyStepTuple(collections.abc.Sequence[Step]):
                 if st.orient != orient or st.node_id != str(nid):
                     return False
             return True
-        return False
+        return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self._codes.tobytes())
+        return hash(tuple(self))
 
 
 _EMPTY_LAZY_STEPS = LazyStepTuple(np.empty(0, dtype=np.int32))
@@ -1333,14 +1363,14 @@ class LazyProvenanceTuple(collections.abc.Sequence[StepProvenance]):
                 return True
         return False
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: object) -> Any:
         if self is other:
             return True
-        if isinstance(other, (Sequence, tuple, list)):
-            if len(self) != len(other):
-                return False
-            return all(a == b for a, b in zip(self, other))
-        return False
+        if isinstance(other, (str, bytes)) or not isinstance(other, Sequence):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        return all(a == b for a, b in zip(self, other))
 
 
 class LazyRefStepRanges(collections.abc.Sequence[tuple[int, int]]):
@@ -1372,7 +1402,7 @@ class LazyRefStepRanges(collections.abc.Sequence[tuple[int, int]]):
         ends = self._cum_offsets[1:].tolist()
         return iter(zip(starts, ends))
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: object) -> Any:
         if self is other:
             return True
         if isinstance(other, LazyRefStepRanges):
@@ -1381,7 +1411,7 @@ class LazyRefStepRanges(collections.abc.Sequence[tuple[int, int]]):
             if len(self) != len(other):
                 return False
             return all(a == b for a, b in zip(self, other))
-        return False
+        return NotImplemented
 
 
 class CompactRefNodeSet(collections.abc.Set[str]):
@@ -1406,10 +1436,9 @@ class CompactRefNodeSet(collections.abc.Set[str]):
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
             return False
-        if key.isdigit():
-            nid = int(key)
-            if 1 <= nid < int(self._mask.shape[0]):
-                return bool(self._mask[nid])
+        if is_compact_nid_str(key, int(self._mask.shape[0]) - 1):
+            if bool(self._mask[int(key)]):
+                return True
         return key in self._extra
 
     def __len__(self) -> int:
@@ -1441,21 +1470,18 @@ class CompactUniqueRefMap(collections.abc.Mapping[str, int]):
         )
 
     def __getitem__(self, key: str) -> int:
-        if isinstance(key, str) and key.isdigit():
-            nid = int(key)
-            if 1 <= nid < int(self._nid_to_rank.shape[0]):
-                r = int(self._nid_to_rank[nid])
-                if r >= 0:
-                    return r
+        if is_compact_nid_str(key, int(self._nid_to_rank.shape[0]) - 1):
+            r = int(self._nid_to_rank[int(key)])
+            if r >= 0:
+                return r
         return self._extra[key]
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
             return False
-        if key.isdigit():
-            nid = int(key)
-            if 1 <= nid < int(self._nid_to_rank.shape[0]):
-                return int(self._nid_to_rank[nid]) >= 0
+        if is_compact_nid_str(key, int(self._nid_to_rank.shape[0]) - 1):
+            if int(self._nid_to_rank[int(key)]) >= 0:
+                return True
         return key in self._extra
 
     def __len__(self) -> int:
@@ -1559,54 +1585,111 @@ class LazyProjectedAnchorSequence(collections.abc.Sequence[ProjectedAnchor]):
         for i in range(len(self)):
             yield self[i]
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: object) -> Any:
         if self is other:
             return True
-        if isinstance(other, (Sequence, list, tuple)):
-            if len(self) != len(other):
-                return False
-            return all(a == b for a, b in zip(self, other))
-        return False
+        if isinstance(other, (str, bytes)) or not isinstance(other, Sequence):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        return all(a == b for a, b in zip(self, other))
+
+
+_VISIT_MISSING = object()
 
 
 class CompactVisitCounts(collections.abc.Mapping[str, int]):
     """
     Compact Mapping[str, int] for per-contig node visit counts on chromosome-scale paths.
-    Stores sorted `int32` arrays of multi-visited node IDs (`count >= 2`) and their counts.
+    Stores sorted `int32` arrays of multi-visited node IDs (`count >= 2`) and their counts,
+    plus optional packed single-visit bitset (`visited_bits`) or sorted `visited_nids`.
     """
 
-    __slots__ = ("_multi_nids", "_multi_counts", "_multi_set")
+    __slots__ = (
+        "_multi_nids",
+        "_multi_counts",
+        "_multi_set",
+        "_visited_bits",
+        "_max_visited_nid",
+        "_visited_nids",
+        "_total_visited",
+    )
 
-    def __init__(self, multi_nids: np.ndarray, multi_counts: np.ndarray) -> None:
+    def __init__(
+        self,
+        multi_nids: np.ndarray,
+        multi_counts: np.ndarray,
+        visited_bits: np.ndarray | None = None,
+        max_visited_nid: int = 0,
+        visited_nids: np.ndarray | None = None,
+        total_visited: int | None = None,
+    ) -> None:
         self._multi_nids = multi_nids
         self._multi_counts = multi_counts
         self._multi_set: frozenset[int] = frozenset(multi_nids.tolist())
+        self._visited_bits = visited_bits
+        self._max_visited_nid = max_visited_nid
+        self._visited_nids = visited_nids
+        self._total_visited = (
+            total_visited
+            if total_visited is not None
+            else int(multi_nids.shape[0])
+        )
+
+    def _has_visited_nid(self, nid: int) -> bool:
+        if self._visited_bits is not None:
+            if 1 <= nid <= self._max_visited_nid:
+                return bool(
+                    (int(self._visited_bits[nid >> 3]) >> (7 - (nid & 7))) & 1
+                )
+            return False
+        if self._visited_nids is not None:
+            v_arr = self._visited_nids
+            n_v = int(v_arr.shape[0])
+            if n_v == 0:
+                return False
+            pos = int(np.searchsorted(v_arr, nid))
+            return pos < n_v and int(v_arr[pos]) == nid
+        return False
 
     def get(self, key: str, default: Any = 0) -> Any:
-        if isinstance(key, str) and key.isdigit():
+        if is_compact_nid_str(key):
             nid = int(key)
-            if nid not in self._multi_set:
-                return default
-            arr = self._multi_nids
-            idx = int(np.searchsorted(arr, nid))
-            return int(self._multi_counts[idx])
+            if nid in self._multi_set:
+                arr = self._multi_nids
+                idx = int(np.searchsorted(arr, nid))
+                return int(self._multi_counts[idx])
+            if self._has_visited_nid(nid):
+                return 1
         return default
 
     def __getitem__(self, key: str) -> int:
-        val = self.get(key, -1)
-        if val < 0:
+        val = self.get(key, _VISIT_MISSING)
+        if val is _VISIT_MISSING:
             raise KeyError(key)
         return int(val)
 
     def __contains__(self, key: object) -> bool:
-        if isinstance(key, str):
-            return self.get(key, -1) >= 0
+        if is_compact_nid_str(key):
+            nid = int(key)
+            return (nid in self._multi_set) or self._has_visited_nid(nid)
         return False
 
     def __len__(self) -> int:
-        return int(self._multi_nids.shape[0])
+        return self._total_visited
 
     def __iter__(self) -> Iterator[str]:
+        if self._visited_bits is not None:
+            unpacked = np.unpackbits(
+                self._visited_bits, count=self._max_visited_nid + 1
+            )
+            for nid in np.flatnonzero(unpacked).tolist():
+                yield str(nid)
+            return
+        if self._visited_nids is not None:
+            for nid in self._visited_nids.tolist():
+                yield str(nid)
+            return
         for nid in self._multi_nids.tolist():
             yield str(nid)
 
@@ -1614,11 +1697,12 @@ class CompactVisitCounts(collections.abc.Mapping[str, int]):
 class CompactRankSet:
     """Compact boolean-mask set of reference step ranks with O(1) min/max tracking."""
 
-    __slots__ = ("_mask", "_count", "_min_val", "_max_val")
+    __slots__ = ("_mask", "_count", "_has_any", "_min_val", "_max_val")
 
     def __init__(self, n_ref: int) -> None:
-        self._mask = np.zeros(n_ref, dtype=bool)
+        self._mask = np.zeros(max(0, int(n_ref)), dtype=bool)
         self._count = 0
+        self._has_any = False
         self._min_val = 10**9
         self._max_val = -1
 
@@ -1627,7 +1711,9 @@ class CompactRankSet:
         if 0 <= ri < int(self._mask.shape[0]):
             if not bool(self._mask[ri]):
                 self._mask[ri] = True
-                self._count += 1
+                if self._count >= 0:
+                    self._count += 1
+                self._has_any = True
             if ri < self._min_val:
                 self._min_val = ri
             if ri > self._max_val:
@@ -1638,22 +1724,28 @@ class CompactRankSet:
         e = min(int(self._mask.shape[0]), int(r_end))
         if s < e:
             self._mask[s:e] = True
-            self._count = max(self._count, e - s)
+            self._has_any = True
+            self._count = -1
             if s < self._min_val:
                 self._min_val = s
             if e - 1 > self._max_val:
                 self._max_val = e - 1
 
     def add_array(self, arr: np.ndarray) -> None:
-        if int(arr.shape[0]) > 0:
-            self._mask[arr] = True
-            self._count = max(self._count, int(arr.shape[0]))
-            lo = int(arr[0])
-            hi = int(arr[-1])
-            if lo < self._min_val:
-                self._min_val = lo
-            if hi > self._max_val:
-                self._max_val = hi
+        arr_np = np.asarray(arr)
+        if arr_np.size > 0:
+            n = int(self._mask.shape[0])
+            valid = arr_np[(arr_np >= 0) & (arr_np < n)]
+            if int(valid.shape[0]) > 0:
+                self._mask[valid] = True
+                self._has_any = True
+                self._count = -1
+                lo = int(valid.min())
+                hi = int(valid.max())
+                if lo < self._min_val:
+                    self._min_val = lo
+                if hi > self._max_val:
+                    self._max_val = hi
 
     def __contains__(self, r: object) -> bool:
         if isinstance(r, (int, np.integer)):
@@ -1663,14 +1755,25 @@ class CompactRankSet:
         return False
 
     def __bool__(self) -> bool:
-        return self._count > 0
+        return self._has_any
 
     def __len__(self) -> int:
+        if not self._has_any:
+            return 0
+        if self._count < 0:
+            self._count = int(
+                np.count_nonzero(self._mask[self._min_val : self._max_val + 1])
+            )
         return self._count
 
     def __iter__(self) -> Iterator[int]:
-        for idx in np.flatnonzero(self._mask).tolist():
-            yield int(idx)
+        if not self._has_any:
+            return
+        offset = self._min_val
+        for rel in np.flatnonzero(
+            self._mask[offset : self._max_val + 1]
+        ).tolist():
+            yield offset + int(rel)
 
 
 class LazyStepOffsetSequence(collections.abc.Sequence[StepOffsetRow]):

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 import collections
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from panflat.models import (
     InputContractError,
+    LazyStepOffsetSequence,
     StepOffsetRow,
     SVEvent,
 )
@@ -314,11 +317,20 @@ def liftover_gff3_lines(
             ins_event_ids_by_pos[ev.ref_start].append(ev.event_id)
 
     active_pos_set: set[int] = set()
-    for row in step_offsets:
-        if row.slot_ins_len > 0:
-            active_pos_set.add(row.ref_start)
-            if row.ref_start not in ins_event_ids_by_pos:
-                ins_event_ids_by_pos[row.ref_start] = []
+    is_lazy_offsets = isinstance(step_offsets, LazyStepOffsetSequence)
+    if is_lazy_offsets:
+        pos_slots = np.flatnonzero(step_offsets.slot_ins_lens > 0)
+        for r_s_val in step_offsets.ref_starts[pos_slots].tolist():
+            r_s_int = int(r_s_val)
+            active_pos_set.add(r_s_int)
+            if r_s_int not in ins_event_ids_by_pos:
+                ins_event_ids_by_pos[r_s_int] = []
+    else:
+        for row in step_offsets:
+            if row.slot_ins_len > 0:
+                active_pos_set.add(row.ref_start)
+                if row.ref_start not in ins_event_ids_by_pos:
+                    ins_event_ids_by_pos[row.ref_start] = []
 
     for ev in seq_ins_events:
         if ev.pan_end > ev.pan_start or not step_offsets:
@@ -327,7 +339,9 @@ def liftover_gff3_lines(
     ins_positions: list[int] = sorted(active_pos_set)
 
     # 3. Build 0-based reference base -> 0-based pan base coordinate mapper
-    ref_starts = [row.ref_start for row in step_offsets]
+    ref_starts: list[int] = (
+        [] if is_lazy_offsets else [row.ref_start for row in step_offsets]
+    )
 
     # Fallback cumulative shifts if step_offsets is empty
     fallback_shifts: dict[int, int] = collections.defaultdict(int)
@@ -341,7 +355,23 @@ def liftover_gff3_lines(
             fallback_shifts[pos] = max(0, max_pe - min_ps)
 
     def pan_base_pos(r: int) -> int:
-        if step_offsets:
+        if is_lazy_offsets:
+            assert isinstance(step_offsets, LazyStepOffsetSequence)
+            if len(step_offsets) > 0:
+                idx = (
+                    int(
+                        np.searchsorted(
+                            step_offsets.ref_starts, r, side="right"
+                        )
+                    )
+                    - 1
+                )
+                if idx < 0:
+                    idx = 0
+                return int(step_offsets.pan_starts[idx]) + (
+                    r - int(step_offsets.ref_starts[idx])
+                )
+        elif step_offsets:
             idx = bisect_right(ref_starts, r) - 1
             if idx < 0:
                 idx = 0
@@ -360,7 +390,9 @@ def liftover_gff3_lines(
 
     # 4. Split splittable features across strictly internal insertions & recalculate CDS phase
     for feat in features:
-        internal_pts = [p for p in ins_positions if feat.s0 < p < feat.e0]
+        lo_p = bisect_right(ins_positions, feat.s0)
+        hi_p = bisect_left(ins_positions, feat.e0)
+        internal_pts = ins_positions[lo_p:hi_p] if lo_p < hi_p else []
         if feat.ftype in SPLITTABLE_FEATURE_TYPES and internal_pts:
             feat.projection_split = True
             bounds = [feat.s0, *internal_pts, feat.e0]
@@ -443,9 +475,9 @@ def liftover_gff3_lines(
             return []
         desc: list[_ParsedGFFFeature] = []
         seen_rows: set[int] = set()
-        queue = list(children_by_parent.get(root_feat.feat_id, ()))
+        queue = collections.deque(children_by_parent.get(root_feat.feat_id, ()))
         while queue:
-            cur = queue.pop(0)
+            cur = queue.popleft()
             if cur.row_idx in seen_rows:
                 continue
             seen_rows.add(cur.row_idx)
@@ -456,7 +488,9 @@ def liftover_gff3_lines(
 
     # 6. Annotate SV statuses, splice_site_proximal_sv, and sv_id on each feature
     for feat in features:
-        internal_pts = [p for p in ins_positions if feat.s0 < p < feat.e0]
+        lo_p = bisect_right(ins_positions, feat.s0)
+        hi_p = bisect_left(ins_positions, feat.e0)
+        internal_pts = ins_positions[lo_p:hi_p] if lo_p < hi_p else []
         if feat.ftype == "CDS":
             if internal_pts:
                 feat.sv_statuses = ["cds_split_by_insertion"]
@@ -498,11 +532,16 @@ def liftover_gff3_lines(
                 if s in status_set
             ]
 
-            proximal_pts = [
-                p
-                for p in ins_positions
-                if min(abs(p - feat.s0), abs(p - feat.e0)) <= splice_window
-            ]
+            lo_s = bisect_left(ins_positions, feat.s0 - splice_window)
+            hi_s = bisect_right(ins_positions, feat.s0 + splice_window)
+            lo_e = bisect_left(ins_positions, feat.e0 - splice_window)
+            hi_e = bisect_right(ins_positions, feat.e0 + splice_window)
+            if hi_s >= lo_e:
+                proximal_pts = ins_positions[lo_s : max(hi_s, hi_e)]
+            else:
+                proximal_pts = (
+                    ins_positions[lo_s:hi_s] + ins_positions[lo_e:hi_e]
+                )
             if proximal_pts:
                 feat.splice_site_proximal = True
                 for p in proximal_pts:
@@ -526,7 +565,11 @@ def liftover_gff3_lines(
         status_set = set()
         ev_ids = []
 
-        internal_pts = [p for p in ins_positions if feat.s0 < p < feat.e0]
+        eff_s0 = min([feat.s0, *(d.s0 for d in desc)]) if desc else feat.s0
+        eff_e0 = max([feat.e0, *(d.e0 for d in desc)]) if desc else feat.e0
+        lo_p = bisect_right(ins_positions, eff_s0)
+        hi_p = bisect_left(ins_positions, eff_e0)
+        internal_pts = ins_positions[lo_p:hi_p] if lo_p < hi_p else []
         for p in internal_pts:
             if any(c.s0 < p < c.e0 for c in desc_cds):
                 status_set.add("cds_split_by_insertion")
@@ -541,8 +584,6 @@ def liftover_gff3_lines(
                 ev_ids.extend(ins_event_ids_by_pos.get(p, ()))
 
         for d in desc:
-            for st in d.sv_statuses:
-                status_set.add(st)
             if d.splice_site_proximal:
                 feat.splice_site_proximal = True
             ev_ids.extend(d.sv_ids)

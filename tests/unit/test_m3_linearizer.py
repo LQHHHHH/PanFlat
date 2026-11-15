@@ -3,13 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
-
-import pytest
 
 from panflat.gfa_io import load_and_validate_inputs, revcomp
 from panflat.linearizer import (
-    CandidateBlock,
     ExtractedCandidate,
     SubproblemStateKey,
     assemble_pan_and_offsets,
@@ -20,7 +16,6 @@ from panflat.linearizer import (
     make_token_str,
     reanchor_deviation,
     run_chromosome_pipeline,
-    screen_and_fold_candidate,
     solve_chromosome,
     solve_parallel_group,
     steps_to_pieces,
@@ -34,7 +29,6 @@ from panflat.models import (
 )
 from tests.e2e.helpers import (
     SyntheticInputBuilder,
-    make_coding_seq,
     make_complex_seq,
     make_satellite_seq,
     mutate_seq_snps,

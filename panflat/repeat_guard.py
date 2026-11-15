@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import collections
+import functools
 import re
 from typing import Any, Literal, Mapping, Sequence
 
@@ -210,35 +210,16 @@ _RC5_LUT = np.array(
     ],
     dtype=np.uint32,
 )
-_REPEAT_MASK_CACHE: dict[str, tuple[list[tuple[int, int]], list[dict[str, Any]]]] = {}
+_REPEAT_CACHE_MAX_SEQ_LEN: int = 200_000
 
 
-def repeat_mask_intervals(
+def _compute_repeat_mask_immutable(
     seq: str,
-) -> tuple[list[tuple[int, int]], list[dict[str, Any]]]:
-    """
-    Shared local repeat masking function (§3.8.4-C & §3.6.6).
-
-    - Only evaluates sequences of length >= 500 bp (`L < 500` returns `([], [])`).
-    - For `500 <= L <= 1000`, evaluates a single full window `[0, L)`.
-    - For `L > 1000`, evaluates 1000 bp windows at 500 bp steps plus a right-aligned
-      tail window `[L - 1000, L)`, deduplicated by window start and sorted ascending.
-    - In each window, computes canonical 15-mer keys `min(kmer, revcomp(kmer))` across
-      pure ACGT 15-mers. If valid 15-mer positions < 90% of `W - 14`, window state is
-      `"unknown"`. Otherwise `singleton_ratio = singletons / valid_positions`;
-      strictly `< 0.30` is `"low"`, `>= 0.30` is `"non-low"`.
-    - For `L > 1000`, at least 2 adjacent `"low"` windows (`"unknown"` breaks runs)
-      form a masked interval equal to their union.
-    - Short-block exception: for `500 <= L <= 1000` (single window), if the single
-      window is `"low"`, masks `[0, L)`.
-    """
+) -> tuple[
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, int, int, int, int, int, float | None, str], ...],
+]:
     seq_len = len(seq)
-    if seq_len < REPEAT_MIN_SEQ_LEN:
-        return [], []
-    cached = _REPEAT_MASK_CACHE.get(seq)
-    if cached is not None:
-        return list(cached[0]), list(cached[1])
-
     if seq_len <= REPEAT_WINDOW_SIZE:
         window_bounds: list[tuple[int, int]] = [(0, seq_len)]
     else:
@@ -279,7 +260,9 @@ def repeat_mask_intervals(
     )
     canon = np.minimum(fwd, rev, out=fwd)
 
-    window_diagnostics: list[dict[str, Any]] = []
+    diag_tuples: list[
+        tuple[int, int, int, int, int, int, float | None, str]
+    ] = []
     for w_s, w_e in window_bounds:
         total_pos = (w_e - w_s) - (REPEAT_KMER_SIZE - 1)
         w_valid = valid_mask[w_s : w_s + total_pos]
@@ -316,44 +299,103 @@ def repeat_mask_intervals(
             else:
                 state = "non-low"
 
-        window_diagnostics.append(
-            {
-                "start": w_s,
-                "end": w_e,
-                "total_positions": total_pos,
-                "valid_positions": valid_pos,
-                "unique_keys": unique_keys,
-                "singleton_count": singleton_count,
-                "singleton_ratio": singleton_ratio,
-                "state": state,
-            }
+        diag_tuples.append(
+            (
+                w_s,
+                w_e,
+                total_pos,
+                valid_pos,
+                unique_keys,
+                singleton_count,
+                singleton_ratio,
+                state,
+            )
         )
 
     # Mask interval construction
-    if len(window_diagnostics) == 1:
+    if len(diag_tuples) == 1:
         # Short-block exception (500 <= L <= 1000)
-        if window_diagnostics[0]["state"] == "low":
-            masked_intervals = [(0, seq_len)]
+        if diag_tuples[0][7] == "low":
+            masked_intervals: list[tuple[int, int]] = [(0, seq_len)]
         else:
             masked_intervals = []
     else:
         raw_masked: list[tuple[int, int]] = []
-        current_run: list[dict[str, Any]] = []
-        for w_diag in window_diagnostics:
-            if w_diag["state"] == "low":
-                current_run.append(w_diag)
+        current_run: list[tuple[int, int]] = []
+        for w_diag in diag_tuples:
+            if w_diag[7] == "low":
+                current_run.append((w_diag[0], w_diag[1]))
             else:
                 if len(current_run) >= 2:
-                    raw_masked.append((current_run[0]["start"], current_run[-1]["end"]))
+                    raw_masked.append((current_run[0][0], current_run[-1][1]))
                 current_run = []
         if len(current_run) >= 2:
-            raw_masked.append((current_run[0]["start"], current_run[-1]["end"]))
+            raw_masked.append((current_run[0][0], current_run[-1][1]))
         masked_intervals = merge_intervals(raw_masked)
 
-    if len(_REPEAT_MASK_CACHE) >= 32:
-        _REPEAT_MASK_CACHE.clear()
-    _REPEAT_MASK_CACHE[seq] = (masked_intervals, window_diagnostics)
-    return list(masked_intervals), list(window_diagnostics)
+    return tuple(masked_intervals), tuple(diag_tuples)
+
+
+@functools.lru_cache(maxsize=32)
+def _repeat_mask_intervals_cached(
+    seq: str,
+) -> tuple[
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, int, int, int, int, int, float | None, str], ...],
+]:
+    return _compute_repeat_mask_immutable(seq)
+
+
+def repeat_mask_intervals(
+    seq: str,
+) -> tuple[list[tuple[int, int]], list[dict[str, Any]]]:
+    """
+    Shared local repeat masking function (§3.8.4-C & §3.6.6).
+
+    - Only evaluates sequences of length >= 500 bp (`L < 500` returns `([], [])`).
+    - For `500 <= L <= 1000`, evaluates a single full window `[0, L)`.
+    - For `L > 1000`, evaluates 1000 bp windows at 500 bp steps plus a right-aligned
+      tail window `[L - 1000, L)`, deduplicated by window start and sorted ascending.
+    - In each window, computes canonical 15-mer keys `min(kmer, revcomp(kmer))` across
+      pure ACGT 15-mers. If valid 15-mer positions < 90% of `W - 14`, window state is
+      `"unknown"`. Otherwise `singleton_ratio = singletons / valid_positions`;
+      strictly `< 0.30` is `"low"`, `>= 0.30` is `"non-low"`.
+    - For `L > 1000`, at least 2 adjacent `"low"` windows (`"unknown"` breaks runs)
+      form a masked interval equal to their union.
+    - Short-block exception: for `500 <= L <= 1000` (single window), if the single
+      window is `"low"`, masks `[0, L)`.
+    """
+    seq_len = len(seq)
+    if seq_len < REPEAT_MIN_SEQ_LEN:
+        return [], []
+    if seq_len <= _REPEAT_CACHE_MAX_SEQ_LEN:
+        masked_tup, diag_tup = _repeat_mask_intervals_cached(seq)
+    else:
+        masked_tup, diag_tup = _compute_repeat_mask_immutable(seq)
+
+    window_diagnostics: list[dict[str, Any]] = [
+        {
+            "start": w_s,
+            "end": w_e,
+            "total_positions": total_pos,
+            "valid_positions": valid_pos,
+            "unique_keys": unique_keys,
+            "singleton_count": singleton_count,
+            "singleton_ratio": singleton_ratio,
+            "state": state,
+        }
+        for (
+            w_s,
+            w_e,
+            total_pos,
+            valid_pos,
+            unique_keys,
+            singleton_count,
+            singleton_ratio,
+            state,
+        ) in diag_tup
+    ]
+    return list(masked_tup), window_diagnostics
 
 
 def slice_candidate_by_intervals(
