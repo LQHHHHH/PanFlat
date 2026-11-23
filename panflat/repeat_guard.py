@@ -742,6 +742,7 @@ def subtract_reference_intervals_mappy(
     ref_region_seq: str,
     min_sv_len: int = 50,
     aligner: Any | None = None,
+    buf: Any | None = None,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], int]:
     """
     Reference interval subtraction using `mappy` (`preset='asm20'`, `cs=True`) (§3.8.4-B).
@@ -769,7 +770,11 @@ def subtract_reference_intervals_mappy(
         aligner = mappy.Aligner(seq=ref_region_seq.upper(), preset="asm20")
 
     num_blocks = (q_len + REF_SUB_BLOCK_SIZE - 1) // REF_SUB_BLOCK_SIZE
-    primary_hits = list(aligner.map(q_upper, cs=True))
+    primary_hits = list(
+        aligner.map(q_upper, buf=buf, cs=True)
+        if buf is not None
+        else aligner.map(q_upper, cs=True)
+    )
     all_hit_masked, all_hit_aligned = _evaluate_mappy_hits_on_blocks(
         hits=primary_hits,
         query_offset=0,
@@ -800,7 +805,11 @@ def subtract_reference_intervals_mappy(
                 and (blk_s, blk_e) not in seen_slices
             ):
                 seen_slices.add((blk_s, blk_e))
-                sub_hits = list(aligner.map(q_upper[blk_s:blk_e], cs=True))
+                sub_hits = list(
+                    aligner.map(q_upper[blk_s:blk_e], buf=buf, cs=True)
+                    if buf is not None
+                    else aligner.map(q_upper[blk_s:blk_e], cs=True)
+                )
                 if sub_hits:
                     extra_masked, extra_aligned = _evaluate_mappy_hits_on_blocks(
                         hits=sub_hits,

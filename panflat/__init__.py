@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+import os as _os
+
+for _env_var in (
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    _os.environ.setdefault(_env_var, "1")
+del _env_var
+
 from panflat.models import (
     CENTROMERE_TSV_COLUMNS,
     DEFAULT_NO_FASTA_REASONS,

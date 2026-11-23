@@ -4,9 +4,19 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import sys
 import time
 from typing import Sequence
+
+for _env_var in (
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_env_var, "1")
+del _env_var
 
 from panflat.gfa_io import load_and_validate_inputs, validate_build_config
 from panflat.linearizer import run_chromosome_pipeline

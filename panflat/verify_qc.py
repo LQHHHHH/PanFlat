@@ -5,11 +5,14 @@ from __future__ import annotations
 from array import array
 from bisect import bisect_right
 import collections
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import random
 import re
+import threading
+import time
 from typing import Any, Mapping, Sequence
 
 import mappy
@@ -29,6 +32,7 @@ from panflat.models import (
     VerificationReport,
     is_compact_nid_str,
 )
+from panflat.progress import log_progress
 
 OFFSETS_HEADER: list[str] = [
     "chrom",
@@ -168,6 +172,104 @@ def _reconstruct_ref_seq_from_result(result: ChromosomeBuildResult, pan_up: str)
     return "".join(parts)
 
 
+def _map_queries_parallel(
+    aligner_main: mappy.Aligner | None,
+    aligner_short: mappy.Aligner | None,
+    query_indices: Sequence[int],
+    piece_bytes: Sequence[bytes],
+    piece_lens: Sequence[int],
+    n_threads: int,
+    t_starts: Sequence[int] | None = None,
+    t_ends: Sequence[int] | None = None,
+) -> list[tuple[int, list[tuple[int, int, float]]]]:
+    """
+    Map `query_indices` against read-only `aligner_main` (and optional `aligner_short` for
+    pieces `<= 500 bp`) using C-level GIL-free `mappy.ThreadBuffer` multithreading,
+    pre-encoded ASCII bytes, and adaptive LPT dynamic work stealing.
+    """
+    if (aligner_main is None and aligner_short is None) or not query_indices:
+        return []
+
+    ordered_q = sorted(query_indices, key=lambda idx: (-piece_lens[idx], idx))
+    n_q = len(ordered_q)
+    has_tbuf = hasattr(mappy, "ThreadBuffer")
+    workers = min(max(1, int(n_threads)), n_q) if has_tbuf else 1
+    check_sep = t_starts is not None and t_ends is not None
+
+    def _map_one(
+        idx_q: int,
+        buf_main: Any,
+        buf_short: Any,
+    ) -> list[tuple[int, int, float]]:
+        q_b = piece_bytes[idx_q]
+        local_hits: list[tuple[int, int, float]] = []
+        if aligner_main is not None:
+            main_iter = (
+                aligner_main.map(q_b, buf=buf_main)
+                if buf_main is not None
+                else aligner_main.map(q_b)
+            )
+            for hit in main_iter:
+                if hit.blen < 150:
+                    continue
+                if check_sep:
+                    assert t_starts is not None and t_ends is not None
+                    pos_t = bisect_right(t_starts, hit.r_st) - 1
+                    if pos_t < 0 or hit.r_en > t_ends[pos_t]:
+                        continue
+                local_hits.append((hit.q_st, hit.q_en, hit.mlen / hit.blen))
+        if aligner_short is not None and piece_lens[idx_q] <= 500:
+            short_iter = (
+                aligner_short.map(q_b, buf=buf_short)
+                if buf_short is not None
+                else aligner_short.map(q_b)
+            )
+            for hit in short_iter:
+                if hit.blen < 150:
+                    continue
+                if check_sep:
+                    assert t_starts is not None and t_ends is not None
+                    pos_t = bisect_right(t_starts, hit.r_st) - 1
+                    if pos_t < 0 or hit.r_en > t_ends[pos_t]:
+                        continue
+                local_hits.append((hit.q_st, hit.q_en, hit.mlen / hit.blen))
+        return local_hits
+
+    if workers <= 1:
+        buf_main = mappy.ThreadBuffer() if (has_tbuf and aligner_main is not None) else None
+        buf_short = mappy.ThreadBuffer() if (has_tbuf and aligner_short is not None) else None
+        return [(idx_q, _map_one(idx_q, buf_main, buf_short)) for idx_q in ordered_q]
+
+    slot_hits: list[list[tuple[int, int, float]]] = [[] for _ in range(n_q)]
+    cursor = 0
+    cursor_lock = threading.Lock()
+
+    def _worker() -> None:
+        nonlocal cursor
+        buf_main = mappy.ThreadBuffer() if aligner_main is not None else None
+        buf_short = mappy.ThreadBuffer() if aligner_short is not None else None
+        while True:
+            with cursor_lock:
+                start = cursor
+                if start >= n_q:
+                    return
+                if piece_lens[ordered_q[start]] >= 2000:
+                    step = 1
+                else:
+                    step = min(8, max(1, (n_q - start) // (workers * 4)))
+                end = min(n_q, start + step)
+                cursor = end
+            for pos in range(start, end):
+                slot_hits[pos] = _map_one(ordered_q[pos], buf_main, buf_short)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_worker) for _ in range(workers)]
+        for fut in futs:
+            fut.result()
+
+    return list(zip(ordered_q, slot_hits))
+
+
 def run_qc(
     result: ChromosomeBuildResult,
     config: BuildConfig | None = None,
@@ -178,6 +280,7 @@ def run_qc(
     so 100% self-hits never suppress ~90–92% homologs via `minimap2` `pri_ratio = 0.80`,
     while keeping index builds `O(1)` in chromosome size (`O(|pan.fa| + log M * sum |piece|)`).
     """
+    n_threads = max(1, int(config.threads)) if config is not None else 1
     short_lengths: list[int] = []
     long_rows: list[dict[str, Any]] = []
 
@@ -226,6 +329,7 @@ def run_qc(
             p_e = int(r["pan_end"])
             piece_lens.append(p_e - p_s)
             piece_seqs.append(str(r.get("seq") or pan_up[p_s:p_e]).upper())
+        piece_bytes = [s.encode("ascii") for s in piece_seqs]
 
         if has_step_offsets:
             stage1_target_seq = _reconstruct_ref_seq_from_result(result, pan_up)
@@ -241,6 +345,7 @@ def run_qc(
         need_short = any(pl <= 500 for pl in piece_lens)
 
         # Stage 1: Query every long piece against contiguous reference sequence
+        t_s1 = time.monotonic()
         aligner_asm20 = (
             mappy.Aligner(seq=stage1_target_seq, preset="asm20", best_n=50)
             if stage1_target_seq
@@ -258,44 +363,54 @@ def run_qc(
             if (stage1_target_seq and need_short)
             else None
         )
-        for idx_r, seq in enumerate(piece_seqs):
-            raw_hits = (
-                list(aligner_asm20.map(seq))
-                if aligner_asm20 is not None
-                else []
-            )
-            if aligner_short is not None and piece_lens[idx_r] <= 500:
-                raw_hits.extend(aligner_short.map(seq))
-            hits_info = piece_hits_by_idx[idx_r]
-            ref_hits_info = stage1_ref_hits_by_idx[idx_r]
-            for hit in raw_hits:
-                if hit.blen < 150:
-                    continue
-                h_tup = (hit.q_st, hit.q_en, hit.mlen / hit.blen)
-                hits_info.append(h_tup)
+        stage1_results = _map_queries_parallel(
+            aligner_main=aligner_asm20,
+            aligner_short=aligner_short,
+            query_indices=range(len(long_rows)),
+            piece_bytes=piece_bytes,
+            piece_lens=piece_lens,
+            n_threads=n_threads,
+        )
+        for idx_r, q_hits in stage1_results:
+            if q_hits:
+                piece_hits_by_idx[idx_r].extend(q_hits)
                 if has_step_offsets:
-                    ref_hits_info.append(h_tup)
-        del aligner_asm20, aligner_short, stage1_target_seq
+                    stage1_ref_hits_by_idx[idx_r].extend(q_hits)
+        del aligner_asm20, aligner_short, stage1_target_seq, stage1_results
+        log_progress(
+            f"    --qc Stage 1 (ref alignment): {len(long_rows):,} pieces "
+            f"({long_bp:,} bp, threads={min(n_threads, len(long_rows))}) "
+            f"done in {time.monotonic() - t_s1:.2f}s"
+        )
 
         # Stage 2: Bitwise dyadic halving across long pieces for exact piece-to-piece hits without self-hits
         n_long = len(long_rows)
         if n_long >= 2:
             sep = "N" * 200
             n_bits = (n_long - 1).bit_length()
+            total_rounds = 2 * n_bits
+            round_idx = 0
             for bit_idx in range(n_bits):
                 for target_bit in (0, 1):
-                    target_seqs = [
-                        piece_seqs[j]
+                    t_round = time.monotonic()
+                    target_indices = [
+                        j
                         for j in range(n_long)
                         if ((j >> bit_idx) & 1) == target_bit
                     ]
-                    if not target_seqs:
+                    query_indices = [
+                        j
+                        for j in range(n_long)
+                        if ((j >> bit_idx) & 1) != target_bit
+                    ]
+                    if not target_indices or not query_indices:
                         continue
                     t_starts: list[int] = []
                     t_ends: list[int] = []
                     t_chunks: list[str] = []
                     cur_off = 0
-                    for idx_t, t_seq in enumerate(target_seqs):
+                    for idx_t, j in enumerate(target_indices):
+                        t_seq = piece_seqs[j]
                         if idx_t > 0:
                             t_chunks.append(sep)
                             cur_off += len(sep)
@@ -307,6 +422,9 @@ def run_qc(
                     sub_asm20 = mappy.Aligner(
                         seq=subset_seq, preset="asm20", best_n=50
                     )
+                    round_need_short = need_short and any(
+                        piece_lens[q] <= 500 for q in query_indices
+                    )
                     sub_short = (
                         mappy.Aligner(
                             seq=subset_seq,
@@ -316,25 +434,30 @@ def run_qc(
                             min_chain_score=20,
                             best_n=50,
                         )
-                        if need_short
+                        if round_need_short
                         else None
                     )
-                    for idx_q in range(n_long):
-                        if ((idx_q >> bit_idx) & 1) == target_bit:
-                            continue
-                        q_seq = piece_seqs[idx_q]
-                        p_hits = list(sub_asm20.map(q_seq))
-                        if sub_short is not None and piece_lens[idx_q] <= 500:
-                            p_hits.extend(sub_short.map(q_seq))
-                        hits_info = piece_hits_by_idx[idx_q]
-                        for hit in p_hits:
-                            if hit.blen < 150:
-                                continue
-                            pos_t = bisect_right(t_starts, hit.r_st) - 1
-                            if pos_t >= 0 and hit.r_en <= t_ends[pos_t]:
-                                hits_info.append(
-                                    (hit.q_st, hit.q_en, hit.mlen / hit.blen)
-                                )
+                    round_results = _map_queries_parallel(
+                        aligner_main=sub_asm20,
+                        aligner_short=sub_short,
+                        query_indices=query_indices,
+                        piece_bytes=piece_bytes,
+                        piece_lens=piece_lens,
+                        n_threads=n_threads,
+                        t_starts=t_starts,
+                        t_ends=t_ends,
+                    )
+                    for idx_q, q_hits in round_results:
+                        if q_hits:
+                            piece_hits_by_idx[idx_q].extend(q_hits)
+                    del sub_asm20, sub_short, subset_seq, round_results
+                    round_idx += 1
+                    log_progress(
+                        f"    --qc Stage 2 round {round_idx}/{total_rounds}: "
+                        f"targets={len(target_indices):,}, queries={len(query_indices):,} "
+                        f"({time.monotonic() - t_round:.2f}s)"
+                    )
+        del piece_bytes
 
     for tau in (0.90, 0.95, 0.98):
         red_bp = 0

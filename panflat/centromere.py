@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import collections
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import contextlib
 from dataclasses import dataclass
-from typing import AbstractSet, Any, Literal, Mapping, Sequence
+import gc
+import multiprocessing
+import os
+import time
+from typing import AbstractSet, Any, Iterator, Literal, Mapping, Sequence
 
 import mappy
 import numpy as np
@@ -31,6 +37,7 @@ from panflat.models import (
     UnresolvedRecord,
     is_compact_nid_str,
 )
+from panflat.progress import log_progress
 from panflat.repeat_guard import (
     REPEAT_KMER_SIZE,
     REPEAT_MIN_SEQ_LEN,
@@ -41,6 +48,7 @@ from panflat.repeat_guard import (
     REF_SUB_BLOCK_SIZE,
     REF_SUB_MIN_ALIGNED_RATIO,
     REF_SUB_MIN_IDENTITY,
+    _repeat_mask_intervals_cached,
     check_similarity_merge,
     complement_intervals,
     merge_contiguous_provenance,
@@ -1106,6 +1114,539 @@ class _IslandCluster:
     aligner: Any | None = None
 
 
+@dataclass(slots=True)
+class _CenHapExtractResult:
+    hap_id: str
+    accounting: dict[str, int | str]
+    pending_unresolved: list[
+        tuple[str, int, int, Literal["+", "-"], str, str, bool]
+    ]
+    json_logs: list[dict[str, Any]]
+    accepted: list[_AcceptedIslandCandidate]
+
+
+_CEN_FORK_CTX: (
+    tuple[
+        CentromereRegion,
+        CentromerePartitionResult,
+        GFAGraph,
+        BuildConfig,
+        str,
+        Any | None,
+    ]
+    | None
+) = None
+
+
+def _supports_fork() -> bool:
+    return "fork" in multiprocessing.get_all_start_methods()
+
+
+def _force_fork_enabled() -> bool:
+    return os.environ.get("PANFLAT_FORCE_FORK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _resolve_max_fork_workers(threads: int) -> int:
+    cap = max(1, int(threads))
+    raw = os.environ.get("PANFLAT_MAX_FORK_WORKERS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                cap = min(cap, parsed)
+        except ValueError:
+            pass
+    return cap
+
+
+@contextlib.contextmanager
+def _fork_gc_frozen() -> Iterator[None]:
+    _repeat_mask_intervals_cached.cache_clear()
+    gc.collect()
+    froze = False
+    if hasattr(gc, "freeze") and hasattr(gc, "unfreeze"):
+        gc.freeze()
+        froze = True
+    try:
+        yield
+    finally:
+        if froze:
+            gc.unfreeze()
+
+
+def _make_cen_json_log_entry(
+    region_id: str,
+    hap_id: str,
+    candidate_id: str,
+    parent_id: str | None,
+    src_path: str,
+    src_start: int,
+    src_end: int,
+    src_strand: str,
+    length: int,
+    revisited_fraction: float | None,
+    masked_intervals: Sequence[tuple[int, int]] | None,
+    window_singleton_ratios: list[float | None] | None,
+    final_reason: str,
+    representative_event_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "region_id": region_id,
+        "hap": hap_id,
+        "candidate_id": candidate_id,
+        "parent_id": parent_id,
+        "src_path": src_path,
+        "src_start": src_start,
+        "src_end": src_end,
+        "src_strand": src_strand,
+        "length": length,
+        "revisited_fraction": revisited_fraction,
+        "masked_intervals": (
+            [[int(s), int(e)] for s, e in masked_intervals]
+            if masked_intervals is not None
+            else None
+        ),
+        "window_singleton_ratios": window_singleton_ratios,
+        "final_reason": final_reason,
+        "representative_event_id": representative_event_id,
+    }
+
+
+def _extract_islands_complete_hap_core(
+    hap_id: str,
+    reg: CentromereRegion,
+    partition: CentromerePartitionResult,
+    graph: GFAGraph,
+    config: BuildConfig,
+    ref_region_seq: str,
+    region_aligner: Any | None,
+    *,
+    for_ipc: bool = False,
+) -> _CenHapExtractResult:
+    """Execute Steps A–C for one `(status='complete', ref_status='complete')` haplotype."""
+    hslice = partition.hap_slices[(reg.region_id, hap_id)]
+    node_visit_counts = collections.Counter(
+        st.node_id for st in hslice.inner_steps
+    )
+    runs = _extract_nonref_runs(
+        steps=hslice.inner_steps,
+        provenance=hslice.inner_provenance,
+        nodes=graph.nodes,
+        global_ref_nodes=graph.global_ref_nodes,
+    )
+
+    nonref_input_bp = 0
+    reference_like_bp = 0
+    repeat_like_bp = 0
+    short_bp = 0
+    unresolved_bp = 0
+    accepted_source_bp = 0
+
+    pending_unresolved: list[
+        tuple[str, int, int, Literal["+", "-"], str, str, bool]
+    ] = []
+    json_logs: list[dict[str, Any]] = []
+    accepted: list[_AcceptedIslandCandidate] = []
+
+    tbuf = (
+        mappy.ThreadBuffer()
+        if (
+            isinstance(region_aligner, mappy.Aligner)
+            and hasattr(mappy, "ThreadBuffer")
+        )
+        else None
+    )
+
+    for cand_idx, r in enumerate(runs, start=1):
+        cand_id = f"{reg.region_id}_{hap_id}_cand_{cand_idx}"
+        cand_len = len(r.seq)
+        nonref_input_bp += cand_len
+        rev_frac = (
+            sum(
+                st.step_len(graph.nodes)
+                for st in r.steps
+                if node_visit_counts[st.node_id] > 1
+            )
+            / cand_len
+        )
+
+        # Step A length check
+        if cand_len < config.centromere_min_island:
+            short_bp += cand_len
+            if cand_len >= config.min_sv_len:
+                pending_unresolved.append(
+                    (
+                        r.src_path,
+                        r.src_start,
+                        r.src_end,
+                        r.src_strand,
+                        r.seq,
+                        "CEN_SHORT_RESIDUAL",
+                        True,
+                    )
+                )
+            json_logs.append(
+                _make_cen_json_log_entry(
+                    region_id=reg.region_id,
+                    hap_id=hap_id,
+                    candidate_id=cand_id,
+                    parent_id=None,
+                    src_path=r.src_path,
+                    src_start=r.src_start,
+                    src_end=r.src_end,
+                    src_strand=r.src_strand,
+                    length=cand_len,
+                    revisited_fraction=rev_frac,
+                    masked_intervals=None,
+                    window_singleton_ratios=None,
+                    final_reason="CEN_SHORT_RESIDUAL",
+                    representative_event_id=None,
+                )
+            )
+            continue
+
+        # Step B: Reference interval subtraction (mappy 50bp block grid)
+        b_masked, b_unmasked, b_ref_bp = subtract_reference_intervals_mappy(
+            query_seq=r.seq,
+            ref_region_seq=ref_region_seq,
+            min_sv_len=config.min_sv_len,
+            aligner=region_aligner,
+            buf=tbuf,
+        )
+        reference_like_bp += b_ref_bp
+
+        if not b_unmasked:
+            json_logs.append(
+                _make_cen_json_log_entry(
+                    region_id=reg.region_id,
+                    hap_id=hap_id,
+                    candidate_id=cand_id,
+                    parent_id=None,
+                    src_path=r.src_path,
+                    src_start=r.src_start,
+                    src_end=r.src_end,
+                    src_strand=r.src_strand,
+                    length=cand_len,
+                    revisited_fraction=rev_frac,
+                    masked_intervals=b_masked,
+                    window_singleton_ratios=None,
+                    final_reason="CEN_REFERENCE_LIKE",
+                    representative_event_id=None,
+                )
+            )
+            continue
+
+        if b_masked:
+            json_logs.append(
+                _make_cen_json_log_entry(
+                    region_id=reg.region_id,
+                    hap_id=hap_id,
+                    candidate_id=cand_id,
+                    parent_id=None,
+                    src_path=r.src_path,
+                    src_start=r.src_start,
+                    src_end=r.src_end,
+                    src_strand=r.src_strand,
+                    length=cand_len,
+                    revisited_fraction=rev_frac,
+                    masked_intervals=b_masked,
+                    window_singleton_ratios=None,
+                    final_reason="SPLIT_BY_REFERENCE_SUBTRACTION",
+                    representative_event_id=None,
+                )
+            )
+
+        b_kept_slices, _ = slice_candidate_by_intervals(
+            steps=r.steps,
+            provenance=r.prov,
+            nodes=graph.nodes,
+            keep_intervals=b_unmasked,
+            mask_intervals=b_masked,
+        )
+
+        for b_idx, (_, _, b_steps, b_prov, b_seq) in enumerate(
+            b_kept_slices, start=1
+        ):
+            b_len = len(b_seq)
+            b_id = cand_id if not b_masked else f"{cand_id}_b{b_idx}"
+            b_parent = None if not b_masked else cand_id
+            b_contig_prov = merge_contiguous_provenance(b_prov, b_seq)[0][0]
+            b_rev_frac = (
+                sum(
+                    st.step_len(graph.nodes)
+                    for st in b_steps
+                    if node_visit_counts[st.node_id] > 1
+                )
+                / b_len
+            )
+
+            if b_len < config.centromere_min_island:
+                short_bp += b_len
+                if b_len >= config.min_sv_len:
+                    pending_unresolved.append(
+                        (
+                            b_contig_prov.src_path,
+                            b_contig_prov.src_start,
+                            b_contig_prov.src_end,
+                            b_contig_prov.src_strand,
+                            b_seq,
+                            "CEN_SHORT_RESIDUAL",
+                            True,
+                        )
+                    )
+                json_logs.append(
+                    _make_cen_json_log_entry(
+                        region_id=reg.region_id,
+                        hap_id=hap_id,
+                        candidate_id=b_id,
+                        parent_id=b_parent,
+                        src_path=b_contig_prov.src_path,
+                        src_start=b_contig_prov.src_start,
+                        src_end=b_contig_prov.src_end,
+                        src_strand=b_contig_prov.src_strand,
+                        length=b_len,
+                        revisited_fraction=b_rev_frac,
+                        masked_intervals=None,
+                        window_singleton_ratios=None,
+                        final_reason="CEN_SHORT_RESIDUAL",
+                        representative_event_id=None,
+                    )
+                )
+                continue
+
+            # Step C: Local repeat masking (always executed in extract-islands)
+            c_masked, c_diags = repeat_mask_intervals(b_seq)
+            c_win_ratios: list[float | None] | None = (
+                [d["singleton_ratio"] for d in c_diags] if c_diags else None
+            )
+            c_unmasked = complement_intervals(b_len, c_masked)
+            c_kept_slices, c_masked_slices = slice_candidate_by_intervals(
+                steps=b_steps,
+                provenance=b_prov,
+                nodes=graph.nodes,
+                keep_intervals=c_unmasked,
+                mask_intervals=c_masked,
+            )
+
+            for _, _, m_prov, m_seq in c_masked_slices:
+                m_len = len(m_seq)
+                repeat_like_bp += m_len
+                if m_len >= config.min_sv_len:
+                    m_contig_prov = merge_contiguous_provenance(m_prov, m_seq)[
+                        0
+                    ][0]
+                    pending_unresolved.append(
+                        (
+                            m_contig_prov.src_path,
+                            m_contig_prov.src_start,
+                            m_contig_prov.src_end,
+                            m_contig_prov.src_strand,
+                            m_seq if config.dump_repeat_sequences else "",
+                            "CEN_REPEAT_LIKE",
+                            config.dump_repeat_sequences,
+                        )
+                    )
+
+            if not c_kept_slices:
+                json_logs.append(
+                    _make_cen_json_log_entry(
+                        region_id=reg.region_id,
+                        hap_id=hap_id,
+                        candidate_id=b_id,
+                        parent_id=b_parent,
+                        src_path=b_contig_prov.src_path,
+                        src_start=b_contig_prov.src_start,
+                        src_end=b_contig_prov.src_end,
+                        src_strand=b_contig_prov.src_strand,
+                        length=b_len,
+                        revisited_fraction=b_rev_frac,
+                        masked_intervals=c_masked,
+                        window_singleton_ratios=c_win_ratios,
+                        final_reason="CEN_REPEAT_LIKE",
+                        representative_event_id=None,
+                    )
+                )
+                continue
+
+            if c_masked:
+                json_logs.append(
+                    _make_cen_json_log_entry(
+                        region_id=reg.region_id,
+                        hap_id=hap_id,
+                        candidate_id=b_id,
+                        parent_id=b_parent,
+                        src_path=b_contig_prov.src_path,
+                        src_start=b_contig_prov.src_start,
+                        src_end=b_contig_prov.src_end,
+                        src_strand=b_contig_prov.src_strand,
+                        length=b_len,
+                        revisited_fraction=b_rev_frac,
+                        masked_intervals=c_masked,
+                        window_singleton_ratios=c_win_ratios,
+                        final_reason="SPLIT_BY_REPEAT_MASK",
+                        representative_event_id=None,
+                    )
+                )
+
+            for c_idx, (_, _, c_steps, c_prov, c_seq) in enumerate(
+                c_kept_slices, start=1
+            ):
+                c_len = len(c_seq)
+                c_id = b_id if not c_masked else f"{b_id}_c{c_idx}"
+                # Child residuals always reference raw_block_candidate_id (cand_id)
+                c_parent = b_parent if not c_masked else cand_id
+                c_contig_prov = merge_contiguous_provenance(c_prov, c_seq)[0][0]
+                c_rev_frac = (
+                    sum(
+                        st.step_len(graph.nodes)
+                        for st in c_steps
+                        if node_visit_counts[st.node_id] > 1
+                    )
+                    / c_len
+                )
+
+                if c_len < config.centromere_min_island:
+                    short_bp += c_len
+                    if c_len >= config.min_sv_len:
+                        pending_unresolved.append(
+                            (
+                                c_contig_prov.src_path,
+                                c_contig_prov.src_start,
+                                c_contig_prov.src_end,
+                                c_contig_prov.src_strand,
+                                c_seq,
+                                "CEN_SHORT_RESIDUAL",
+                                True,
+                            )
+                        )
+                    json_logs.append(
+                        _make_cen_json_log_entry(
+                            region_id=reg.region_id,
+                            hap_id=hap_id,
+                            candidate_id=c_id,
+                            parent_id=c_parent,
+                            src_path=c_contig_prov.src_path,
+                            src_start=c_contig_prov.src_start,
+                            src_end=c_contig_prov.src_end,
+                            src_strand=c_contig_prov.src_strand,
+                            length=c_len,
+                            revisited_fraction=c_rev_frac,
+                            masked_intervals=[],
+                            window_singleton_ratios=None,
+                            final_reason="CEN_SHORT_RESIDUAL",
+                            representative_event_id=None,
+                        )
+                    )
+                    continue
+
+                if any(ch not in "ACGTacgt" for ch in c_seq):
+                    unresolved_bp += c_len
+                    pending_unresolved.append(
+                        (
+                            c_contig_prov.src_path,
+                            c_contig_prov.src_start,
+                            c_contig_prov.src_end,
+                            c_contig_prov.src_strand,
+                            c_seq,
+                            "CEN_SEQUENCE_UNCERTAIN",
+                            True,
+                        )
+                    )
+                    json_logs.append(
+                        _make_cen_json_log_entry(
+                            region_id=reg.region_id,
+                            hap_id=hap_id,
+                            candidate_id=c_id,
+                            parent_id=c_parent,
+                            src_path=c_contig_prov.src_path,
+                            src_start=c_contig_prov.src_start,
+                            src_end=c_contig_prov.src_end,
+                            src_strand=c_contig_prov.src_strand,
+                            length=c_len,
+                            revisited_fraction=c_rev_frac,
+                            masked_intervals=None,
+                            window_singleton_ratios=None,
+                            final_reason="CEN_SEQUENCE_UNCERTAIN",
+                            representative_event_id=None,
+                        )
+                    )
+                    continue
+
+                # Accepted candidate island
+                accepted_source_bp += c_len
+                if not c_masked:
+                    sub_ratios = c_win_ratios
+                else:
+                    _, sub_diags = repeat_mask_intervals(c_seq)
+                    sub_ratios = (
+                        [d["singleton_ratio"] for d in sub_diags]
+                        if sub_diags
+                        else None
+                    )
+                accepted.append(
+                    _AcceptedIslandCandidate(
+                        candidate_id=c_id,
+                        parent_id=c_parent,
+                        hap_id=hap_id,
+                        steps=() if for_ipc else c_steps,
+                        prov=c_contig_prov,
+                        seq=c_seq.upper(),
+                        revisited_fraction=c_rev_frac,
+                        masked_intervals=[],
+                        window_singleton_ratios=sub_ratios,
+                    )
+                )
+
+    total_accounted = (
+        reference_like_bp
+        + repeat_like_bp
+        + short_bp
+        + unresolved_bp
+        + accepted_source_bp
+    )
+    if total_accounted != nonref_input_bp:
+        raise InvariantViolationError(
+            f"5-way centromere bp accounting mismatch for ({reg.region_id}, {hap_id}): "
+            f"{total_accounted} != {nonref_input_bp}"
+        )
+
+    return _CenHapExtractResult(
+        hap_id=hap_id,
+        accounting={
+            "nonref_input_bp": nonref_input_bp,
+            "reference_like_bp": reference_like_bp,
+            "repeat_like_bp": repeat_like_bp,
+            "short_bp": short_bp,
+            "unresolved_bp": unresolved_bp,
+            "accepted_source_bp": accepted_source_bp,
+        },
+        pending_unresolved=pending_unresolved,
+        json_logs=json_logs,
+        accepted=accepted,
+    )
+
+
+def _extract_islands_hap_worker(hap_id: str) -> _CenHapExtractResult:
+    ctx = _CEN_FORK_CTX
+    assert ctx is not None
+    reg, partition, graph, config, ref_region_seq, region_aligner = ctx
+    return _extract_islands_complete_hap_core(
+        hap_id=hap_id,
+        reg=reg,
+        partition=partition,
+        graph=graph,
+        config=config,
+        ref_region_seq=ref_region_seq,
+        region_aligner=region_aligner,
+        for_ipc=True,
+    )
+
+
 def process_centromere_regions(
     partition: CentromerePartitionResult,
     graph: GFAGraph,
@@ -1195,26 +1736,22 @@ def process_centromere_regions(
         representative_event_id: str | None,
     ) -> None:
         json_log_entries.append(
-            {
-                "region_id": region_id,
-                "hap": hap_id,
-                "candidate_id": candidate_id,
-                "parent_id": parent_id,
-                "src_path": src_path,
-                "src_start": src_start,
-                "src_end": src_end,
-                "src_strand": src_strand,
-                "length": length,
-                "revisited_fraction": revisited_fraction,
-                "masked_intervals": (
-                    [[int(s), int(e)] for s, e in masked_intervals]
-                    if masked_intervals is not None
-                    else None
-                ),
-                "window_singleton_ratios": window_singleton_ratios,
-                "final_reason": final_reason,
-                "representative_event_id": representative_event_id,
-            }
+            _make_cen_json_log_entry(
+                region_id=region_id,
+                hap_id=hap_id,
+                candidate_id=candidate_id,
+                parent_id=parent_id,
+                src_path=src_path,
+                src_start=src_start,
+                src_end=src_end,
+                src_strand=src_strand,
+                length=length,
+                revisited_fraction=revisited_fraction,
+                masked_intervals=masked_intervals,
+                window_singleton_ratios=window_singleton_ratios,
+                final_reason=final_reason,
+                representative_event_id=representative_event_id,
+            )
         )
 
     for reg in partition.regions:
@@ -1385,6 +1922,72 @@ def process_centromere_regions(
         hap_accounting: dict[str, dict[str, int | str]] = {}
         accepted_candidates: list[_AcceptedIslandCandidate] = []
 
+        work_haps = [
+            h
+            for h in graph.all_haplotypes
+            if h != graph.ref_fragment.hap_id
+            and partition.hap_slices[(reg.region_id, h)].status == "complete"
+            and partition.hap_slices[(reg.region_id, h)].ref_status == "complete"
+        ]
+        total_work_bp = sum(
+            partition.hap_slices[(reg.region_id, h)].l_path or 0
+            for h in work_haps
+        )
+        force_fork = _force_fork_enabled()
+        max_fork_workers = _resolve_max_fork_workers(config.threads)
+        can_fork = config.threads > 1 and _supports_fork()
+        use_fork_cen = (
+            can_fork
+            and (max_fork_workers > 1 or force_fork)
+            and len(work_haps) >= (1 if force_fork else 2)
+            and (
+                force_fork
+                or total_work_bp >= 50_000
+                or len(ref_region_seq) >= 10_000
+            )
+        )
+
+        complete_results_by_hap: dict[str, _CenHapExtractResult] = {}
+        if use_fork_cen:
+            t_cen_fork = time.monotonic()
+            ordered_work_haps = sorted(
+                work_haps,
+                key=lambda h: (
+                    -(partition.hap_slices[(reg.region_id, h)].l_path or 0),
+                    h,
+                ),
+            )
+            n_cen_workers = min(max_fork_workers, len(ordered_work_haps))
+            global _CEN_FORK_CTX
+            _CEN_FORK_CTX = (
+                reg,
+                partition,
+                graph,
+                config,
+                ref_region_seq,
+                region_aligner,
+            )
+            try:
+                with _fork_gc_frozen():
+                    with ProcessPoolExecutor(
+                        max_workers=n_cen_workers,
+                        mp_context=multiprocessing.get_context("fork"),
+                    ) as pool:
+                        futs = [
+                            pool.submit(_extract_islands_hap_worker, h_id)
+                            for h_id in ordered_work_haps
+                        ]
+                        for fut in as_completed(futs):
+                            h_res = fut.result()
+                            complete_results_by_hap[h_res.hap_id] = h_res
+            finally:
+                _CEN_FORK_CTX = None
+            log_progress(
+                f"  Centromere {reg.region_id} extract-islands (fork, "
+                f"workers={n_cen_workers}): {len(ordered_work_haps)} haps "
+                f"done in {time.monotonic() - t_cen_fork:.2f}s"
+            )
+
         for hap_id in graph.all_haplotypes:
             hslice = partition.hap_slices[(reg.region_id, hap_id)]
 
@@ -1492,24 +2095,24 @@ def process_centromere_regions(
                 continue
 
             # hslice.status == "complete"
-            node_visit_counts = collections.Counter(
-                st.node_id for st in hslice.inner_steps
-            )
-            runs = _extract_nonref_runs(
-                steps=hslice.inner_steps,
-                provenance=hslice.inner_provenance,
-                nodes=graph.nodes,
-                global_ref_nodes=graph.global_ref_nodes,
-            )
-
-            nonref_input_bp = 0
-            reference_like_bp = 0
-            repeat_like_bp = 0
-            short_bp = 0
-            unresolved_bp = 0
-            accepted_source_bp = 0
-
             if hslice.ref_status == "gapped":
+                node_visit_counts = collections.Counter(
+                    st.node_id for st in hslice.inner_steps
+                )
+                runs = _extract_nonref_runs(
+                    steps=hslice.inner_steps,
+                    provenance=hslice.inner_provenance,
+                    nodes=graph.nodes,
+                    global_ref_nodes=graph.global_ref_nodes,
+                )
+
+                nonref_input_bp = 0
+                reference_like_bp = 0
+                repeat_like_bp = 0
+                short_bp = 0
+                unresolved_bp = 0
+                accepted_source_bp = 0
+
                 for cand_idx, r in enumerate(runs, start=1):
                     cand_id = f"{reg.region_id}_{hap_id}_cand_{cand_idx}"
                     c_len = len(r.seq)
@@ -1591,345 +2194,42 @@ def process_centromere_regions(
                 continue
 
             # Full Steps A–C for status == "complete" and ref_status == "complete"
-            for cand_idx, r in enumerate(runs, start=1):
-                cand_id = f"{reg.region_id}_{hap_id}_cand_{cand_idx}"
-                cand_len = len(r.seq)
-                nonref_input_bp += cand_len
-                rev_frac = (
-                    sum(
-                        st.step_len(graph.nodes)
-                        for st in r.steps
-                        if node_visit_counts[st.node_id] > 1
-                    )
-                    / cand_len
-                )
-
-                # Step A length check
-                if cand_len < config.centromere_min_island:
-                    short_bp += cand_len
-                    if cand_len >= config.min_sv_len:
-                        _emit_unresolved(
-                            region_id=reg.region_id,
-                            src_path=r.src_path,
-                            src_start=r.src_start,
-                            src_end=r.src_end,
-                            src_strand=r.src_strand,
-                            seq=r.seq,
-                            reason="CEN_SHORT_RESIDUAL",
-                            export_to_fasta=True,
-                        )
-                    _emit_json_log(
-                        region_id=reg.region_id,
-                        hap_id=hap_id,
-                        candidate_id=cand_id,
-                        parent_id=None,
-                        src_path=r.src_path,
-                        src_start=r.src_start,
-                        src_end=r.src_end,
-                        src_strand=r.src_strand,
-                        length=cand_len,
-                        revisited_fraction=rev_frac,
-                        masked_intervals=None,
-                        window_singleton_ratios=None,
-                        final_reason="CEN_SHORT_RESIDUAL",
-                        representative_event_id=None,
-                    )
-                    continue
-
-                # Step B: Reference interval subtraction (mappy 50bp block grid)
-                b_masked, b_unmasked, b_ref_bp = subtract_reference_intervals_mappy(
-                    query_seq=r.seq,
+            h_res = complete_results_by_hap.pop(hap_id, None)
+            if h_res is None:
+                h_res = _extract_islands_complete_hap_core(
+                    hap_id=hap_id,
+                    reg=reg,
+                    partition=partition,
+                    graph=graph,
+                    config=config,
                     ref_region_seq=ref_region_seq,
-                    min_sv_len=config.min_sv_len,
-                    aligner=region_aligner,
+                    region_aligner=region_aligner,
+                    for_ipc=False,
                 )
-                reference_like_bp += b_ref_bp
-
-                if not b_unmasked:
-                    _emit_json_log(
-                        region_id=reg.region_id,
-                        hap_id=hap_id,
-                        candidate_id=cand_id,
-                        parent_id=None,
-                        src_path=r.src_path,
-                        src_start=r.src_start,
-                        src_end=r.src_end,
-                        src_strand=r.src_strand,
-                        length=cand_len,
-                        revisited_fraction=rev_frac,
-                        masked_intervals=b_masked,
-                        window_singleton_ratios=None,
-                        final_reason="CEN_REFERENCE_LIKE",
-                        representative_event_id=None,
-                    )
-                    continue
-
-                if b_masked:
-                    _emit_json_log(
-                        region_id=reg.region_id,
-                        hap_id=hap_id,
-                        candidate_id=cand_id,
-                        parent_id=None,
-                        src_path=r.src_path,
-                        src_start=r.src_start,
-                        src_end=r.src_end,
-                        src_strand=r.src_strand,
-                        length=cand_len,
-                        revisited_fraction=rev_frac,
-                        masked_intervals=b_masked,
-                        window_singleton_ratios=None,
-                        final_reason="SPLIT_BY_REFERENCE_SUBTRACTION",
-                        representative_event_id=None,
-                    )
-
-                b_kept_slices, _ = slice_candidate_by_intervals(
-                    steps=r.steps,
-                    provenance=r.prov,
-                    nodes=graph.nodes,
-                    keep_intervals=b_unmasked,
-                    mask_intervals=b_masked,
+            for (
+                u_src_path,
+                u_src_start,
+                u_src_end,
+                u_src_strand,
+                u_seq,
+                u_reason,
+                u_export,
+            ) in h_res.pending_unresolved:
+                _emit_unresolved(
+                    region_id=reg.region_id,
+                    src_path=u_src_path,
+                    src_start=u_src_start,
+                    src_end=u_src_end,
+                    src_strand=u_src_strand,
+                    seq=u_seq,
+                    reason=u_reason,
+                    export_to_fasta=u_export,
                 )
-
-                for b_idx, (_, _, b_steps, b_prov, b_seq) in enumerate(
-                    b_kept_slices, start=1
-                ):
-                    b_len = len(b_seq)
-                    b_id = cand_id if not b_masked else f"{cand_id}_b{b_idx}"
-                    b_parent = None if not b_masked else cand_id
-                    b_contig_prov = merge_contiguous_provenance(b_prov, b_seq)[0][0]
-                    b_rev_frac = (
-                        sum(
-                            st.step_len(graph.nodes)
-                            for st in b_steps
-                            if node_visit_counts[st.node_id] > 1
-                        )
-                        / b_len
-                    )
-
-                    if b_len < config.centromere_min_island:
-                        short_bp += b_len
-                        if b_len >= config.min_sv_len:
-                            _emit_unresolved(
-                                region_id=reg.region_id,
-                                src_path=b_contig_prov.src_path,
-                                src_start=b_contig_prov.src_start,
-                                src_end=b_contig_prov.src_end,
-                                src_strand=b_contig_prov.src_strand,
-                                seq=b_seq,
-                                reason="CEN_SHORT_RESIDUAL",
-                                export_to_fasta=True,
-                            )
-                        _emit_json_log(
-                            region_id=reg.region_id,
-                            hap_id=hap_id,
-                            candidate_id=b_id,
-                            parent_id=b_parent,
-                            src_path=b_contig_prov.src_path,
-                            src_start=b_contig_prov.src_start,
-                            src_end=b_contig_prov.src_end,
-                            src_strand=b_contig_prov.src_strand,
-                            length=b_len,
-                            revisited_fraction=b_rev_frac,
-                            masked_intervals=None,
-                            window_singleton_ratios=None,
-                            final_reason="CEN_SHORT_RESIDUAL",
-                            representative_event_id=None,
-                        )
-                        continue
-
-                    # Step C: Local repeat masking (always executed in extract-islands)
-                    c_masked, c_diags = repeat_mask_intervals(b_seq)
-                    c_win_ratios: list[float | None] | None = (
-                        [d["singleton_ratio"] for d in c_diags] if c_diags else None
-                    )
-                    c_unmasked = complement_intervals(b_len, c_masked)
-                    c_kept_slices, c_masked_slices = slice_candidate_by_intervals(
-                        steps=b_steps,
-                        provenance=b_prov,
-                        nodes=graph.nodes,
-                        keep_intervals=c_unmasked,
-                        mask_intervals=c_masked,
-                    )
-
-                    for _, _, m_prov, m_seq in c_masked_slices:
-                        m_len = len(m_seq)
-                        repeat_like_bp += m_len
-                        if m_len >= config.min_sv_len:
-                            m_contig_prov = merge_contiguous_provenance(m_prov, m_seq)[
-                                0
-                            ][0]
-                            _emit_unresolved(
-                                region_id=reg.region_id,
-                                src_path=m_contig_prov.src_path,
-                                src_start=m_contig_prov.src_start,
-                                src_end=m_contig_prov.src_end,
-                                src_strand=m_contig_prov.src_strand,
-                                seq=m_seq,
-                                reason="CEN_REPEAT_LIKE",
-                                export_to_fasta=config.dump_repeat_sequences,
-                            )
-
-                    if not c_kept_slices:
-                        _emit_json_log(
-                            region_id=reg.region_id,
-                            hap_id=hap_id,
-                            candidate_id=b_id,
-                            parent_id=b_parent,
-                            src_path=b_contig_prov.src_path,
-                            src_start=b_contig_prov.src_start,
-                            src_end=b_contig_prov.src_end,
-                            src_strand=b_contig_prov.src_strand,
-                            length=b_len,
-                            revisited_fraction=b_rev_frac,
-                            masked_intervals=c_masked,
-                            window_singleton_ratios=c_win_ratios,
-                            final_reason="CEN_REPEAT_LIKE",
-                            representative_event_id=None,
-                        )
-                        continue
-
-                    if c_masked:
-                        _emit_json_log(
-                            region_id=reg.region_id,
-                            hap_id=hap_id,
-                            candidate_id=b_id,
-                            parent_id=b_parent,
-                            src_path=b_contig_prov.src_path,
-                            src_start=b_contig_prov.src_start,
-                            src_end=b_contig_prov.src_end,
-                            src_strand=b_contig_prov.src_strand,
-                            length=b_len,
-                            revisited_fraction=b_rev_frac,
-                            masked_intervals=c_masked,
-                            window_singleton_ratios=c_win_ratios,
-                            final_reason="SPLIT_BY_REPEAT_MASK",
-                            representative_event_id=None,
-                        )
-
-                    for c_idx, (_, _, c_steps, c_prov, c_seq) in enumerate(
-                        c_kept_slices, start=1
-                    ):
-                        c_len = len(c_seq)
-                        c_id = b_id if not c_masked else f"{b_id}_c{c_idx}"
-                        # Child residuals always reference raw_block_candidate_id (cand_id)
-                        c_parent = b_parent if not c_masked else cand_id
-                        c_contig_prov = merge_contiguous_provenance(c_prov, c_seq)[0][0]
-                        c_rev_frac = (
-                            sum(
-                                st.step_len(graph.nodes)
-                                for st in c_steps
-                                if node_visit_counts[st.node_id] > 1
-                            )
-                            / c_len
-                        )
-
-                        if c_len < config.centromere_min_island:
-                            short_bp += c_len
-                            if c_len >= config.min_sv_len:
-                                _emit_unresolved(
-                                    region_id=reg.region_id,
-                                    src_path=c_contig_prov.src_path,
-                                    src_start=c_contig_prov.src_start,
-                                    src_end=c_contig_prov.src_end,
-                                    src_strand=c_contig_prov.src_strand,
-                                    seq=c_seq,
-                                    reason="CEN_SHORT_RESIDUAL",
-                                    export_to_fasta=True,
-                                )
-                            _emit_json_log(
-                                region_id=reg.region_id,
-                                hap_id=hap_id,
-                                candidate_id=c_id,
-                                parent_id=c_parent,
-                                src_path=c_contig_prov.src_path,
-                                src_start=c_contig_prov.src_start,
-                                src_end=c_contig_prov.src_end,
-                                src_strand=c_contig_prov.src_strand,
-                                length=c_len,
-                                revisited_fraction=c_rev_frac,
-                                masked_intervals=[],
-                                window_singleton_ratios=None,
-                                final_reason="CEN_SHORT_RESIDUAL",
-                                representative_event_id=None,
-                            )
-                            continue
-
-                        if any(ch not in "ACGTacgt" for ch in c_seq):
-                            unresolved_bp += c_len
-                            _emit_unresolved(
-                                region_id=reg.region_id,
-                                src_path=c_contig_prov.src_path,
-                                src_start=c_contig_prov.src_start,
-                                src_end=c_contig_prov.src_end,
-                                src_strand=c_contig_prov.src_strand,
-                                seq=c_seq,
-                                reason="CEN_SEQUENCE_UNCERTAIN",
-                                export_to_fasta=True,
-                            )
-                            _emit_json_log(
-                                region_id=reg.region_id,
-                                hap_id=hap_id,
-                                candidate_id=c_id,
-                                parent_id=c_parent,
-                                src_path=c_contig_prov.src_path,
-                                src_start=c_contig_prov.src_start,
-                                src_end=c_contig_prov.src_end,
-                                src_strand=c_contig_prov.src_strand,
-                                length=c_len,
-                                revisited_fraction=c_rev_frac,
-                                masked_intervals=None,
-                                window_singleton_ratios=None,
-                                final_reason="CEN_SEQUENCE_UNCERTAIN",
-                                representative_event_id=None,
-                            )
-                            continue
-
-                        # Accepted candidate island
-                        accepted_source_bp += c_len
-                        if not c_masked:
-                            sub_ratios = c_win_ratios
-                        else:
-                            _, sub_diags = repeat_mask_intervals(c_seq)
-                            sub_ratios = (
-                                [d["singleton_ratio"] for d in sub_diags]
-                                if sub_diags
-                                else None
-                            )
-                        accepted_candidates.append(
-                            _AcceptedIslandCandidate(
-                                candidate_id=c_id,
-                                parent_id=c_parent,
-                                hap_id=hap_id,
-                                steps=c_steps,
-                                prov=c_contig_prov,
-                                seq=c_seq.upper(),
-                                revisited_fraction=c_rev_frac,
-                                masked_intervals=[],
-                                window_singleton_ratios=sub_ratios,
-                            )
-                        )
-
-            total_accounted = (
-                reference_like_bp
-                + repeat_like_bp
-                + short_bp
-                + unresolved_bp
-                + accepted_source_bp
-            )
-            if total_accounted != nonref_input_bp:
-                raise InvariantViolationError(
-                    f"5-way centromere bp accounting mismatch for ({reg.region_id}, {hap_id}): "
-                    f"{total_accounted} != {nonref_input_bp}"
-                )
-
-            hap_accounting[hap_id] = {
-                "nonref_input_bp": nonref_input_bp,
-                "reference_like_bp": reference_like_bp,
-                "repeat_like_bp": repeat_like_bp,
-                "short_bp": short_bp,
-                "unresolved_bp": unresolved_bp,
-                "accepted_source_bp": accepted_source_bp,
-            }
+            if h_res.json_logs:
+                json_log_entries.extend(h_res.json_logs)
+            if h_res.accepted:
+                accepted_candidates.extend(h_res.accepted)
+            hap_accounting[hap_id] = h_res.accounting
 
         # Step D: Exact deduplication, 4-criterion clustering, and mounting at ref_start(v)
         hap_supported_events: dict[str, list[str]] = collections.defaultdict(list)

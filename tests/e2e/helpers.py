@@ -976,10 +976,17 @@ def run_panflat_cli(
     args: Sequence[str | Path],
     cwd: Path | None = None,
     check: bool = True,
+    extra_env: Mapping[str, str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke `python3 -m panflat.cli` in a subprocess with PYTHONPATH set to PROJECT_ROOT."""
     cmd = [sys.executable, "-m", "panflat.cli", *[str(a) for a in args]]
     env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT)}
+    if extra_env is not None:
+        for key, val in extra_env.items():
+            if val is None:
+                env.pop(key, None)
+            else:
+                env[key] = val
     proc = subprocess.run(
         cmd,
         cwd=str(cwd or PROJECT_ROOT),
@@ -1004,6 +1011,7 @@ def run_build(
     out_prefix: Path | str | None = None,
     include_bed: bool = True,
     include_gff: bool = True,
+    extra_env: Mapping[str, str | None] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], OutputBundle | None]:
     """Run `panflat build` on `inputs` and return `(CompletedProcess, OutputBundle | None)`."""
     prefix = Path(out_prefix) if out_prefix is not None else inputs.out_prefix
@@ -1025,7 +1033,7 @@ def run_build(
         args.extend(["--centromere-bed", inputs.bed_path])
     args.extend(extra_args)
 
-    proc = run_panflat_cli(args, check=check)
+    proc = run_panflat_cli(args, check=check, extra_env=extra_env)
     bundle = OutputBundle(prefix) if proc.returncode == 0 else None
     return (proc, bundle)
 

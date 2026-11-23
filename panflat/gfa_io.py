@@ -532,6 +532,7 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
     p_line_offsets: list[tuple[int, int]] = []
     w_line_offsets: list[tuple[int, int]] = []
 
+    t_sl = time.monotonic()
     with gfa_file.open("rb") as fh:
         line_no = 0
         cur_byte_offset = 0
@@ -865,6 +866,13 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
 
     links_store = CompactLinkSet(canon_links=canon_links_np, extra=extra_links_set)
     use_fast_int_paths = (len(extra_nodes) == 0) and (len(extra_links_set) == 0)
+    n_canon_links = int(canon_links_np.shape[0]) + (len(extra_links_set) // 2)
+    log_progress(
+        f"  GFA S/L parsed ({time.monotonic() - t_sl:.2f}s): "
+        f"nodes={len(nodes_store):,}, links={n_canon_links:,}, "
+        f"P={len(p_line_offsets):,}, W={len(w_line_offsets):,}"
+    )
+    t_pw = time.monotonic()
 
     # 2. Stream P and W lines by seeking to their byte offsets (one line in memory at a time)
     all_fragments: list[PathFragment] = []
@@ -1258,6 +1266,13 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     f"'{name1}' [{s1}, {e1}) overlaps '{name2}' [{s2}, {e2}) (§2.1)"
                 )
 
+    log_progress(
+        f"  GFA P/W parsed ({time.monotonic() - t_pw:.2f}s): "
+        f"fragments={len(all_fragments):,} "
+        f"(P={len(p_line_offsets):,}, W={len(w_line_offsets):,})"
+    )
+    t_fa = time.monotonic()
+
     # 3. Match unique reference path by --backbone-prefix (PanSN-boundary-aware + primary-hap fallback)
     prefix = config.backbone_prefix
     matched_indices: list[int] = []
@@ -1365,6 +1380,10 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                     f"GFA='{b_gfa}' vs FASTA='{b_fa}'"
                 )
     del assembled_ref
+    log_progress(
+        f"  Reference FASTA validated ({time.monotonic() - t_fa:.2f}s): "
+        f"chrom={ref_chrom}, len={len(ref_seq):,} bp"
+    )
 
     # Validate optional centromere BED and reference GFF3 against reference chromosome and length
     cen_bed_count: int | None = None

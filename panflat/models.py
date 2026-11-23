@@ -979,6 +979,7 @@ class LazyStepTuple(collections.abc.Sequence[Step]):
 
 
 _EMPTY_LAZY_STEPS = LazyStepTuple(np.empty(0, dtype=np.int32))
+_EMPTY_NODE_LENS = np.empty(0, dtype=np.int32)
 
 
 class LazyProvenanceTuple(collections.abc.Sequence[StepProvenance]):
@@ -1245,6 +1246,28 @@ class LazyProvenanceTuple(collections.abc.Sequence[StepProvenance]):
                 total_bp=bp_len,
             )
         return tuple(self[i] for i in range(m))
+
+    def without_node_lens(self) -> LazyProvenanceTuple:
+        """Return a shallow view with `_node_lens` and `_cum_cache` cleared for zero-copy IPC."""
+        return LazyProvenanceTuple(
+            src_hap=self.src_hap,
+            src_path=self.src_path,
+            base_offset=self.base_offset,
+            orig_codes=self._orig_codes,
+            node_lens=_EMPTY_NODE_LENS,
+            cum_cache=[None],
+            slice_start=self._slice_start,
+            slice_end=self._slice_end,
+            is_contig_flipped=self._is_contig_flipped,
+            inv_intervals=self._inv_intervals,
+            inv_starts=self._inv_starts,
+            total_bp=self._total_bp,
+        )
+
+    def rebind_node_lens(self, node_lens: np.ndarray) -> LazyProvenanceTuple:
+        """Rebind `_node_lens` after IPC deserialization and return self."""
+        self._node_lens = node_lens
+        return self
 
     def merged_runs(self) -> list[tuple[StepProvenance, int, int]]:
         """
@@ -1618,7 +1641,7 @@ class CompactVisitCounts(collections.abc.Mapping[str, int]):
     def __init__(
         self,
         multi_nids: np.ndarray,
-        multi_counts: np.ndarray,
+        multi_counts: np.ndarray | None = None,
         visited_bits: np.ndarray | None = None,
         max_visited_nid: int = 0,
         visited_nids: np.ndarray | None = None,
@@ -1656,6 +1679,8 @@ class CompactVisitCounts(collections.abc.Mapping[str, int]):
         if is_compact_nid_str(key):
             nid = int(key)
             if nid in self._multi_set:
+                if self._multi_counts is None:
+                    return 2
                 arr = self._multi_nids
                 idx = int(np.searchsorted(arr, nid))
                 return int(self._multi_counts[idx])
