@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Any, Iterator, Mapping, Sequence, TextIO
 
 import numpy as np
@@ -20,6 +21,7 @@ from panflat.models import (
     LazyStepOffsetSequence,
     StepOffsetRow,
 )
+from panflat.progress import log_progress
 from panflat.verify_qc import (
     INSERTS_HEADER,
     OFFSETS_HEADER,
@@ -140,6 +142,7 @@ def write_build_outputs(
 
     # Compute lifted GFF3 lines if --ref-gff was provided and not yet populated
     if config.ref_gff is not None and not result.lifted_gff_lines:
+        t_gff = time.monotonic()
         lifted_gff_lines: tuple[str, ...] = tuple(
             liftover_gff3(
                 gff_path=config.ref_gff,
@@ -148,6 +151,10 @@ def write_build_outputs(
                 insertion_events=result.sv_events,
                 splice_window=config.splice_window,
             )
+        )
+        log_progress(
+            f"  GFF3 liftover complete ({time.monotonic() - t_gff:.2f}s): "
+            f"{len(lifted_gff_lines):,} lines"
         )
     else:
         lifted_gff_lines = result.lifted_gff_lines
@@ -176,8 +183,13 @@ def write_build_outputs(
             )
 
     if config.qc and "qc_enabled" not in summary_metrics:
+        t_qc = time.monotonic()
+        log_progress("  Running --qc alignment redundancy analysis...")
         qc_metrics = run_qc(result, config)
         summary_metrics.update(qc_metrics)
+        log_progress(
+            f"  Alignment redundancy --qc complete ({time.monotonic() - t_qc:.2f}s)"
+        )
 
     written: dict[str, str] = {}
 

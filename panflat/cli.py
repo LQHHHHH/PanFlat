@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import gc
 import sys
+import time
 from typing import Sequence
 
 from panflat.gfa_io import load_and_validate_inputs, validate_build_config
 from panflat.linearizer import run_chromosome_pipeline
 from panflat.models import BuildConfig, CLIArgumentError, PanFlatError
+from panflat.progress import log_progress
 from panflat.verify_qc import verify_build_outputs
 from panflat.writers import merge_chromosomes, write_build_outputs
 
@@ -251,15 +253,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 centromere_min_island_explicit=cen_min_island_explicit,
             )
 
+            t_total = time.monotonic()
+            log_progress(
+                f"Starting panflat build (out_prefix={config.out_prefix}, "
+                f"threads={config.threads}, centromere_mode={config.effective_centromere_mode}, "
+                f"repeat_guard={config.repeat_guard}, qc={config.qc})"
+            )
+            log_progress("[1/4] Pre-flight check & loading inputs...")
             validate_build_config(config)
             graph = load_and_validate_inputs(config)
+
+            log_progress(
+                f"[2/4] Running chromosome linearization (chrom={graph.ref_chrom}, threads={config.threads})..."
+            )
             result = run_chromosome_pipeline(graph, config)
+            pan_len = len(result.pan_seq)
+            ref_len = len(graph.ref_seq)
             del graph
             gc.collect()
+
+            log_progress(f"[3/4] Writing outputs to '{config.out_prefix}.*'...")
+            t_write = time.monotonic()
             write_build_outputs(result, config)
             del result
             gc.collect()
+            log_progress(f"  Outputs written ({time.monotonic() - t_write:.2f}s)")
 
+            log_progress("[4/4] Verifying Global Invariants I, II, III...")
+            t_ver = time.monotonic()
             verify_build_outputs(
                 prefix=config.out_prefix,
                 gfa_path=config.gfa,
@@ -270,6 +291,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 spacer_n=config.spacer_n,
                 raise_on_error=True,
             )
+            log_progress(
+                f"  Verification PASSED ({time.monotonic() - t_ver:.2f}s)"
+            )
+            log_progress(
+                f"Build complete in {time.monotonic() - t_total:.2f}s "
+                f"(ref_len={ref_len:,} bp -> pan_len={pan_len:,} bp, +{pan_len - ref_len:,} bp)"
+            )
             return 0
 
         if args.subcommand == "verify":
@@ -277,6 +305,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise CLIArgumentError(
                     f"--spacer-n must be >= 0, got {args.spacer_n}"
                 )
+            t_ver = time.monotonic()
+            log_progress(f"Starting panflat verify (prefix={args.prefix})...")
             report = verify_build_outputs(
                 prefix=args.prefix,
                 gfa_path=args.gfa,
@@ -290,13 +320,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not report.passed:
                 for err in report.errors:
                     print(err, file=sys.stderr)
+                log_progress(
+                    f"Verification FAILED ({time.monotonic() - t_ver:.2f}s, {len(report.errors)} error(s))"
+                )
                 return 1
+            log_progress(
+                f"Verification PASSED ({time.monotonic() - t_ver:.2f}s): "
+                f"ref_steps={report.checked_ref_steps:,}, pieces={report.checked_pieces:,}, "
+                f"chain_blocks={report.checked_chain_blocks:,}, unresolved={report.checked_unresolved:,}"
+            )
             return 0
 
         if args.subcommand == "merge":
+            t_merge = time.monotonic()
+            log_progress(
+                f"Starting panflat merge (prefix_list={args.prefix_list}, out_prefix={args.out_prefix})..."
+            )
             merge_chromosomes(
                 prefix_list_path=args.prefix_list,
                 out_prefix=args.out_prefix,
+            )
+            log_progress(
+                f"Merge complete in {time.monotonic() - t_merge:.2f}s (out_prefix={args.out_prefix})"
             )
             return 0
 

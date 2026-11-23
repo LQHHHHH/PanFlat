@@ -182,6 +182,113 @@ def liftover_gff3(
     )
 
 
+def _validate_gff3_feature_row(
+    raw_line: str,
+    line_no: int,
+    ref_chrom: str,
+    ref_len: int | None,
+) -> tuple[str, str, str, int, int, str, str, str, str]:
+    """Validate a single non-comment GFF3 feature line and return parsed core fields."""
+    cols = raw_line.rstrip("\r\n").split("\t")
+    if len(cols) != 9:
+        raise InputContractError(
+            f"Malformed GFF3 at line {line_no}: expected 9 tab-separated columns, "
+            f"got {len(cols)}"
+        )
+
+    seqid = cols[0].strip()
+    if not seqid:
+        raise InputContractError(f"Empty seqid in GFF3 at line {line_no}")
+    if ref_chrom and seqid != ref_chrom:
+        raise InputContractError(
+            f"GFF3 seqid '{seqid}' at line {line_no} does not match reference "
+            f"chromosome '{ref_chrom}'"
+        )
+
+    source = cols[1].strip()
+    ftype = cols[2].strip()
+    if not source or not ftype:
+        raise InputContractError(
+            f"Empty source or feature type in GFF3 at line {line_no}"
+        )
+
+    try:
+        start_1based = int(cols[3].strip())
+        end_1based = int(cols[4].strip())
+    except ValueError as exc:
+        raise InputContractError(
+            f"Non-integer GFF3 coordinates at line {line_no}: "
+            f"start='{cols[3]}', end='{cols[4]}'"
+        ) from exc
+
+    if start_1based < 1 or start_1based > end_1based:
+        raise InputContractError(
+            f"Invalid GFF3 coordinate range [{start_1based}, {end_1based}] "
+            f"at line {line_no} (must satisfy 1 <= start <= end)"
+        )
+    if ref_len is not None and end_1based > ref_len:
+        raise InputContractError(
+            f"GFF3 feature end {end_1based} at line {line_no} exceeds "
+            f"reference length {ref_len}"
+        )
+
+    score = cols[5].strip()
+    strand = cols[6].strip()
+    if strand not in VALID_STRANDS:
+        raise InputContractError(
+            f"Invalid GFF3 strand '{strand}' at line {line_no}"
+        )
+
+    phase = cols[7].strip()
+    if phase not in VALID_PHASES:
+        raise InputContractError(
+            f"Invalid GFF3 phase '{phase}' at line {line_no}"
+        )
+
+    attr_str = cols[8].strip()
+    return (
+        seqid,
+        source,
+        ftype,
+        start_1based,
+        end_1based,
+        score,
+        strand,
+        phase,
+        attr_str,
+    )
+
+
+def validate_gff3_file(
+    gff_path: str | Path,
+    ref_chrom: str,
+    ref_len: int | None = None,
+) -> int:
+    """
+    Stream and validate a reference GFF3 file against `(ref_chrom, ref_len)` before
+    running linearization (fail-fast pre-flight check).
+
+    Returns the number of validated feature lines (0 is valid for comments-only GFF3).
+    """
+    path_obj = Path(gff_path)
+    if not path_obj.is_file():
+        raise InputContractError(f"Reference GFF3 file not found: '{gff_path}'")
+
+    feature_count = 0
+    with path_obj.open("r", encoding="utf-8") as fh:
+        for line_no, raw_line in enumerate(fh, start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("##FASTA"):
+                break
+            if stripped.startswith("#"):
+                continue
+            _validate_gff3_feature_row(raw_line, line_no, ref_chrom, ref_len)
+            feature_count += 1
+    return feature_count
+
+
 def liftover_gff3_lines(
     gff_lines: Sequence[str],
     ref_chrom: str,
@@ -205,63 +312,18 @@ def liftover_gff3_lines(
         if stripped.startswith("#"):
             continue
 
-        cols = raw_line.rstrip("\r\n").split("\t")
-        if len(cols) != 9:
-            raise InputContractError(
-                f"Malformed GFF3 at line {line_no}: expected 9 tab-separated columns, "
-                f"got {len(cols)}"
-            )
+        (
+            seqid,
+            source,
+            ftype,
+            start_1based,
+            end_1based,
+            score,
+            strand,
+            phase,
+            attr_str,
+        ) = _validate_gff3_feature_row(raw_line, line_no, ref_chrom, ref_len)
 
-        seqid = cols[0].strip()
-        if not seqid:
-            raise InputContractError(f"Empty seqid in GFF3 at line {line_no}")
-        if ref_chrom and seqid != ref_chrom:
-            raise InputContractError(
-                f"GFF3 seqid '{seqid}' at line {line_no} does not match reference "
-                f"chromosome '{ref_chrom}'"
-            )
-
-        source = cols[1].strip()
-        ftype = cols[2].strip()
-        if not source or not ftype:
-            raise InputContractError(
-                f"Empty source or feature type in GFF3 at line {line_no}"
-            )
-
-        try:
-            start_1based = int(cols[3].strip())
-            end_1based = int(cols[4].strip())
-        except ValueError as exc:
-            raise InputContractError(
-                f"Non-integer GFF3 coordinates at line {line_no}: "
-                f"start='{cols[3]}', end='{cols[4]}'"
-            ) from exc
-
-        if start_1based < 1 or start_1based > end_1based:
-            raise InputContractError(
-                f"Invalid GFF3 coordinate range [{start_1based}, {end_1based}] "
-                f"at line {line_no} (must satisfy 1 <= start <= end)"
-            )
-        if ref_len is not None and end_1based > ref_len:
-            raise InputContractError(
-                f"GFF3 feature end {end_1based} at line {line_no} exceeds "
-                f"reference length {ref_len}"
-            )
-
-        score = cols[5].strip()
-        strand = cols[6].strip()
-        if strand not in VALID_STRANDS:
-            raise InputContractError(
-                f"Invalid GFF3 strand '{strand}' at line {line_no}"
-            )
-
-        phase = cols[7].strip()
-        if phase not in VALID_PHASES:
-            raise InputContractError(
-                f"Invalid GFF3 phase '{phase}' at line {line_no}"
-            )
-
-        attr_str = cols[8].strip()
         attr_items, attr_dict = _parse_gff3_attributes(attr_str)
         feat_id = attr_dict.get("ID")
         parents = [

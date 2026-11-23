@@ -3609,3 +3609,115 @@ def test_m7_33_p1_4_unresolved_fa_header_strand_and_verify_tamper_rejection(
 
     # Restore clean file
     Path(f"{in1.out_prefix}.unresolved.fa").write_text(orig_ufa, encoding="utf-8")
+
+
+def test_m7_34_fail_fast_preflight_gff_bed_and_verify_missing_files(
+    tmp_path: Path,
+) -> None:
+    """Fail-fast pre-flight validation:
+    1. `load_and_validate_inputs` rejects missing `--ref-gff` and `--centromere-bed`
+       BEFORE scanning the GFA (even if the GFA itself is invalid/empty).
+    2. `load_and_validate_inputs` validates `--ref-gff` seqid/coordinates/format
+       against `(ref_chrom, len(ref_seq))` BEFORE `run_chromosome_pipeline` runs.
+    3. `verify_build_outputs` rejects nonexistent explicit `ref_gff_path` and
+       `centromere_bed_path` rather than silently skipping verification.
+    """
+    b = SyntheticInputBuilder(tmp_path / "preflight", chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("1", make_complex_seq(300, seed=9101))
+    b.set_ref_path("Ref#1#Chr01", ["1+"])
+    b.add_gff_line("Chr01", "src", "gene", 10, 200, ".", "+", ".", "ID=g1")
+    b.add_bed_region(50, 150, "CEN1")
+    inputs = b.write("pf_ok")
+
+    # 1. Missing --ref-gff and --centromere-bed fail BEFORE scanning an empty/corrupt GFA
+    empty_gfa = tmp_path / "empty.gfa"
+    empty_gfa.write_text("", encoding="utf-8")
+
+    with pytest.raises(InputContractError, match="Reference GFF3 file not found"):
+        load_and_validate_inputs(
+            BuildConfig(
+                gfa=str(empty_gfa),
+                ref_fa=str(inputs.ref_fa_path),
+                backbone_prefix="Ref#1#",
+                out_prefix=str(tmp_path / "o1"),
+                ref_gff=str(tmp_path / "missing.gff3"),
+            )
+        )
+
+    with pytest.raises(InputContractError, match="Centromere BED file not found"):
+        load_and_validate_inputs(
+            BuildConfig(
+                gfa=str(empty_gfa),
+                ref_fa=str(inputs.ref_fa_path),
+                backbone_prefix="Ref#1#",
+                out_prefix=str(tmp_path / "o2"),
+                centromere_bed=str(tmp_path / "missing.bed"),
+                centromere_mode="bypass",
+            )
+        )
+
+    # 2. Mismatched seqid or out-of-range coordinate in --ref-gff fails inside load_and_validate_inputs
+    wrong_seqid_gff = tmp_path / "wrong_seqid.gff3"
+    wrong_seqid_gff.write_text(
+        "##gff-version 3\nChr02\tsrc\tgene\t10\t100\t.\t+\t.\tID=g1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(InputContractError, match="does not match reference chromosome"):
+        load_and_validate_inputs(
+            BuildConfig(
+                gfa=str(inputs.gfa_path),
+                ref_fa=str(inputs.ref_fa_path),
+                backbone_prefix="Ref#1#",
+                out_prefix=str(tmp_path / "o3"),
+                ref_gff=str(wrong_seqid_gff),
+            )
+        )
+
+    oob_gff = tmp_path / "oob.gff3"
+    oob_gff.write_text(
+        "##gff-version 3\nChr01\tsrc\tgene\t10\t500\t.\t+\t.\tID=g1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(InputContractError, match="exceeds reference length"):
+        load_and_validate_inputs(
+            BuildConfig(
+                gfa=str(inputs.gfa_path),
+                ref_fa=str(inputs.ref_fa_path),
+                backbone_prefix="Ref#1#",
+                out_prefix=str(tmp_path / "o4"),
+                ref_gff=str(oob_gff),
+            )
+        )
+
+    # 3. Valid build + verify rejects nonexistent explicit ref_gff_path / centromere_bed_path
+    cfg_ok = BuildConfig(
+        gfa=str(inputs.gfa_path),
+        ref_fa=str(inputs.ref_fa_path),
+        backbone_prefix="Ref#1#",
+        out_prefix=str(inputs.out_prefix),
+        ref_gff=str(inputs.gff_path),
+        centromere_bed=str(inputs.bed_path),
+        centromere_mode="bypass",
+    )
+    graph = load_and_validate_inputs(cfg_ok)
+    res = run_chromosome_pipeline(graph, cfg_ok)
+    write_build_outputs(res, cfg_ok)
+
+    rep_missing_gff = verify_build_outputs(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        ref_gff_path=tmp_path / "no_such.gff3",
+    )
+    assert not rep_missing_gff.passed
+    assert any("Reference GFF3 file not found" in e for e in rep_missing_gff.errors)
+
+    rep_missing_bed = verify_build_outputs(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        centromere_bed_path=tmp_path / "no_such.bed",
+    )
+    assert not rep_missing_bed.passed
+    assert any("Centromere BED file not found" in e for e in rep_missing_bed.errors)
+

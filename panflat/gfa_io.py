@@ -5,10 +5,12 @@ import collections
 import hashlib
 from pathlib import Path
 import re
+import time
 from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
+from panflat.gff_liftover import validate_gff3_file
 from panflat.models import (
     MAX_COMPACT_NID,
     BuildConfig,
@@ -27,6 +29,7 @@ from panflat.models import (
     StepProvenance,
     is_compact_nid_str,
 )
+from panflat.progress import log_progress
 
 _REVCOMP_TABLE = str.maketrans(
     "ACGTNacgtnRYSWKMBDHVryswkmbdhv",
@@ -480,18 +483,36 @@ def _build_step_provenance(
 
 def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
     """
-    Load and validate the input GFA, reference FASTA, and optional centromere BED (§2.1, §3.8.1).
+    Load and validate the input GFA, reference FASTA, and optional centromere BED / reference GFF3 (§2.1, §3.8.1, §4).
     Uses streaming GFA/FASTA parsing and compact NumPy-backed containers for chromosome-scale graphs.
     """
+    t0 = time.monotonic()
     validate_build_config(config)
 
-    # Check FASTA exists early before scanning a large GFA
+    # Pre-flight: check all supplied input files exist before scanning a large GFA
     if not Path(config.ref_fa).is_file():
         raise InputContractError(f"FASTA file not found: '{config.ref_fa}'")
 
     gfa_file = Path(config.gfa)
     if not gfa_file.is_file():
         raise InputContractError(f"GFA file not found: '{config.gfa}'")
+
+    if config.centromere_bed is not None and not Path(config.centromere_bed).is_file():
+        raise InputContractError(
+            f"Centromere BED file not found: '{config.centromere_bed}'"
+        )
+
+    if config.ref_gff is not None and not Path(config.ref_gff).is_file():
+        raise InputContractError(
+            f"Reference GFF3 file not found: '{config.ref_gff}'"
+        )
+
+    checked_inputs = ["gfa", "ref-fa"]
+    if config.centromere_bed is not None:
+        checked_inputs.append("centromere-bed")
+    if config.ref_gff is not None:
+        checked_inputs.append("ref-gff")
+    log_progress(f"  Pre-flight file check passed ({', '.join(checked_inputs)})")
 
     # 1. Stream GFA: compute SHA-256, parse S and L records into compact buffers, and record P/W byte offsets
     hasher = hashlib.sha256()
@@ -1345,9 +1366,16 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
                 )
     del assembled_ref
 
-    # Validate optional centromere BED against reference chromosome and length
+    # Validate optional centromere BED and reference GFF3 against reference chromosome and length
+    cen_bed_count: int | None = None
     if config.centromere_bed is not None:
-        parse_bed(config.centromere_bed, ref_chrom, len(ref_seq))
+        cen_bed_count = len(parse_bed(config.centromere_bed, ref_chrom, len(ref_seq)))
+
+    gff_feat_count: int | None = None
+    if config.ref_gff is not None:
+        gff_feat_count = validate_gff3_file(
+            config.ref_gff, ref_chrom=ref_chrom, ref_len=len(ref_seq)
+        )
 
     # 5. Index reference steps and haplotypes using compact NumPy arrays when integer-backed
     if isinstance(ref_fragment.steps, LazyStepTuple) and use_fast_int_paths:
@@ -1406,6 +1434,19 @@ def load_and_validate_inputs(config: BuildConfig) -> GFAGraph:
         {frag.hap_id for frag in alt_fragments if frag.hap_id != ref_fragment.hap_id}
     )
     all_haplotypes = (ref_fragment.hap_id, *alt_haps)
+
+    extras: list[str] = []
+    if cen_bed_count is not None:
+        extras.append(f"cen_bed={cen_bed_count}")
+    if gff_feat_count is not None:
+        extras.append(f"gff_features={gff_feat_count}")
+    extra_str = f", {', '.join(extras)}" if extras else ""
+    log_progress(
+        f"  Inputs validated ({time.monotonic() - t0:.2f}s): "
+        f"chrom={ref_chrom}, ref_path={ref_fragment.src_path}, "
+        f"ref_len={len(ref_seq):,} bp, nodes={len(nodes_store):,}, "
+        f"haplotypes={len(all_haplotypes)} (alt_frags={len(alt_fragments)}){extra_str}"
+    )
 
     return GFAGraph(
         gfa_path=str(gfa_file),

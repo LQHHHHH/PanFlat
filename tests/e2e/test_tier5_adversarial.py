@@ -4291,3 +4291,85 @@ def test_tier5_m7_16_p1_3_and_p1_4_cen_mount_stacked_spacer_and_unresolved_heade
         and "[CEN]" in res_cen.stderr
         and "Traceback" not in res_cen.stderr
     )
+
+
+def test_tier5_m7_17_preflight_validation_and_stderr_progress_cli(
+    tmp_path: Path,
+) -> None:
+    """Black-box CLI test verifying:
+    1. Missing or mismatched `--ref-gff` fails during pre-flight without emitting any output files.
+    2. Successful `panflat build` emits real-time timestamped stage progress on `stderr`
+       while keeping `stdout` empty and passing all invariants.
+    3. `panflat verify` rejects nonexistent explicit `--ref-gff` / `--centromere-bed`.
+    """
+    b = SyntheticInputBuilder(tmp_path / "pf_cli", chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("1", make_complex_seq(400, seed=9201))
+    b.add_node("2", make_complex_seq(120, seed=9202))
+    b.add_node("3", make_complex_seq(400, seed=9203))
+    b.set_ref_path("Ref#1#Chr01", ["1+", "3+"])
+    b.add_path("Alt1#1#Chr01", ["1+", "2+", "3+"])
+    b.add_gff_line("Chr01", "src", "gene", 20, 380, ".", "+", ".", "ID=g1")
+    inputs = b.write("pf_case")
+
+    # 1. Mismatched --ref-gff fails before writing any output files
+    bad_gff = tmp_path / "bad_chrom.gff3"
+    bad_gff.write_text(
+        "##gff-version 3\nChr99\tsrc\tgene\t10\t100\t.\t+\t.\tID=g1\n",
+        encoding="utf-8",
+    )
+    bad_out = tmp_path / "should_not_exist"
+    p_bad = run_panflat_cli(
+        [
+            "build",
+            "--gfa",
+            str(inputs.gfa_path),
+            "--ref-fa",
+            str(inputs.ref_fa_path),
+            "--backbone-prefix",
+            "Ref#1#",
+            "--ref-gff",
+            str(bad_gff),
+            "--out-prefix",
+            str(bad_out),
+        ],
+        check=False,
+    )
+    assert p_bad.returncode != 0
+    assert "Traceback" not in p_bad.stderr
+    assert "does not match reference chromosome" in p_bad.stderr
+    assert list(tmp_path.glob("should_not_exist*")) == []
+
+    # 2. Successful build emits timestamped stage progress on stderr, keeps stdout clean
+    ok_proc, bundle = run_build(inputs, extra_args=["--ref-gff", str(inputs.gff_path)])
+    assert ok_proc.stdout == ""
+    for marker in ("[panflat]", "[1/4]", "[2/4]", "[3/4]", "[4/4]", "Build complete"):
+        assert marker in ok_proc.stderr
+    assert_all_global_invariants(bundle, inputs.gfa_path, inputs.ref_fa_path)
+
+    # 3. panflat verify rejects nonexistent explicit --ref-gff and --centromere-bed
+    v_missing_gff = run_verify(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--ref-gff", str(tmp_path / "missing.gff3")],
+        check=False,
+    )
+    assert (
+        v_missing_gff.returncode == 1
+        and "Reference GFF3 file not found" in v_missing_gff.stderr
+        and "Traceback" not in v_missing_gff.stderr
+    )
+
+    v_missing_bed = run_verify(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        extra_args=["--centromere-bed", str(tmp_path / "missing.bed")],
+        check=False,
+    )
+    assert (
+        v_missing_bed.returncode == 1
+        and "Centromere BED file not found" in v_missing_bed.stderr
+        and "Traceback" not in v_missing_bed.stderr
+    )
+

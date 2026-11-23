@@ -18,10 +18,14 @@ from __future__ import annotations
 import collections
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+import threading
+import time
 from typing import AbstractSet, Any, Literal, Mapping, Sequence
 
 import mappy
 import numpy as np
+
+from panflat.progress import log_progress
 
 from panflat.centromere import (
     delimit_centromere_regions,
@@ -2754,6 +2758,7 @@ def run_chromosome_pipeline(
         graph.links._canon_links = np.empty(0, dtype=np.uint64)
         graph.links._first_v = None
 
+    t_pipe = time.monotonic()
     log_lines: list[str] = [
         f"INFO\tPanFlat build starting for chrom={graph.ref_chrom} "
         f"gfa={graph.gfa_path} gfa_sha256={graph.gfa_sha256} "
@@ -2800,6 +2805,13 @@ def run_chromosome_pipeline(
         oriented_fragments, regions, graph, config
     )
     cen_out = process_centromere_regions(partition, graph, config)
+    if regions:
+        log_progress(
+            f"  Centromere processing done ({time.monotonic() - t_pipe:.2f}s): "
+            f"regions={len(regions)}, mode={config.effective_centromere_mode}, "
+            f"islands={len(cen_out.island_sv_events)}"
+        )
+    t_stage4 = time.monotonic()
 
     centromere_rows: list[CentromereRow] = list(cen_out.centromere_rows)
     unresolved_records: list[UnresolvedRecord] = list(cen_out.unresolved_records)
@@ -3444,6 +3456,11 @@ def run_chromosome_pipeline(
         terminal_devs_by_pair.keys(),
         key=lambda ab: (ab[1], ab[1] - ab[0], ab[0]),
     )
+    log_progress(
+        f"  Inversion normalization & weighted LIS done ({time.monotonic() - t_stage4:.2f}s): "
+        f"contigs={len(contig_analyses)}, terminal_groups={len(sorted_group_pairs):,}"
+    )
+    t_stage5 = time.monotonic()
 
     group_guard_by_pair: dict[tuple[int, int], GroupRepeatGuardResult] = {}
     group_solutions: dict[tuple[int, int], ParallelGroupSolution] = {}
@@ -3559,16 +3576,46 @@ def run_chromosome_pipeline(
             for pair in sorted_group_pairs
             if group_guard_by_pair[pair].kept_candidates
         ]
-        if len(active_cand_pairs) > 1:
+        n_active = len(active_cand_pairs)
+        if n_active > 1:
+            t_solve = time.monotonic()
+            prog_lock = threading.Lock()
+            solved_count = [0]
+            last_solve_log = [t_solve]
+
+            def _solve_one_top_pair_tracked(
+                pair: tuple[int, int],
+            ) -> ParallelGroupSolution:
+                sol = _solve_one_top_pair(pair)
+                if n_active >= 20:
+                    with prog_lock:
+                        solved_count[0] += 1
+                        done = solved_count[0]
+                        now_t = time.monotonic()
+                        if done == n_active or now_t - last_solve_log[0] >= 10.0:
+                            pct = 100.0 * done / n_active
+                            log_progress(
+                                f"  Solving parallel groups: {done:,}/{n_active:,} "
+                                f"({pct:.1f}%, {now_t - t_solve:.1f}s)"
+                            )
+                            last_solve_log[0] = now_t
+                return sol
+
             with ThreadPoolExecutor(
-                max_workers=min(config.threads, len(active_cand_pairs))
+                max_workers=min(config.threads, n_active)
             ) as pool:
-                solved_list = list(pool.map(_solve_one_top_pair, active_cand_pairs))
+                solved_list = list(
+                    pool.map(_solve_one_top_pair_tracked, active_cand_pairs)
+                )
             for pair, sol in zip(active_cand_pairs, solved_list):
                 group_solutions[pair] = sol
         else:
             for pair in active_cand_pairs:
                 group_solutions[pair] = _solve_one_top_pair(pair)
+    log_progress(
+        f"  Candidate screening & group solving done ({time.monotonic() - t_stage5:.2f}s): "
+        f"solved_groups={len(group_solutions):,}"
+    )
 
     # 6. Collect all top-level normal SV events before assigning region_id and event_id
     @dataclass
@@ -4663,6 +4710,13 @@ def run_chromosome_pipeline(
         "ref_sub_min_aligned_ratio": REF_SUB_MIN_ALIGNED_RATIO,
         "ref_sub_min_identity": REF_SUB_MIN_IDENTITY,
     }
+
+    log_progress(
+        f"  Linearization complete ({time.monotonic() - t_pipe:.2f}s): "
+        f"pan_len={len(pan_seq):,} bp (+{len(pan_seq) - len(graph.ref_seq):,} bp), "
+        f"events={len(sorted_sv_events):,}, pieces={len(inserts_rows):,}, "
+        f"unresolved={len(unresolved_records):,}"
+    )
 
     return ChromosomeBuildResult(
         chrom=graph.ref_chrom,

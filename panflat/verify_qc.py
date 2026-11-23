@@ -1642,6 +1642,10 @@ def verify_build_outputs(
         _err("INV2", f"GFA file not found: '{gfa_file}'")
     if not ref_fa_file.is_file():
         _err("INV1", f"Reference FASTA file not found: '{ref_fa_file}'")
+    if ref_gff_path is not None and not Path(ref_gff_path).is_file():
+        _err("INV3", f"Reference GFF3 file not found: '{ref_gff_path}'")
+    if centromere_bed_path is not None and not Path(centromere_bed_path).is_file():
+        _err("CEN", f"Centromere BED file not found: '{centromere_bed_path}'")
 
     pan_fa_path = Path(f"{p}.pan.fa")
     offsets_path = Path(f"{p}.offsets.tsv")
