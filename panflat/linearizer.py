@@ -4318,7 +4318,18 @@ def run_chromosome_pipeline(
         collections.defaultdict(list)
     )
     use_lazy_ref_slice = isinstance(ref_steps, LazyStepTuple)
-    for pair in sorted_group_pairs:
+    n_stage6_pairs = len(sorted_group_pairs)
+    t_stage6 = time.monotonic()
+    last_stage6_log = t_stage6
+    for p_idx_6, pair in enumerate(sorted_group_pairs, start=1):
+        if n_stage6_pairs >= 1000 and (p_idx_6 & 255) == 0:
+            now_6 = time.monotonic()
+            if now_6 - last_stage6_log >= 10.0:
+                log_progress(
+                    f"  Calling events & genotyping: {p_idx_6:,}/{n_stage6_pairs:,} "
+                    f"({100.0 * p_idx_6 / n_stage6_pairs:.1f}%, {now_6 - t_stage6:.1f}s)"
+                )
+                last_stage6_log = now_6
         rank_a, rank_b = pair
         devs_at_pair = terminal_devs_by_pair[pair]
         guard_res = group_guard_by_pair[pair]

@@ -3721,3 +3721,101 @@ def test_m7_34_fail_fast_preflight_gff_bed_and_verify_missing_files(
     assert not rep_missing_bed.passed
     assert any("Centromere BED file not found" in e for e in rep_missing_bed.errors)
 
+
+def test_m7_35_centromere_step4b_coalesces_consecutive_cuts_no_shard_explosion(
+    tmp_path: Path,
+) -> None:
+    """Regression test for chromosome-scale Step 4b fragment explosion:
+    When a haplotype misses boundary anchors `u`/`v` (e.g. SNP-split PGGB nodes)
+    and traverses hundreds of unique reference nodes inside `[ref_start, ref_end)`
+    (including repeated internal nodes and an internal novel sequence), Step 4b MUST
+    coalesce consecutive/overlapping `amb_cuts` into ONE cut producing only the 2
+    outer chromosome arms (NOT hundreds of 1-node internal shards), while still
+    recording the internal novel run as `CEN_BOUNDARY_AMBIGUOUS` and mounting outer
+    arm insertions normally.
+    """
+    from panflat.centromere import (
+        delimit_centromere_regions,
+        partition_fragments_by_centromere,
+    )
+
+    n_cen_nodes = 200
+    b = SyntheticInputBuilder(
+        tmp_path / "cen_coalesce", chrom="Chr06A", backbone_prefix="Ref#1#"
+    )
+    # Integer node IDs trigger the LazyStepTuple / NumPy fast path:
+    # 1, 2 = left arm; 3 = u; 4..203 = 200 internal cen nodes; 204 = v; 205, 206 = right arm
+    # 300 = left arm insertion (120 bp), 301 = internal cen novel (140 bp), 302 = right arm insertion (130 bp)
+    for nid in range(1, 207):
+        b.add_node(str(nid), make_complex_seq(100, seed=10000 + nid))
+    b.add_node("300", make_complex_seq(120, seed=20001))
+    b.add_node("301", make_complex_seq(140, seed=20002))
+    b.add_node("302", make_complex_seq(130, seed=20003))
+
+    ref_steps = [f"{nid}+" for nid in range(1, 207)]
+    b.set_ref_path("Ref#1#Chr06A", ref_steps)
+
+    # Alt1 skips u (3) and v (204), lands on first/last internal nodes 4 & 203 (touching [300,20300) boundary)
+    alt_steps = (
+        ["1+", "300+", "2+"]
+        + [f"{nid}+" for nid in range(4, 51)]
+        + ["50+"]
+        + [f"{nid}+" for nid in range(51, 101)]
+        + ["301+"]
+        + [f"{nid}+" for nid in range(101, 204)]
+        + ["205+", "302+", "206+"]
+    )
+    b.add_path("AltNoUV#1#Chr06A", alt_steps)
+
+    # Alt2 jumps strictly across [300, 20300) boundaries (2 -> 5 and 202 -> 205)
+    alt2_steps = (
+        ["1+", "300+", "2+"]
+        + [f"{nid}+" for nid in range(5, 203)]
+        + ["205+", "302+", "206+"]
+    )
+    b.add_path("AltCross#1#Chr06A", alt2_steps)
+
+    # BED covers internal nodes 4..203 => [300, 20300); u=node 3 [200,300), v=node 204 [20300,20400)
+    b.add_bed_region(350, 20250, "CEN06A")
+    inputs = b.write("cen_coalesce_case")
+
+    cfg = BuildConfig(
+        gfa=str(inputs.gfa_path),
+        ref_fa=str(inputs.ref_fa_path),
+        backbone_prefix="Ref#1#",
+        out_prefix=str(inputs.out_prefix),
+        centromere_bed=str(inputs.bed_path),
+        centromere_mode="bypass",
+    )
+    graph = load_and_validate_inputs(cfg)
+    regions, _ = delimit_centromere_regions(graph, cfg)
+    part = partition_fragments_by_centromere(graph.alt_fragments, regions, graph, cfg)
+
+    # Each haplotype must produce ONLY 2 outer arms (total 4), NOT ~400 single-node shards!
+    assert len(part.normal_fragments) == 4
+    by_hap: dict[str, list] = {}
+    for nf in part.normal_fragments:
+        by_hap.setdefault(nf.hap_id, []).append(nf)
+    assert [len(f.steps) for f in by_hap["AltNoUV#1"]] == [4, 4]
+    assert [len(f.steps) for f in by_hap["AltCross#1"]] == [3, 3]
+
+    # Internal novel sequence still routed to CEN_BOUNDARY_AMBIGUOUS
+    assert len(part.boundary_ambiguous_records) == 1
+    assert part.boundary_ambiguous_records[0].reason == "CEN_BOUNDARY_AMBIGUOUS"
+    assert part.boundary_ambiguous_records[0].length == 140
+
+    # End-to-end build & verify passes all Global Invariants and mounts both outer arm insertions
+    res = run_chromosome_pipeline(graph, cfg)
+    write_build_outputs(res, cfg)
+    rep = verify_build_outputs(
+        inputs.out_prefix,
+        inputs.gfa_path,
+        inputs.ref_fa_path,
+        centromere_bed_path=inputs.bed_path,
+    )
+    assert rep.passed, f"verify failed: {rep.errors}"
+    ins_events = [ev for ev in res.sv_events if ev.event_type == "INS"]
+    assert len(ins_events) == 2
+    assert n_cen_nodes == 200
+
+

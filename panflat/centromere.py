@@ -980,8 +980,11 @@ def partition_fragments_by_centromere(
             cum_off = graph._ref_cum_offsets
             span_s_arr = cum_off[r_lo_arr + 1]
             span_e_arr = cum_off[r_hi_arr]
+            node_s_arr = cum_off[r_lo_arr]
+            node_e_arr = cum_off[r_lo_arr + 1]
             crossed_mask = np.zeros(int(r_lo_arr.shape[0]), dtype=bool)
             non_eq = r_lo_arr < r_hi_arr
+            is_eq = ~non_eq
             for reg in regions:
                 cond_interval = (span_s_arr < span_e_arr) & (
                     np.maximum(span_s_arr, reg.ref_start)
@@ -990,7 +993,12 @@ def partition_fragments_by_centromere(
                 cond_point = (span_s_arr >= span_e_arr) & (
                     (reg.ref_start < span_s_arr) & (span_s_arr < reg.ref_end)
                 )
-                crossed_mask |= non_eq & (cond_interval | cond_point)
+                cond_same_inside = (
+                    (reg.ref_start <= node_s_arr) & (node_e_arr <= reg.ref_end)
+                )
+                crossed_mask |= (non_eq & (cond_interval | cond_point)) | (
+                    is_eq & cond_same_inside
+                )
             cand_k_list = np.flatnonzero(crossed_mask).tolist()
             anc_positions_lazy: tuple[np.ndarray, np.ndarray] | None = (
                 hit_pos,
@@ -1020,59 +1028,77 @@ def partition_fragments_by_centromere(
                 idx_a, r_a = anc_positions[k]
                 idx_b, r_b = anc_positions[k + 1]
             r_lo, r_hi = min(r_a, r_b), max(r_a, r_b)
-            if r_lo == r_hi:
-                continue
-            span_start = graph.ref_step_ranges[r_lo][1]
-            span_end = graph.ref_step_ranges[r_hi][0]
 
             crossed_reg: CentromereRegion | None = None
-            for reg in regions:
-                if span_start < span_end:
-                    if max(span_start, reg.ref_start) < min(span_end, reg.ref_end):
+            if r_lo == r_hi:
+                node_start, node_end = graph.ref_step_ranges[r_lo]
+                for reg in regions:
+                    if reg.ref_start <= node_start and node_end <= reg.ref_end:
                         crossed_reg = reg
                         break
-                else:
-                    if reg.ref_start < span_start < reg.ref_end:
-                        crossed_reg = reg
-                        break
+            else:
+                span_start = graph.ref_step_ranges[r_lo][1]
+                span_end = graph.ref_step_ranges[r_hi][0]
+                for reg in regions:
+                    if span_start < span_end:
+                        if max(span_start, reg.ref_start) < min(span_end, reg.ref_end):
+                            crossed_reg = reg
+                            break
+                    else:
+                        if reg.ref_start < span_start < reg.ref_end:
+                            crossed_reg = reg
+                            break
 
             if crossed_reg is not None:
                 amb_cuts.append((idx_a, idx_b))
-                runs = _extract_nonref_runs(
-                    steps=sub_frag.steps[idx_a + 1 : idx_b],
-                    provenance=sub_frag.provenance[idx_a + 1 : idx_b],
-                    nodes=graph.nodes,
-                    global_ref_nodes=graph.global_ref_nodes,
-                )
-                for r in runs:
-                    if len(r.seq) >= min_sv_len:
-                        iv_key = (r.src_path, r.src_start, r.src_end)
-                        if iv_key not in claimed_source_intervals:
-                            claimed_source_intervals.add(iv_key)
-                            rec_id = f"{crossed_reg.region_id}_UNRES_AMB_{amb_counter}"
-                            amb_counter += 1
-                            boundary_ambiguous_records.append(
-                                UnresolvedRecord(
-                                    record_id=rec_id,
-                                    region_id=crossed_reg.region_id,
-                                    event_id=".",
-                                    src_path=r.src_path,
-                                    src_start=r.src_start,
-                                    src_end=r.src_end,
-                                    src_strand=r.src_strand,
-                                    length=r.src_end - r.src_start,
-                                    reason="CEN_BOUNDARY_AMBIGUOUS",
-                                    seq=r.seq,
-                                    export_to_fasta=True,
-                                    exported_fasta_id=rec_id,
+                if idx_a + 1 < idx_b:
+                    runs = _extract_nonref_runs(
+                        steps=sub_frag.steps[idx_a + 1 : idx_b],
+                        provenance=sub_frag.provenance[idx_a + 1 : idx_b],
+                        nodes=graph.nodes,
+                        global_ref_nodes=graph.global_ref_nodes,
+                    )
+                    for r in runs:
+                        if len(r.seq) >= min_sv_len:
+                            iv_key = (r.src_path, r.src_start, r.src_end)
+                            if iv_key not in claimed_source_intervals:
+                                claimed_source_intervals.add(iv_key)
+                                rec_id = (
+                                    f"{crossed_reg.region_id}_UNRES_AMB_{amb_counter}"
                                 )
-                            )
+                                amb_counter += 1
+                                boundary_ambiguous_records.append(
+                                    UnresolvedRecord(
+                                        record_id=rec_id,
+                                        region_id=crossed_reg.region_id,
+                                        event_id=".",
+                                        src_path=r.src_path,
+                                        src_start=r.src_start,
+                                        src_end=r.src_end,
+                                        src_strand=r.src_strand,
+                                        length=r.src_end - r.src_start,
+                                        reason="CEN_BOUNDARY_AMBIGUOUS",
+                                        seq=r.seq,
+                                        export_to_fasta=True,
+                                        exported_fasta_id=rec_id,
+                                    )
+                                )
 
         if not amb_cuts:
             normal_fragments.append(sub_frag)
         else:
-            cur_s = 0
+            # Coalesce consecutive/overlapping centromere cuts so traversing internal
+            # centromere anchors produces a single cut rather than N single-node shards.
+            merged_cuts: list[tuple[int, int]] = []
             for idx_a, idx_b in amb_cuts:
+                if merged_cuts and idx_a <= merged_cuts[-1][1]:
+                    if idx_b > merged_cuts[-1][1]:
+                        merged_cuts[-1] = (merged_cuts[-1][0], idx_b)
+                else:
+                    merged_cuts.append((idx_a, idx_b))
+
+            cur_s = 0
+            for idx_a, idx_b in merged_cuts:
                 if cur_s <= idx_a:
                     normal_fragments.append(
                         _slice_path_fragment(sub_frag, cur_s, idx_a + 1)
