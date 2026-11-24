@@ -1715,6 +1715,25 @@ def _load_ref_records_for_verify(
     return raw_records
 
 
+def _sha256_file(path: Path) -> str:
+    """Compute lowercase SHA-256 hex digest of `path` (supports Python >= 3.10)."""
+    file_digest_fn = getattr(hashlib, "file_digest", None)
+    if file_digest_fn is not None:
+        with path.open("rb") as fh:
+            return file_digest_fn(fh, "sha256").hexdigest().lower()
+
+    hasher = hashlib.sha256()
+    buf = bytearray(4 * 1024 * 1024)
+    mv = memoryview(buf)
+    with path.open("rb") as fh:
+        while True:
+            n_read = fh.readinto(buf)
+            if not n_read:
+                break
+            hasher.update(mv[:n_read])
+    return hasher.hexdigest().lower()
+
+
 def verify_build_outputs(
     prefix: str | Path,
     gfa_path: str | Path,
@@ -1822,8 +1841,7 @@ def verify_build_outputs(
         if len(parts) >= 2:
             summary_kv[parts[0]] = parts[1]
 
-    with gfa_file.open("rb") as gfa_bin_fh:
-        actual_sha = hashlib.file_digest(gfa_bin_fh, "sha256").hexdigest().lower()
+    actual_sha = _sha256_file(gfa_file)
     recorded_sha = summary_kv.get("gfa_sha256")
     if recorded_sha and recorded_sha.lower() != actual_sha:
         _err(

@@ -3819,3 +3819,48 @@ def test_m7_35_centromere_step4b_coalesces_consecutive_cuts_no_shard_explosion(
     assert n_cen_nodes == 200
 
 
+def test_m7_36_python310_hashlib_no_file_digest_compat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensure `verify_build_outputs` works on Python 3.10 where `hashlib.file_digest`
+    (introduced in Python 3.11) does not exist, both for valid verification and
+    SHA-256 tamper detection across multi-chunk buffers.
+    """
+    import hashlib as _hashlib
+
+    b = SyntheticInputBuilder(tmp_path / "py310_sha", chrom="Chr01", backbone_prefix="Ref#1#")
+    b.add_node("1", make_complex_seq(400, seed=9901))
+    b.add_node("2", make_complex_seq(120, seed=9902))
+    b.add_node("3", make_complex_seq(400, seed=9903))
+    b.set_ref_path("Ref#1#Chr01", ["1+", "3+"])
+    b.add_path("Alt#1#Chr01", ["1+", "2+", "3+"])
+    inputs = b.write("py310_case")
+
+    cfg = BuildConfig(
+        gfa=str(inputs.gfa_path),
+        ref_fa=str(inputs.ref_fa_path),
+        backbone_prefix="Ref#1#",
+        out_prefix=str(inputs.out_prefix),
+    )
+    graph = load_and_validate_inputs(cfg)
+    res = run_chromosome_pipeline(graph, cfg)
+    write_build_outputs(res, cfg)
+
+    monkeypatch.delattr(_hashlib, "file_digest", raising=False)
+    assert not hasattr(_hashlib, "file_digest")
+
+    rep_ok = verify_build_outputs(inputs.out_prefix, inputs.gfa_path, inputs.ref_fa_path)
+    assert rep_ok.passed, f"Expected pass without hashlib.file_digest, got: {rep_ok.errors}"
+
+    tampered_gfa = tmp_path / "tampered.gfa"
+    tampered_gfa.write_text(
+        Path(inputs.gfa_path).read_text(encoding="utf-8") + "# trailing tamper\n",
+        encoding="utf-8",
+    )
+    rep_bad = verify_build_outputs(inputs.out_prefix, tampered_gfa, inputs.ref_fa_path)
+    assert not rep_bad.passed
+    assert any("GFA SHA-256 mismatch" in e for e in rep_bad.errors)
+
+
+
