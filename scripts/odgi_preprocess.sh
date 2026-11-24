@@ -8,15 +8,20 @@
 #   3. odgi sort   (reference-guided Ygs sort, or fast -O node ID compaction)
 #   4. odgi view   (export GFA v1 ready for `panflat build`)
 #
+# Output location rule:
+#   - Default (no -o): writes <REF_CHROM>.clean.gfa & <REF_CHROM>.ref_path.txt
+#     directly into the -i directory (or the directory containing the -i .og file).
+#   - Bare -o <name> (no '/'): writes <in_dir>/<name>.clean.gfa inside the -i directory.
+#   - Path -o <dir>/<name> (contains '/'): writes to the explicit <dir>/<name>.clean.gfa.
+#
 # Usage examples:
-#   # Using exact reference path name:
+#   # Output directly back into the -i directory as <REF_CHROM>.clean.gfa (e.g. Chr15A.clean.gfa):
 #   scripts/odgi_preprocess.sh \
 #     -i community9_pggb_p96_s10k_asm5_g7910_f0_k47 \
-#     -r "Pyrbr_ds#1#Chr15A" \
-#     -o c9 \
+#     -p "Pyrbr_ds#1#" \
 #     -t 16
 #
-#   # Using PanSN prefix (auto-detects the unique reference path in the graph):
+#   # Output back into the -i directory with a custom filename prefix (c9.clean.gfa):
 #   scripts/odgi_preprocess.sh \
 #     -i community9_pggb_p96_s10k_asm5_g7910_f0_k47 \
 #     -p "Pyrbr_ds#1#" \
@@ -47,7 +52,7 @@ die() {
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME -i <pggb_dir_or_og> (-r <ref_path> | -p <ref_prefix>) -o <out_prefix> [options]
+Usage: $SCRIPT_NAME -i <pggb_dir_or_og> (-r <ref_path> | -p <ref_prefix>) [options]
 
 Required arguments:
   -i, --input PATH          PGGB output directory (containing *.smooth.final.og)
@@ -56,21 +61,23 @@ Required arguments:
                             (e.g. "Pyrbr_ds#1#Chr15A"). Mutually exclusive with -p.
   -p, --ref-prefix PREFIX   PanSN prefix matching a unique reference path in the graph
                             (e.g. "Pyrbr_ds#1#"). Mutually exclusive with -r.
-  -o, --out-prefix PREFIX   Output prefix; produces <PREFIX>.clean.gfa and
-                            <PREFIX>.ref_path.txt (parent directories created if needed).
 
 Optional arguments:
+  -o, --out-prefix PREFIX   Output prefix:
+                              (omitted)   : <in_dir>/<REF_CHROM> (writes back into -i dir)
+                              <name>      : <in_dir>/<name>      (writes back into -i dir)
+                              <dir>/<name>: <dir>/<name>         (writes to explicit path)
   -t, --threads INT         Threads for odgi groom/unchop/sort [default: 16]
   --sort-mode MODE          Sorting strategy:
                               ref-ygs  : odgi sort -H <ref_path_file> -p Ygs (default)
                               optimize : odgi sort -O (fast 1..N node ID compaction)
-  --keep-intermediates      Keep <PREFIX>.groom.og, <PREFIX>.unchop.og, <PREFIX>.sort.og
-  -f, --force               Overwrite existing <PREFIX>.clean.gfa if present
+  --keep-intermediates      Keep <prefix>.groom.og, <prefix>.unchop.og, <prefix>.sort.og
+  -f, --force               Overwrite existing <prefix>.clean.gfa if present
   -h, --help                Show this help message and exit
 
-Outputs:
-  <out_prefix>.clean.gfa      Preprocessed GFA v1 graph for \`panflat build --gfa\`
-  <out_prefix>.ref_path.txt   Resolved unique reference path name (1 line)
+Outputs (inside -i directory by default):
+  <prefix>.clean.gfa        Preprocessed GFA v1 graph for \`panflat build --gfa\`
+  <prefix>.ref_path.txt     Resolved unique reference path name (1 line)
 EOF
 }
 
@@ -126,8 +133,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- Pre-flight validation ----
-[[ -n "$INPUT" ]]      || die "Missing required argument: -i / --input"
-[[ -n "$OUT_PREFIX" ]] || die "Missing required argument: -o / --out-prefix"
+[[ -n "$INPUT" ]] || die "Missing required argument: -i / --input"
 if [[ -n "$REF_PATH" && -n "$REF_PREFIX" ]]; then
     die "Specify either -r/--ref-path OR -p/--ref-prefix, not both"
 fi
@@ -148,10 +154,12 @@ RAW_OG=""
 if [[ -f "$INPUT" ]]; then
     RAW_OG="$INPUT"
 elif [[ -d "$INPUT" ]]; then
+    INPUT_CLEAN="${INPUT%/}"
+    [[ -n "$INPUT_CLEAN" ]] || INPUT_CLEAN="/"
     shopt -s nullglob
-    candidates=( "$INPUT"/*.smooth.final.og )
+    candidates=( "${INPUT_CLEAN}"/*.smooth.final.og )
     if [[ ${#candidates[@]} -eq 0 ]]; then
-        candidates=( "$INPUT"/*.final.og )
+        candidates=( "${INPUT_CLEAN}"/*.final.og )
     fi
     shopt -u nullglob
     if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -166,16 +174,7 @@ else
     die "Input path does not exist: '$INPUT'"
 fi
 
-OUT_DIR="$(dirname "$OUT_PREFIX")"
-if [[ -n "$OUT_DIR" && "$OUT_DIR" != "." ]]; then
-    mkdir -p "$OUT_DIR"
-fi
-
-CLEAN_GFA="${OUT_PREFIX}.clean.gfa"
-REF_PATH_FILE="${OUT_PREFIX}.ref_path.txt"
-if [[ -e "$CLEAN_GFA" && "$OVERWRITE" -ne 1 ]]; then
-    die "Output already exists: '$CLEAN_GFA' (pass -f/--force to overwrite)"
-fi
+IN_DIR="$(dirname "$RAW_OG")"
 
 # ---- Validate & resolve unique reference path in RAW_OG ----
 log "Inspecting paths in '$RAW_OG'..."
@@ -217,13 +216,36 @@ else
     RESOLVED_REF="${matches[0]}"
 fi
 
+REF_CHROM="${RESOLVED_REF##*#}"
+SAFE_REF_CHROM="${REF_CHROM//\//_}"
+
+# Resolve output prefix: default & bare names write back into -i directory
+if [[ -z "$OUT_PREFIX" ]]; then
+    FINAL_PREFIX="${IN_DIR}/${SAFE_REF_CHROM}"
+elif [[ "$OUT_PREFIX" != */* ]]; then
+    FINAL_PREFIX="${IN_DIR}/${OUT_PREFIX}"
+else
+    FINAL_PREFIX="$OUT_PREFIX"
+fi
+
+OUT_DIR="$(dirname "$FINAL_PREFIX")"
+if [[ -n "$OUT_DIR" && "$OUT_DIR" != "." ]]; then
+    mkdir -p "$OUT_DIR"
+fi
+
+CLEAN_GFA="${FINAL_PREFIX}.clean.gfa"
+REF_PATH_FILE="${FINAL_PREFIX}.ref_path.txt"
+if [[ -e "$CLEAN_GFA" && "$OVERWRITE" -ne 1 ]]; then
+    die "Output already exists: '$CLEAN_GFA' (pass -f/--force to overwrite)"
+fi
+
 printf '%s\n' "$RESOLVED_REF" > "$REF_PATH_FILE"
-log "Resolved reference path: '$RESOLVED_REF' (total paths=${#ALL_PATHS[@]}, threads=${THREADS}, sort_mode=${SORT_MODE})"
+log "Resolved reference path: '$RESOLVED_REF' -> output prefix '${FINAL_PREFIX}' (total paths=${#ALL_PATHS[@]}, threads=${THREADS}, sort_mode=${SORT_MODE})"
 
 # ---- Set up intermediate files & cleanup trap ----
-GROOM_OG="${OUT_PREFIX}.groom.og"
-UNCHOP_OG="${OUT_PREFIX}.unchop.og"
-SORT_OG="${OUT_PREFIX}.sort.og"
+GROOM_OG="${FINAL_PREFIX}.groom.og"
+UNCHOP_OG="${FINAL_PREFIX}.unchop.og"
+SORT_OG="${FINAL_PREFIX}.sort.og"
 TMP_GFA="${CLEAN_GFA}.tmp.$$"
 
 cleanup() {
@@ -274,6 +296,5 @@ mv -f "$TMP_GFA" "$CLEAN_GFA"
 log "  view done ($((SECONDS - t0))s)"
 
 GFA_SIZE="$(du -h "$CLEAN_GFA" | awk '{print $1}')"
-REF_CHROM="${RESOLVED_REF##*#}"
 log "Preprocessing complete in $((SECONDS - t_start))s -> '$CLEAN_GFA' (${GFA_SIZE})"
 log "Next step: run \`panflat build --gfa '$CLEAN_GFA' --ref-fa <ref_or_community.fa> --backbone-prefix '$RESOLVED_REF' --ref-gff <${REF_CHROM}.gff3> --out-prefix <prefix>\`"
