@@ -551,7 +551,11 @@ def test_c20_candidate_split_by_repeat_guard_and_fully_masked_genotype_dot(
     _assert_result_invariants(graph, cfg, res)
 
     assert len(res.inserts_rows) == 2
-    assert res.inserts_rows[0]["join_before"] == "source_contiguous"
+    # Right residual [2000, 2600) (600 bp, src 2250-2850, u_start=2000) sorts before
+    # left residual [0, 500) (500 bp, src 250-750) by length DESC (§3.6.2 Step 4), so
+    # piece 0 skips 2,000 bp after n1 [0, 250) and must be 'synthetic' (Item 4 / Invariant II).
+    assert res.inserts_rows[0]["src_intervals"] == "2250-2850"
+    assert res.inserts_rows[0]["join_before"] == "synthetic"
     assert res.inserts_rows[1]["join_before"] == "spacer"
     ins_ev = [e for e in res.sv_events if e.event_type == "INS"][0]
     assert "partial_content=1" in ins_ev.alleles_str
@@ -1620,6 +1624,10 @@ def test_boundary_1000bp_edlib_vs_1001bp_mappy_clustering_switch(
     core900 = make_complex_seq(900, seed=4414)
     tail60 = make_complex_seq(60, seed=4415)
     tail50 = make_complex_seq(50, seed=4416)
+    # Seeds 4415 ("TAACC...") and 4416 ("TCTTG...") collide on base 0 ('T'), which would
+    # shrink the divergent tail to 49 bp (< 50 bp); flip base 0 so the tail is genuinely 50 bp.
+    if tail50[0] == tail60[0]:
+        tail50 = ("A" if tail60[0] != "A" else "C") + tail50[1:]
     r960 = core900 + tail60
     s950 = core900 + tail50
     b.add_node("r960", r960).add_node("s950", s950)

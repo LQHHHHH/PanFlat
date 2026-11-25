@@ -494,6 +494,7 @@ class DeviationSegment:
     multi_hit_nodes: tuple[str, ...] = ()
     is_unanchored_start: bool = False
     is_unanchored_end: bool = False
+    left_anchor_contiguous: bool = True
 
     def detached(self, keep_provenance: bool = True) -> DeviationSegment:
         """Return a copy whose step and provenance slices do not pin full-contig parent arrays."""
@@ -521,6 +522,7 @@ class DeviationSegment:
             multi_hit_nodes=self.multi_hit_nodes,
             is_unanchored_start=self.is_unanchored_start,
             is_unanchored_end=self.is_unanchored_end,
+            left_anchor_contiguous=self.left_anchor_contiguous,
         )
 
 

@@ -2328,8 +2328,12 @@ def test_f19_04_c20_candidate_split_into_two_residuals_and_fully_masked_genotype
     assert_all_global_invariants(bundle, inputs.gfa_path, inputs.ref_fa_path)
 
     # Two residuals separated by N*spacer (never seamlessly stitched!)
+    # Right residual [2000, 2600) (600 bp, src 2250-2850, u_start=2000) sorts before
+    # left residual [0, 500) (500 bp, src 250-750) by length DESC (§3.6.2 Step 4), so
+    # piece 0 skips 2,000 bp after n1 [0, 250) and must be 'synthetic' (Item 4 / Invariant II).
     assert len(bundle.inserts) == 2
-    assert bundle.inserts[0]["join_before"] == "source_contiguous"
+    assert bundle.inserts[0]["src_intervals"] == "2250-2850"
+    assert bundle.inserts[0]["join_before"] == "synthetic"
     assert bundle.inserts[1]["join_before"] == "spacer"
     p0_e = int(bundle.inserts[0]["pan_end"])
     p1_s = int(bundle.inserts[1]["pan_start"])

@@ -37,6 +37,34 @@ def _is_full_step(step: Step) -> bool:
     return not step.is_partial and step.slice_start == 0 and step.slice_end is None
 
 
+def _step_boundary_contiguous(
+    provenance: Sequence[StepProvenance],
+    idx: int,
+) -> bool:
+    """Return True iff `provenance[idx - 1]` and `provenance[idx]` are contiguous on the same original path & strand."""
+    if idx <= 0 or idx >= len(provenance):
+        return True
+    if isinstance(provenance, LazyProvenanceTuple):
+        if not provenance._inv_intervals:
+            return True
+        abs_idx = provenance._slice_start + idx
+        return all(
+            abs_idx != iv_s and abs_idx != iv_e
+            for iv_s, iv_e in provenance._inv_intervals
+        )
+    prev_p = provenance[idx - 1]
+    curr_p = provenance[idx]
+    return (
+        prev_p.src_hap == curr_p.src_hap
+        and prev_p.src_path == curr_p.src_path
+        and prev_p.src_strand == curr_p.src_strand
+        and (
+            (prev_p.src_strand == "+" and prev_p.src_end == curr_p.src_start)
+            or (prev_p.src_strand == "-" and prev_p.src_start == curr_p.src_end)
+        )
+    )
+
+
 def build_backbone_anchor_map(
     backbone_steps: Sequence[Step],
     lo: int = 0,
@@ -1323,6 +1351,13 @@ def extract_deviations(
                                 multi_hit_nodes=mh_nodes,
                                 is_unanchored_start=False,
                                 is_unanchored_end=False,
+                                left_anchor_contiguous=(
+                                    True
+                                    if b_start >= b_end
+                                    else _step_boundary_contiguous(
+                                        fragment.provenance, b_start
+                                    )
+                                ),
                             )
                         )
         else:
@@ -1357,6 +1392,13 @@ def extract_deviations(
                             ),
                             is_unanchored_start=False,
                             is_unanchored_end=False,
+                            left_anchor_contiguous=(
+                                True
+                                if b_start >= b_end
+                                else _step_boundary_contiguous(
+                                    fragment.provenance, b_start
+                                )
+                            ),
                         )
                     )
 
@@ -1479,6 +1521,11 @@ def extract_deviations(
                     ),
                     is_unanchored_start=False,
                     is_unanchored_end=False,
+                    left_anchor_contiguous=(
+                        True
+                        if b_start >= b_end
+                        else _step_boundary_contiguous(fragment.provenance, b_start)
+                    ),
                 )
             )
 
@@ -1509,6 +1556,11 @@ def extract_deviations(
                 ),
                 is_unanchored_start=False,
                 is_unanchored_end=False,
+                left_anchor_contiguous=(
+                    True
+                    if b_start >= n_frag
+                    else _step_boundary_contiguous(fragment.provenance, b_start)
+                ),
             )
         )
 

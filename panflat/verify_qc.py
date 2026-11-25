@@ -723,12 +723,110 @@ class _SparsePathSlices:
     slices: dict[tuple[int, int], str]
 
 
+@dataclass
+class _PathStepBoundaryIndex:
+    """Exact step-boundary metadata for Global Invariant II `source_contiguous` verification."""
+
+    base_offset: int
+    total_len: int
+    # Absolute 0-based coordinate -> (node_id, orient, step_len)
+    # step_ending_at[src_s]: the unique step whose end == src_s (for '+' strand predecessor check)
+    step_ending_at: dict[int, tuple[str, str, int]]
+    # step_starting_at[src_e]: the unique step whose start == src_e (for '-' strand predecessor check)
+    step_starting_at: dict[int, tuple[str, str, int]]
+
+
+def _gfa_key_matches_query(
+    q_path: str,
+    key1: str,
+    key2: str | None = None,
+) -> bool:
+    """Return True iff a queried `src_path` matches a GFA path/walk key (supporting `::`-qualified names)."""
+    candidates = (
+        (q_path, q_path.split("::", 1)[-1]) if "::" in q_path else (q_path,)
+    )
+    for cand in candidates:
+        if cand == key1 or key1.startswith(f"{cand}:"):
+            return True
+        if key2 is not None and (cand == key2 or key2.startswith(f"{cand}:")):
+            return True
+    return False
+
+
+def _meta_could_match_backbone_prefix(
+    meta: _GFAPathMeta,
+    prefix: str,
+) -> bool:
+    """Return True iff `meta` is a candidate for `_match_gfa_paths_by_backbone_prefix` under `prefix`."""
+    if not prefix:
+        return False
+    if prefix.endswith("#"):
+        if meta.src_path.startswith(prefix) or meta.pan_name.startswith(prefix):
+            return True
+        if prefix.endswith("#0#") or prefix.endswith("#1#"):
+            base_sample = prefix[:-3]
+            if (
+                base_sample
+                and "#" not in base_sample
+                and ("#" in meta.src_path or meta.is_w_line)
+                and meta.sample == base_sample
+                and meta.hap in ("0", "1")
+            ):
+                return True
+        return False
+    if "#" in prefix:
+        return (
+            meta.src_path == prefix
+            or meta.pan_name == prefix
+            or meta.src_path.startswith(f"{prefix}#")
+            or meta.pan_name.startswith(f"{prefix}#")
+            or meta.src_path.startswith(f"{prefix}:")
+        )
+    if "#" in meta.src_path or meta.is_w_line:
+        return meta.sample == prefix
+    return meta.src_path.startswith(prefix)
+
+
 def _parse_gfa_paths_and_walks(
     gfa_path: Path,
     required_slices_by_path: Mapping[str, set[tuple[int, int]]] | None = None,
     out_path_metas: list[_GFAPathMeta] | None = None,
+    sc_queries_by_path: Mapping[str, set[tuple[int, int]]] | None = None,
+    wanted_ref_paths: set[str] | None = None,
+    out_path_step_bounds: dict[str, _PathStepBoundaryIndex] | None = None,
+    out_ref_path_steps: dict[str, np.ndarray | tuple[tuple[str, str], ...]] | None = None,
+    backbone_prefix: str | None = None,
 ) -> tuple[Mapping[str, str], dict[str, Any]]:
     """Independently parse GFA S, P, W lines into `(nodes, path_seqs)`."""
+
+    bp_prefix_clean = (backbone_prefix or "").strip()
+
+    def _is_wanted_ref(
+        key1: str,
+        key2: str | None = None,
+        meta: _GFAPathMeta | None = None,
+    ) -> bool:
+        if wanted_ref_paths:
+            if key1 in wanted_ref_paths:
+                return True
+            if key2 is not None and key2 in wanted_ref_paths:
+                return True
+        if bp_prefix_clean and meta is not None:
+            if _meta_could_match_backbone_prefix(meta, bp_prefix_clean):
+                return True
+        return False
+
+    def _matching_sc_reqs_general(
+        key1: str, key2: str | None = None
+    ) -> set[tuple[int, int]]:
+        if not sc_queries_by_path:
+            return set()
+        out: set[tuple[int, int]] = set()
+        for q_path, ivs in sc_queries_by_path.items():
+            if _gfa_key_matches_query(q_path, key1, key2):
+                out.update(ivs)
+        return out
+
     file_size = gfa_path.stat().st_size
     if file_size > 10_000_000 and required_slices_by_path is not None:
         from array import array as _c_array
@@ -800,6 +898,8 @@ def _parse_gfa_paths_and_walks(
             del seq_buf
             path_seqs_sparse: dict[str, Any] = {}
             fast_metas: list[_GFAPathMeta] = []
+            fast_step_bounds: dict[str, _PathStepBoundaryIndex] = {}
+            fast_ref_path_steps: dict[str, np.ndarray] = {}
             w_re = re.compile(r"([><])([1-9][0-9]{0,8})", re.ASCII)
             fast_ok = True
 
@@ -808,19 +908,7 @@ def _parse_gfa_paths_and_walks(
             ) -> set[tuple[int, int]]:
                 reqs: set[tuple[int, int]] = set()
                 for q_path, ivs in required_slices_by_path.items():
-                    lookup = (
-                        q_path.split("::", 1)[-1] if "::" in q_path else q_path
-                    )
-                    if (
-                        lookup == key1
-                        or key1.startswith(f"{lookup}:")
-                        or (
-                            key2 is not None
-                            and (
-                                lookup == key2 or key2.startswith(f"{lookup}:")
-                            )
-                        )
-                    ):
+                    if _gfa_key_matches_query(q_path, key1, key2):
                         reqs.update(ivs)
                 return reqs
 
@@ -828,7 +916,12 @@ def _parse_gfa_paths_and_walks(
                 codes: np.ndarray,
                 reqs: set[tuple[int, int]],
                 base_offset: int,
-            ) -> tuple[int, dict[tuple[int, int], str]]:
+                sc_reqs: set[tuple[int, int]] | None = None,
+            ) -> tuple[
+                int,
+                dict[tuple[int, int], str],
+                _PathStepBoundaryIndex | None,
+            ]:
                 nids_abs = np.abs(codes)
                 if int(nids_abs.shape[0]) > 0 and (
                     int(nids_abs.min()) <= 0 or int(nids_abs.max()) > max_nid
@@ -864,7 +957,45 @@ def _parse_gfa_paths_and_walks(
                             sl_map[(s_i, e_i)] = sub_seq[
                                 rs - base_lo : re_ - base_lo
                             ]
-                return total_len, sl_map
+                sc_idx: _PathStepBoundaryIndex | None = None
+                if sc_reqs:
+                    step_ending_at: dict[int, tuple[str, str, int]] = {}
+                    step_starting_at: dict[int, tuple[str, str, int]] = {}
+                    for s_i, e_i in sc_reqs:
+                        rs = s_i - base_offset
+                        re_ = e_i - base_offset
+                        if not (0 <= rs <= re_ <= total_len):
+                            continue
+                        if rs > 0:
+                            k_end = int(np.searchsorted(cum_bp, rs, side="left"))
+                            if 1 <= k_end <= n_c and int(cum_bp[k_end]) == rs:
+                                c_k = int(codes[k_end - 1])
+                                step_ending_at[s_i] = (
+                                    str(abs(c_k)),
+                                    "+" if c_k > 0 else "-",
+                                    int(cum_bp[k_end] - cum_bp[k_end - 1]),
+                                )
+                        if re_ < total_len:
+                            k_start = int(
+                                np.searchsorted(cum_bp, re_, side="left")
+                            )
+                            if (
+                                0 <= k_start < n_c
+                                and int(cum_bp[k_start]) == re_
+                            ):
+                                c_k = int(codes[k_start])
+                                step_starting_at[e_i] = (
+                                    str(abs(c_k)),
+                                    "+" if c_k > 0 else "-",
+                                    int(cum_bp[k_start + 1] - cum_bp[k_start]),
+                                )
+                    sc_idx = _PathStepBoundaryIndex(
+                        base_offset=base_offset,
+                        total_len=total_len,
+                        step_ending_at=step_ending_at,
+                        step_starting_at=step_starting_at,
+                    )
+                return total_len, sl_map, sc_idx
 
             with gfa_path.open("rb") as fh_pw:
                 for off_pos in pw_offsets:
@@ -880,11 +1011,21 @@ def _parse_gfa_paths_and_walks(
                             break
                         s_p, h_p, hid_p, seq_p = _parse_pansn_meta(pname)
                         pan_n = f"{s_p}#{h_p}#{seq_p}" if "#" in pname else pname
-                        fast_metas.append(
-                            _GFAPathMeta(pname, pan_n, s_p, h_p, hid_p, seq_p, False)
+                        meta_p = _GFAPathMeta(
+                            pname, pan_n, s_p, h_p, hid_p, seq_p, False
                         )
+                        fast_metas.append(meta_p)
                         reqs = _matching_reqs(pname)
-                        if not reqs:
+                        sc_reqs = (
+                            _matching_sc_reqs_general(pname)
+                            if out_path_step_bounds is not None
+                            else set()
+                        )
+                        is_ref = (
+                            out_ref_path_steps is not None
+                            and _is_wanted_ref(pname, meta=meta_p)
+                        )
+                        if not reqs and not sc_reqs and not is_ref:
                             path_seqs_sparse[pname] = _SparsePathSlices(
                                 0, 0, {}
                             )
@@ -908,12 +1049,29 @@ def _parse_gfa_paths_and_walks(
                             np.int32, copy=False
                         )
                         del step_str, nids, nids32, signs
-                        total_len, sl_map = _extract_reqs_from_codes(
-                            codes, reqs, 0
-                        )
-                        path_seqs_sparse[pname] = _SparsePathSlices(
-                            0, total_len, sl_map
-                        )
+                        if is_ref:
+                            fast_ref_path_steps[pname] = codes
+                        if reqs or sc_reqs:
+                            total_len, sl_map, sc_idx = _extract_reqs_from_codes(
+                                codes, reqs, 0, sc_reqs if sc_reqs else None
+                            )
+                            path_seqs_sparse[pname] = _SparsePathSlices(
+                                0, total_len, sl_map
+                            )
+                            if sc_idx is not None:
+                                fast_step_bounds[pname] = sc_idx
+                        else:
+                            nids_abs_r = np.abs(codes)
+                            if int(nids_abs_r.shape[0]) > 0 and (
+                                int(nids_abs_r.min()) <= 0
+                                or int(nids_abs_r.max()) > max_nid
+                            ):
+                                raise InvariantViolationError(
+                                    "GFA path/walk references unknown segment ID"
+                                )
+                            path_seqs_sparse[pname] = _SparsePathSlices(
+                                0, int(node_lens[nids_abs_r].sum()), {}
+                            )
                     elif rec_type == "W" and len(parts) >= 7:
                         sample, hap, seqid = parts[1], parts[2], parts[3]
                         start = 0 if parts[4] == "*" else int(parts[4])
@@ -923,23 +1081,36 @@ def _parse_gfa_paths_and_walks(
                             fast_ok = False
                             break
                         key_plain = f"{sample}#{hap}#{seqid}"
+                        meta_w: _GFAPathMeta | None = None
                         if end >= 0:
                             key_with_coords = (
                                 f"{sample}#{hap}#{seqid}:{start}-{end}"
                             )
-                            fast_metas.append(
-                                _GFAPathMeta(
-                                    key_with_coords,
-                                    key_plain,
-                                    sample,
-                                    hap,
-                                    f"{sample}#{hap}",
-                                    seqid,
-                                    True,
+                            meta_w = _GFAPathMeta(
+                                key_with_coords,
+                                key_plain,
+                                sample,
+                                hap,
+                                f"{sample}#{hap}",
+                                seqid,
+                                True,
+                            )
+                            fast_metas.append(meta_w)
+                            reqs = _matching_reqs(key_with_coords, key_plain)
+                            sc_reqs = (
+                                _matching_sc_reqs_general(
+                                    key_with_coords, key_plain
+                                )
+                                if out_path_step_bounds is not None
+                                else set()
+                            )
+                            is_ref = (
+                                out_ref_path_steps is not None
+                                and _is_wanted_ref(
+                                    key_with_coords, key_plain, meta=meta_w
                                 )
                             )
-                            reqs = _matching_reqs(key_with_coords, key_plain)
-                            if not reqs:
+                            if not reqs and not sc_reqs and not is_ref:
                                 sp_empty = _SparsePathSlices(
                                     start, max(0, end - start), {}
                                 )
@@ -969,35 +1140,59 @@ def _parse_gfa_paths_and_walks(
                             f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
                         )
                         if end < 0:
-                            fast_metas.append(
-                                _GFAPathMeta(
-                                    key_with_coords,
-                                    key_plain,
-                                    sample,
-                                    hap,
-                                    f"{sample}#{hap}",
-                                    seqid,
-                                    True,
-                                )
+                            meta_w = _GFAPathMeta(
+                                key_with_coords,
+                                key_plain,
+                                sample,
+                                hap,
+                                f"{sample}#{hap}",
+                                seqid,
+                                True,
                             )
+                            fast_metas.append(meta_w)
                         reqs = _matching_reqs(key_with_coords, key_plain)
-                        if not reqs:
+                        sc_reqs = (
+                            _matching_sc_reqs_general(
+                                key_with_coords, key_plain
+                            )
+                            if out_path_step_bounds is not None
+                            else set()
+                        )
+                        is_ref = (
+                            out_ref_path_steps is not None
+                            and _is_wanted_ref(
+                                key_with_coords, key_plain, meta=meta_w
+                            )
+                        )
+                        if is_ref:
+                            fast_ref_path_steps[key_with_coords] = codes
+                            if key_plain not in fast_ref_path_steps:
+                                fast_ref_path_steps[key_plain] = codes
+                        if not reqs and not sc_reqs:
                             sp_empty = _SparsePathSlices(start, walk_len, {})
                             path_seqs_sparse[key_with_coords] = sp_empty
                             if key_plain not in path_seqs_sparse:
                                 path_seqs_sparse[key_plain] = sp_empty
                             continue
-                        total_len, sl_map = _extract_reqs_from_codes(
-                            codes, reqs, start
+                        total_len, sl_map, sc_idx = _extract_reqs_from_codes(
+                            codes, reqs, start, sc_reqs if sc_reqs else None
                         )
                         sp_obj = _SparsePathSlices(start, total_len, sl_map)
                         path_seqs_sparse[key_with_coords] = sp_obj
                         if key_plain not in path_seqs_sparse:
                             path_seqs_sparse[key_plain] = sp_obj
+                        if sc_idx is not None:
+                            fast_step_bounds[key_with_coords] = sc_idx
+                            if key_plain not in fast_step_bounds:
+                                fast_step_bounds[key_plain] = sc_idx
 
             if fast_ok:
                 if out_path_metas is not None:
                     out_path_metas.extend(fast_metas)
+                if out_path_step_bounds is not None:
+                    out_path_step_bounds.update(fast_step_bounds)
+                if out_ref_path_steps is not None:
+                    out_ref_path_steps.update(fast_ref_path_steps)
                 return node_store, path_seqs_sparse
 
     nodes: dict[str, str] = {}
@@ -1031,15 +1226,43 @@ def _parse_gfa_paths_and_walks(
                 (parts[1], parts[2], parts[3], s_val, e_val, parts[6])
             )
 
+    def _build_small_step_bounds(
+        step_spans: Sequence[tuple[str, str, int]],
+        base_offset: int,
+        total_len: int,
+        sc_reqs: set[tuple[int, int]] | None,
+    ) -> _PathStepBoundaryIndex:
+        step_ending_at: dict[int, tuple[str, str, int]] = {}
+        step_starting_at: dict[int, tuple[str, str, int]] = {}
+        wanted_ends = {s_i for s_i, _ in sc_reqs} if sc_reqs is not None else None
+        wanted_starts = {e_i for _, e_i in sc_reqs} if sc_reqs is not None else None
+        pos = base_offset
+        for nid_s, ori_s, slen_s in step_spans:
+            pos_end = pos + slen_s
+            if wanted_ends is None or pos_end in wanted_ends:
+                step_ending_at[pos_end] = (nid_s, ori_s, slen_s)
+            if wanted_starts is None or pos in wanted_starts:
+                step_starting_at[pos] = (nid_s, ori_s, slen_s)
+            pos = pos_end
+        return _PathStepBoundaryIndex(
+            base_offset=base_offset,
+            total_len=total_len,
+            step_ending_at=step_ending_at,
+            step_starting_at=step_starting_at,
+        )
+
+    need_step_spans = (
+        out_path_step_bounds is not None or out_ref_path_steps is not None
+    )
     path_seqs: dict[str, tuple[int, str]] = {}
     for pname, step_str in raw_p:
+        s_p, h_p, hid_p, seq_p = _parse_pansn_meta(pname)
+        pan_n = f"{s_p}#{h_p}#{seq_p}" if "#" in pname else pname
+        meta_p_s = _GFAPathMeta(pname, pan_n, s_p, h_p, hid_p, seq_p, False)
         if out_path_metas is not None:
-            s_p, h_p, hid_p, seq_p = _parse_pansn_meta(pname)
-            pan_n = f"{s_p}#{h_p}#{seq_p}" if "#" in pname else pname
-            out_path_metas.append(
-                _GFAPathMeta(pname, pan_n, s_p, h_p, hid_p, seq_p, False)
-            )
+            out_path_metas.append(meta_p_s)
         chunks = []
+        step_spans_p: list[tuple[str, str, int]] = []
         for token in step_str.split(","):
             tok = token.strip()
             if not tok:
@@ -1051,7 +1274,27 @@ def _parse_gfa_paths_and_walks(
                 )
             seq = nodes[nid]
             chunks.append(seq if orient == "+" else revcomp(seq))
-        path_seqs[pname] = (0, "".join(chunks))
+            if need_step_spans:
+                step_spans_p.append((nid, orient, len(seq)))
+        full_seq_p = "".join(chunks)
+        path_seqs[pname] = (0, full_seq_p)
+        if out_ref_path_steps is not None and (
+            wanted_ref_paths is None or _is_wanted_ref(pname, meta=meta_p_s)
+        ):
+            out_ref_path_steps[pname] = tuple(
+                (nid_s, ori_s) for nid_s, ori_s, _ in step_spans_p
+            )
+        if out_path_step_bounds is not None:
+            if sc_queries_by_path is None:
+                out_path_step_bounds[pname] = _build_small_step_bounds(
+                    step_spans_p, 0, len(full_seq_p), None
+                )
+            else:
+                sc_reqs_p = _matching_sc_reqs_general(pname)
+                if sc_reqs_p:
+                    out_path_step_bounds[pname] = _build_small_step_bounds(
+                        step_spans_p, 0, len(full_seq_p), sc_reqs_p
+                    )
 
     w_full_re = re.compile(r"^(?:[><][^><\s]+)+$")
     w_step_re = re.compile(r"([><])([^><\s]+)")
@@ -1062,6 +1305,7 @@ def _parse_gfa_paths_and_walks(
                 f"Malformed W-line walk string '{walk_clean}' for '{sample}#{hap}#{seqid}'"
             )
         chunks = []
+        step_spans_w: list[tuple[str, str, int]] = []
         for match in w_step_re.finditer(walk_clean):
             orient_sym, nid = match.group(1), match.group(2)
             if nid not in nodes:
@@ -1069,26 +1313,57 @@ def _parse_gfa_paths_and_walks(
                     f"Unknown node '{nid}' in W line for '{sample}#{hap}#{seqid}'"
                 )
             seq = nodes[nid]
-            chunks.append(seq if orient_sym == ">" else revcomp(seq))
+            orient_c = "+" if orient_sym == ">" else "-"
+            chunks.append(seq if orient_c == "+" else revcomp(seq))
+            if need_step_spans:
+                step_spans_w.append((nid, orient_c, len(seq)))
         full_seq = "".join(chunks)
         computed_end = start + len(full_seq) if end < 0 else end
         key_with_coords = f"{sample}#{hap}#{seqid}:{start}-{computed_end}"
         key_plain = f"{sample}#{hap}#{seqid}"
+        meta_w_s = _GFAPathMeta(
+            key_with_coords,
+            key_plain,
+            sample,
+            hap,
+            f"{sample}#{hap}",
+            seqid,
+            True,
+        )
         if out_path_metas is not None:
-            out_path_metas.append(
-                _GFAPathMeta(
-                    key_with_coords,
-                    key_plain,
-                    sample,
-                    hap,
-                    f"{sample}#{hap}",
-                    seqid,
-                    True,
-                )
-            )
+            out_path_metas.append(meta_w_s)
         path_seqs[key_with_coords] = (start, full_seq)
         if key_plain not in path_seqs:
             path_seqs[key_plain] = (start, full_seq)
+        if out_ref_path_steps is not None and (
+            wanted_ref_paths is None
+            or _is_wanted_ref(key_with_coords, key_plain, meta=meta_w_s)
+        ):
+            ref_steps_w = tuple(
+                (nid_s, ori_s) for nid_s, ori_s, _ in step_spans_w
+            )
+            out_ref_path_steps[key_with_coords] = ref_steps_w
+            if key_plain not in out_ref_path_steps:
+                out_ref_path_steps[key_plain] = ref_steps_w
+        if out_path_step_bounds is not None:
+            if sc_queries_by_path is None:
+                pb_w = _build_small_step_bounds(
+                    step_spans_w, start, len(full_seq), None
+                )
+                out_path_step_bounds[key_with_coords] = pb_w
+                if key_plain not in out_path_step_bounds:
+                    out_path_step_bounds[key_plain] = pb_w
+            else:
+                sc_reqs_w = _matching_sc_reqs_general(
+                    key_with_coords, key_plain
+                )
+                if sc_reqs_w:
+                    pb_w = _build_small_step_bounds(
+                        step_spans_w, start, len(full_seq), sc_reqs_w
+                    )
+                    out_path_step_bounds[key_with_coords] = pb_w
+                    if key_plain not in out_path_step_bounds:
+                        out_path_step_bounds[key_plain] = pb_w
 
     return nodes, path_seqs
 
@@ -1135,6 +1410,36 @@ def _extract_source_slice(
     raise InvariantViolationError(
         f"Source slice {src_path}:{src_start}-{src_end}({src_strand}) out of bounds or missing in GFA"
     )
+
+
+def _lookup_path_step_bounds(
+    path_step_bounds: Mapping[str, _PathStepBoundaryIndex],
+    src_path: str,
+    src_start: int,
+    src_end: int,
+) -> _PathStepBoundaryIndex | None:
+    """Look up the `_PathStepBoundaryIndex` containing `[src_start, src_end]` for `src_path`."""
+
+    def _fits(idx_obj: _PathStepBoundaryIndex) -> bool:
+        return (
+            idx_obj.base_offset
+            <= src_start
+            <= src_end
+            <= idx_obj.base_offset + idx_obj.total_len
+        )
+
+    direct = path_step_bounds.get(src_path)
+    if direct is not None and _fits(direct):
+        return direct
+    lookup = src_path.split("::", 1)[-1] if "::" in src_path else src_path
+    if lookup != src_path:
+        stripped = path_step_bounds.get(lookup)
+        if stripped is not None and _fits(stripped):
+            return stripped
+    for k, idx_obj in path_step_bounds.items():
+        if _gfa_key_matches_query(src_path, k) and _fits(idx_obj):
+            return idx_obj
+    return None
 
 
 def _parse_src_interval(spec: str) -> tuple[int, int]:
@@ -1903,8 +2208,42 @@ def verify_build_outputs(
             except Exception:
                 pass
 
+        sc_queries: dict[str, set[tuple[int, int]]] = collections.defaultdict(
+            set
+        )
+        for r in ins_rows:
+            if r.get("join_before") == "source_contiguous":
+                try:
+                    s_i, e_i = _parse_src_interval(r.get("src_intervals", ""))
+                    sc_queries[r.get("src_path", "")].add((s_i, e_i))
+                except Exception:
+                    pass
+
+        wanted_ref_paths: set[str] = set()
+        if sc_queries:
+            for tc in pan_records:
+                rp_tc = summary_kv.get(f"{tc}:ref_path", "").strip()
+                if rp_tc:
+                    wanted_ref_paths.add(rp_tc)
+                    wanted_ref_paths.add(_strip_w_coord_suffix(rp_tc))
+            rp_glob = summary_kv.get("ref_path", "").strip()
+            if rp_glob:
+                wanted_ref_paths.add(rp_glob)
+                wanted_ref_paths.add(_strip_w_coord_suffix(rp_glob))
+
+        path_step_bounds: dict[str, _PathStepBoundaryIndex] = {}
+        ref_path_steps: dict[
+            str, np.ndarray | tuple[tuple[str, str], ...]
+        ] = {}
         gfa_nodes, path_seqs = _parse_gfa_paths_and_walks(
-            gfa_file, req_slices, out_path_metas=gfa_path_metas
+            gfa_file,
+            req_slices,
+            out_path_metas=gfa_path_metas,
+            sc_queries_by_path=sc_queries if sc_queries else None,
+            wanted_ref_paths=wanted_ref_paths if wanted_ref_paths else None,
+            out_path_step_bounds=path_step_bounds if sc_queries else None,
+            out_ref_path_steps=ref_path_steps if sc_queries else None,
+            backbone_prefix=eff_backbone_prefix if sc_queries else None,
         )
         if explicit_backbone:
             bp_clean = (backbone_prefix or "").strip()
@@ -2336,6 +2675,45 @@ def verify_build_outputs(
         n_pan = len(pan_up)
         covered_arr = np.zeros(n_pan, dtype=np.uint8)
 
+        chrom_ref_steps: np.ndarray | tuple[tuple[str, str], ...] | None = None
+        if ref_path_steps:
+            rp_cand = summary_kv.get(f"{ref_chrom}:ref_path", "").strip()
+            if not rp_cand and len(pan_records) == 1:
+                rp_cand = summary_kv.get("ref_path", "").strip()
+            if rp_cand:
+                chrom_ref_steps = ref_path_steps.get(rp_cand)
+                if chrom_ref_steps is None:
+                    chrom_ref_steps = ref_path_steps.get(
+                        _strip_w_coord_suffix(rp_cand)
+                    )
+            if chrom_ref_steps is None and eff_backbone_prefix:
+                cand_m_ref = [
+                    m
+                    for m in gfa_path_metas
+                    if m.seqid == ref_chrom
+                    or _strip_w_coord_suffix(m.seqid) == ref_chrom
+                    or m.src_path == ref_chrom
+                    or m.pan_name == ref_chrom
+                ]
+                matched_m_ref = _match_gfa_paths_by_backbone_prefix(
+                    cand_m_ref if len(pan_records) > 1 else gfa_path_metas,
+                    eff_backbone_prefix.strip(),
+                )
+                if len(matched_m_ref) == 1:
+                    chrom_ref_steps = ref_path_steps.get(
+                        matched_m_ref[0].src_path
+                    )
+                    if chrom_ref_steps is None:
+                        chrom_ref_steps = ref_path_steps.get(
+                            matched_m_ref[0].pan_name
+                        )
+
+        chrom_offsets = offsets_by_chrom.get(ref_chrom, ())
+        ref_step_idx_by_pan_end: dict[int, int] = {}
+        ref_up_chrom = (
+            ref_records[ref_chrom].upper() if ref_chrom in ref_records else ""
+        )
+
         if is_large_offsets:
             co = compact_offsets_by_chrom.get(ref_chrom)
             if co is not None and int(co.step_idx.shape[0]) > 0:
@@ -2357,9 +2735,11 @@ def verify_build_outputs(
                             break
                         covered_arr[ps_blk:pe_blk] = 1
         else:
-            for srow in offsets_by_chrom.get(ref_chrom, ()):
+            co = None
+            for idx_r, srow in enumerate(chrom_offsets):
                 p_s = int(srow["pan_start"])
                 p_e = int(srow["pan_end"])
+                ref_step_idx_by_pan_end[p_e] = idx_r
                 if 0 <= p_s <= p_e <= n_pan:
                     if bool(np.any(covered_arr[p_s:p_e] != 0)):
                         _err(
@@ -2369,9 +2749,69 @@ def verify_build_outputs(
                         break
                     covered_arr[p_s:p_e] = 1
 
+        def _get_prev_ref_step_at_pan_end(
+            pan_pos: int,
+        ) -> tuple[str, set[str], int] | None:
+            if is_large_offsets:
+                if co is None or int(co.p_e.shape[0]) == 0:
+                    return None
+                idx_pos = int(np.searchsorted(co.p_e, pan_pos, side="left"))
+                if (
+                    idx_pos >= int(co.p_e.shape[0])
+                    or int(co.p_e[idx_pos]) != pan_pos
+                ):
+                    return None
+                r_step_idx = int(co.step_idx[idx_pos])
+                ref_nid = str(co.nids[idx_pos])
+                r_s_p = int(co.r_s[idx_pos])
+                r_e_p = int(co.r_e[idx_pos])
+                l_prev = r_e_p - r_s_p
+            else:
+                idx_pos_opt = ref_step_idx_by_pan_end.get(pan_pos)
+                if idx_pos_opt is None:
+                    return None
+                srow_p = chrom_offsets[idx_pos_opt]
+                r_step_idx = int(srow_p["ref_step"])
+                ref_nid = srow_p["node_id"]
+                r_s_p = int(srow_p["ref_start"])
+                r_e_p = int(srow_p["ref_end"])
+                l_prev = r_e_p - r_s_p
+
+            if chrom_ref_steps is not None and 0 <= r_step_idx < len(
+                chrom_ref_steps
+            ):
+                if isinstance(chrom_ref_steps, np.ndarray):
+                    c_v = int(chrom_ref_steps[r_step_idx])
+                    gfa_nid, gfa_ori = str(abs(c_v)), ("+" if c_v > 0 else "-")
+                else:
+                    gfa_nid, gfa_ori = chrom_ref_steps[r_step_idx]
+                if gfa_nid != ref_nid:
+                    return None
+                expected_orients: set[str] = {gfa_ori}
+            else:
+                if ref_nid not in gfa_nodes or not (
+                    0 <= r_s_p <= r_e_p <= len(ref_up_chrom)
+                ):
+                    return None
+                node_seq = gfa_nodes[ref_nid].upper()
+                ref_sl = ref_up_chrom[r_s_p:r_e_p]
+                expected_orients = set()
+                if node_seq == ref_sl:
+                    expected_orients.add("+")
+                if revcomp(node_seq) == ref_sl:
+                    expected_orients.add("-")
+                if not expected_orients:
+                    return None
+            return ref_nid, expected_orients, l_prev
+
         prev_p_e: int | None = None
         prev_ev_id: str | None = None
         prev_allele: str | None = None
+        prev_src_hap: str | None = None
+        prev_src_path: str | None = None
+        prev_src_strand: str | None = None
+        prev_src_s: int | None = None
+        prev_src_e: int | None = None
 
         for row in ins_by_chrom.get(ref_chrom, ()):
             try:
@@ -2429,16 +2869,126 @@ def verify_build_outputs(
                             "INV2",
                             f"Expected {eff_spacer_n} 'N' spacer before pan_start={p_s}",
                         )
-            elif (
-                prev_p_e is not None
-                and prev_ev_id == row["event_id"]
-                and prev_allele == row["allele"]
-            ):
-                if p_s != prev_p_e:
+                    elif bool(np.any(covered_arr[p_s - eff_spacer_n : p_s] != 0)):
+                        _err(
+                            "INV2",
+                            f"Piece with join_before='spacer' for {row['event_id']} piece {row['piece']} "
+                            f"at pan_start={p_s} is preceded by covered bases rather than an uncovered {eff_spacer_n}-bp spacer",
+                        )
+            else:
+                if (
+                    prev_p_e is not None
+                    and prev_ev_id == row["event_id"]
+                    and prev_allele == row["allele"]
+                    and p_s != prev_p_e
+                ):
                     _err(
                         "INV2",
                         f"Non-spacer piece gap/overlap in {row['event_id']}: expected pan_start={prev_p_e}, got {p_s}",
                     )
+
+                if join_before == "synthetic":
+                    if p_s > 0 and int(covered_arr[p_s - 1]) == 0:
+                        _err(
+                            "INV2",
+                            f"Piece with join_before='synthetic' for {row['event_id']} piece {row['piece']} "
+                            f"at pan_start={p_s} is preceded by an undeclared uncovered spacer/gap",
+                        )
+                elif join_before == "source_contiguous":
+                    if p_s == 0:
+                        # Chromosome start with no predecessor: must start at physical start of src_path on src_strand
+                        pb = _lookup_path_step_bounds(
+                            path_step_bounds, row["src_path"], src_s, src_e
+                        )
+                        if pb is None:
+                            _err(
+                                "INV2",
+                                f"Piece with join_before='source_contiguous' at pan_start=0 "
+                                f"has unknown source path '{row['src_path']}'",
+                            )
+                        elif src_strand == "+" and src_s != pb.base_offset:
+                            _err(
+                                "INV2",
+                                f"Piece with join_before='source_contiguous' at pan_start=0 (+) "
+                                f"has src_start={src_s} != base_offset={pb.base_offset}",
+                            )
+                        elif (
+                            src_strand == "-"
+                            and src_e != pb.base_offset + pb.total_len
+                        ):
+                            _err(
+                                "INV2",
+                                f"Piece with join_before='source_contiguous' at pan_start=0 (-) "
+                                f"has src_end={src_e} != path_end={pb.base_offset + pb.total_len}",
+                            )
+                    else:
+                        prev_cov = int(covered_arr[p_s - 1])
+                        if prev_cov == 0:
+                            # Situation III: preceded by uncovered 'N' spacer/gap
+                            _err(
+                                "INV2",
+                                f"Piece with join_before='source_contiguous' for {row['event_id']} "
+                                f"piece {row['piece']} at pan_start={p_s} is preceded by an uncovered spacer/gap",
+                            )
+                        elif prev_cov == 2:
+                            # Situation I: immediately follows previous insert piece (prev_p_e == p_s)
+                            src_touch_ok = (
+                                prev_p_e == p_s
+                                and prev_src_hap == row["src_hap"]
+                                and prev_src_path == row["src_path"]
+                                and prev_src_strand == src_strand
+                                and (
+                                    (src_strand == "+" and prev_src_e == src_s)
+                                    or (
+                                        src_strand == "-"
+                                        and prev_src_s == src_e
+                                    )
+                                )
+                            )
+                            if not src_touch_ok:
+                                _err(
+                                    "INV2",
+                                    f"Invalid join_before='source_contiguous' for {row['event_id']} "
+                                    f"piece {row['piece']} at pan_start={p_s}: not source-contiguous with "
+                                    f"preceding insert piece ({prev_src_path}:{prev_src_s}-{prev_src_e}({prev_src_strand}) "
+                                    f"-> {row['src_path']}:{src_s}-{src_e}({src_strand}))",
+                                )
+                        elif prev_cov == 1:
+                            # Situation II: immediately follows reference step r_prev (ref_step_pan_end == p_s)
+                            prev_ref_info = _get_prev_ref_step_at_pan_end(p_s)
+                            pb = _lookup_path_step_bounds(
+                                path_step_bounds, row["src_path"], src_s, src_e
+                            )
+                            if prev_ref_info is None or pb is None:
+                                _err(
+                                    "INV2",
+                                    f"Invalid join_before='source_contiguous' for {row['event_id']} "
+                                    f"piece {row['piece']} at pan_start={p_s}: missing preceding ref step or GFA path bounds",
+                                )
+                            else:
+                                ref_nid, ref_orients, l_prev = prev_ref_info
+                                if src_strand == "+":
+                                    want_orients = ref_orients
+                                    pred_step = pb.step_ending_at.get(src_s)
+                                else:
+                                    want_orients = {
+                                        "-" if o == "+" else "+"
+                                        for o in ref_orients
+                                    }
+                                    pred_step = pb.step_starting_at.get(src_e)
+                                if (
+                                    pred_step is None
+                                    or pred_step[0] != ref_nid
+                                    or pred_step[1] not in want_orients
+                                    or pred_step[2] != l_prev
+                                ):
+                                    _err(
+                                        "INV2",
+                                        f"Invalid join_before='source_contiguous' for {row['event_id']} "
+                                        f"piece {row['piece']} at pan_start={p_s}: source path '{row['src_path']}' "
+                                        f"does not have preceding ref step ({ref_nid}, {sorted(want_orients)}, len={l_prev}) "
+                                        f"adjacent to [{src_s}, {src_e})({src_strand}), found {pred_step}",
+                                    )
 
             if prev_p_e is not None and p_s < prev_p_e:
                 _err(
@@ -2456,6 +3006,11 @@ def verify_build_outputs(
             prev_p_e = p_e
             prev_ev_id = row["event_id"]
             prev_allele = row["allele"]
+            prev_src_hap = row["src_hap"]
+            prev_src_path = row["src_path"]
+            prev_src_strand = src_strand
+            prev_src_s = src_s
+            prev_src_e = src_e
             checked_pieces += 1
 
         # Partition check: uncovered bases must be 'N' in exact multiples of eff_spacer_n

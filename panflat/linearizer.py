@@ -15,6 +15,7 @@ Implements PanFlat v1 specification:
 
 from __future__ import annotations
 
+import bisect
 import collections
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import contextlib
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field, replace
 import gc
 import multiprocessing
 import os
+import sys
 import time
 from typing import AbstractSet, Any, Iterator, Literal, Mapping, Sequence
 
@@ -70,6 +72,7 @@ from panflat.models import (
 from panflat.normalizer import (
     _extract_full_period,
     _get_lazy_backbone_anchor_arrays,
+    _step_boundary_contiguous,
     build_backbone_anchor_map,
     compute_raw_visit_counts,
     compute_weighted_lis,
@@ -81,6 +84,7 @@ from panflat.normalizer import (
     project_steps_onto_backbone,
 )
 from panflat.repeat_guard import (
+    EDLIB_MAX_LEN,
     REF_SUB_BLOCK_SIZE,
     REF_SUB_MIN_ALIGNED_RATIO,
     REF_SUB_MIN_IDENTITY,
@@ -90,6 +94,7 @@ from panflat.repeat_guard import (
     REPEAT_VALID_POS_RATIO,
     REPEAT_WINDOW_SIZE,
     REPEAT_WINDOW_STEP,
+    _check_similarity_merge_with_span,
     _repeat_mask_intervals_cached,
     check_similarity_merge,
     complement_intervals,
@@ -210,6 +215,7 @@ class CandidateBlock:
     partial_content: bool = False
     repeat_residual: bool = False
     multi_hit: bool = False
+    left_anchor_contiguous: bool = True
 
 
 @dataclass(frozen=True)
@@ -231,6 +237,8 @@ class ExtractedCandidate:
     partial_content: bool = False
     repeat_residual: bool = False
     multi_hit: bool = False
+    left_anchor_contiguous: bool = True
+    contig_idx: int = -1
 
 
 @dataclass
@@ -242,9 +250,10 @@ class GroupRepeatGuardResult:
     json_log_entries: list[dict[str, Any]] = field(default_factory=list)
     hap_had_masked_repeat: dict[str, bool] = field(default_factory=dict)
     hap_had_kept_candidate: dict[str, bool] = field(default_factory=dict)
-    contig_had_masked_repeat: set[tuple[str, str]] = field(default_factory=set)
-    contig_had_kept_candidate: set[tuple[str, str]] = field(default_factory=set)
+    contig_had_masked_repeat: set[int] = field(default_factory=set)
+    contig_had_kept_candidate: set[int] = field(default_factory=set)
     has_partial_content: bool = False
+    cand_dev_loc: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 def _make_temp_fragment(
@@ -326,170 +335,212 @@ def reanchor_deviation(
     covered_ranks_out: Any = None,
 ) -> list[DeviationSegment]:
     """
-    §3.5 Progress condition (a) (`F14`, `T16`): Local re-anchoring on `B(a, b)`.
+    §3.5 Progress condition (a) (`F14`, `T16`): Local re-anchoring on `B(a, b)` via explicit
+    LIFO iterative DFS (zero Python recursion depth limit, O(D) ancestor set maintenance).
     """
-    eff_hi = len(backbone_steps) if hi is None else hi
-    if dev.is_unanchored_start or dev.is_unanchored_end:
-        return [dev]
-
-    lo_ab = lo if dev.left_anchor_rank == "START" else int(dev.left_anchor_rank) + 1
-    hi_ab = eff_hi if dev.right_anchor_rank == "END" else int(dev.right_anchor_rank)
-
-    if hi_ab - lo_ab <= 0 or hi_ab - lo_ab >= eff_hi - lo:
-        return [dev]
-
-    if not dev.branch_steps:
-        return [dev]
-
-    # Fast check before allocating state keys: project onto B[lo_ab:hi_ab)
-    sub_anchors = project_steps_onto_backbone(
-        dev.branch_steps,
-        dev.branch_provenance,
-        backbone_steps,
-        nodes,
-        lo=lo_ab,
-        hi=hi_ab,
-    )
-    if isinstance(sub_anchors, LazyProjectedAnchorSequence):
-        has_fwd = bool(np.any(sub_anchors.rel_sign > 0))
-    else:
-        has_fwd = any(anc.rel_orient == "+" for anc in sub_anchors)
-    if not has_fwd:
-        return [dev]
-
-    if parent_key is None:
-        parent_key = SubproblemStateKey(
-            b_id=(("BACKBONE", 0, eff_hi, "+"),),
-            lo=lo,
-            hi=eff_hi,
-            has_logical_start=(lo > 0),
-            has_logical_end=(eff_hi < len(backbone_steps)),
-            m_key=(make_provenance_key(dev.branch_provenance),),
-        )
-
-    child_key = SubproblemStateKey(
-        b_id=parent_key.b_id,
-        lo=lo_ab,
-        hi=hi_ab,
-        has_logical_start=True,
-        has_logical_end=True,
-        m_key=parent_key.m_key,
-    )
-    if not can_transition(parent_key, child_key, ancestor_keys):
-        return [dev]
-
-    sub_chain, _ = compute_weighted_lis(sub_anchors)
-    if not sub_chain:
-        return [dev]
-
+    n_backbone = len(backbone_steps)
+    init_hi = n_backbone if hi is None else hi
     use_lazy_b = isinstance(backbone_steps, LazyStepTuple)
-    if covered_ranks_out is not None:
-        is_compact_cov = isinstance(covered_ranks_out, CompactRankSet)
-        if isinstance(sub_chain, LazyProjectedAnchorSequence) and is_compact_cov:
-            covered_ranks_out.add_array(sub_chain.rank_in_b)
-        else:
-            for anc in sub_chain:
-                covered_ranks_out.add(anc.rank_in_b)
+    is_compact_cov = isinstance(covered_ranks_out, CompactRankSet)
+    active_ancestors: set[SubproblemStateKey] = set(ancestor_keys)
+    refined: list[DeviationSegment] = []
+    stack: list[tuple[Any, ...]] = [("WORK", dev, lo, init_hi, parent_key)]
 
-        first_anc = sub_chain[0]
-        b_pref = (
-            backbone_steps[lo_ab : first_anc.rank_in_b]
-            if use_lazy_b
-            else tuple(backbone_steps[lo_ab : first_anc.rank_in_b])
+    while stack:
+        frame = stack.pop()
+        if frame[0] == "POP_ANC":
+            active_ancestors.discard(frame[1])
+            continue
+
+        _, cur_dev, cur_lo, cur_hi, cur_parent_key = frame
+        if cur_dev.is_unanchored_start or cur_dev.is_unanchored_end:
+            refined.append(cur_dev)
+            continue
+
+        lo_ab = (
+            cur_lo
+            if cur_dev.left_anchor_rank == "START"
+            else int(cur_dev.left_anchor_rank) + 1
         )
-        if dev.branch_steps[0 : first_anc.branch_step_idx] == b_pref:
-            if is_compact_cov:
-                covered_ranks_out.add_range(lo_ab, first_anc.rank_in_b + 1)
-            else:
-                for r in range(lo_ab, first_anc.rank_in_b + 1):
-                    covered_ranks_out.add(r)
+        hi_ab = (
+            cur_hi
+            if cur_dev.right_anchor_rank == "END"
+            else int(cur_dev.right_anchor_rank)
+        )
 
-        for k in range(len(sub_chain) - 1):
-            a_l = sub_chain[k]
-            a_r = sub_chain[k + 1]
-            b_mid = (
-                backbone_steps[a_l.rank_in_b + 1 : a_r.rank_in_b]
-                if use_lazy_b
-                else tuple(backbone_steps[a_l.rank_in_b + 1 : a_r.rank_in_b])
+        if hi_ab - lo_ab <= 0 or hi_ab - lo_ab >= cur_hi - cur_lo:
+            refined.append(cur_dev)
+            continue
+
+        if not cur_dev.branch_steps:
+            refined.append(cur_dev)
+            continue
+
+        # Fast check before allocating state keys: project onto B[lo_ab:hi_ab)
+        sub_anchors = project_steps_onto_backbone(
+            cur_dev.branch_steps,
+            cur_dev.branch_provenance,
+            backbone_steps,
+            nodes,
+            lo=lo_ab,
+            hi=hi_ab,
+        )
+        if isinstance(sub_anchors, LazyProjectedAnchorSequence):
+            has_fwd = bool(np.any(sub_anchors.rel_sign > 0))
+        else:
+            has_fwd = any(anc.rel_orient == "+" for anc in sub_anchors)
+        if not has_fwd:
+            refined.append(cur_dev)
+            continue
+
+        if cur_parent_key is None:
+            cur_parent_key = SubproblemStateKey(
+                b_id=(("BACKBONE", 0, cur_hi, "+"),),
+                lo=cur_lo,
+                hi=cur_hi,
+                has_logical_start=(cur_lo > 0),
+                has_logical_end=(cur_hi < n_backbone),
+                m_key=(make_provenance_key(cur_dev.branch_provenance),),
             )
-            if dev.branch_steps[a_l.branch_step_idx + 1 : a_r.branch_step_idx] == b_mid:
+
+        child_key = SubproblemStateKey(
+            b_id=cur_parent_key.b_id,
+            lo=lo_ab,
+            hi=hi_ab,
+            has_logical_start=True,
+            has_logical_end=True,
+            m_key=cur_parent_key.m_key,
+        )
+        if not can_transition(cur_parent_key, child_key, active_ancestors):
+            refined.append(cur_dev)
+            continue
+
+        sub_chain, _ = compute_weighted_lis(sub_anchors)
+        if not sub_chain:
+            refined.append(cur_dev)
+            continue
+
+        if covered_ranks_out is not None:
+            if isinstance(sub_chain, LazyProjectedAnchorSequence) and is_compact_cov:
+                covered_ranks_out.add_array(sub_chain.rank_in_b)
+            else:
+                for anc in sub_chain:
+                    covered_ranks_out.add(anc.rank_in_b)
+
+            first_anc = sub_chain[0]
+            b_pref = (
+                backbone_steps[lo_ab : first_anc.rank_in_b]
+                if use_lazy_b
+                else tuple(backbone_steps[lo_ab : first_anc.rank_in_b])
+            )
+            if cur_dev.branch_steps[0 : first_anc.branch_step_idx] == b_pref:
                 if is_compact_cov:
-                    covered_ranks_out.add_range(a_l.rank_in_b, a_r.rank_in_b + 1)
+                    covered_ranks_out.add_range(lo_ab, first_anc.rank_in_b + 1)
                 else:
-                    for r in range(a_l.rank_in_b, a_r.rank_in_b + 1):
+                    for r in range(lo_ab, first_anc.rank_in_b + 1):
                         covered_ranks_out.add(r)
 
-        last_anc = sub_chain[-1]
-        b_suff = (
-            backbone_steps[last_anc.rank_in_b + 1 : hi_ab]
-            if use_lazy_b
-            else tuple(backbone_steps[last_anc.rank_in_b + 1 : hi_ab])
-        )
-        if dev.branch_steps[last_anc.branch_step_idx + 1 :] == b_suff:
-            if is_compact_cov:
-                covered_ranks_out.add_range(last_anc.rank_in_b, hi_ab)
-            else:
-                for r in range(last_anc.rank_in_b, hi_ab):
-                    covered_ranks_out.add(r)
+            for k in range(len(sub_chain) - 1):
+                a_l = sub_chain[k]
+                a_r = sub_chain[k + 1]
+                b_mid = (
+                    backbone_steps[a_l.rank_in_b + 1 : a_r.rank_in_b]
+                    if use_lazy_b
+                    else tuple(backbone_steps[a_l.rank_in_b + 1 : a_r.rank_in_b])
+                )
+                if (
+                    cur_dev.branch_steps[a_l.branch_step_idx + 1 : a_r.branch_step_idx]
+                    == b_mid
+                ):
+                    if is_compact_cov:
+                        covered_ranks_out.add_range(a_l.rank_in_b, a_r.rank_in_b + 1)
+                    else:
+                        for r in range(a_l.rank_in_b, a_r.rank_in_b + 1):
+                            covered_ranks_out.add(r)
 
-    temp_frag = _make_temp_fragment(
-        dev.hap_id, dev.src_path, dev.branch_steps, dev.branch_provenance, nodes
-    )
-    raw_sub_devs = extract_deviations(
-        fragment=temp_frag,
-        main_chain=sub_chain,
-        backbone_steps=backbone_steps,
-        is_top_level=False,
-        lo=lo_ab,
-        hi=hi_ab,
-        all_projected_anchors=sub_anchors,
-    )
-
-    next_ancestors = ancestor_keys | {parent_key}
-    refined: list[DeviationSegment] = []
-    for sdev in raw_sub_devs:
-        mapped_left = (
-            dev.left_anchor_rank
-            if sdev.left_anchor_rank == "START"
-            else sdev.left_anchor_rank
-        )
-        mapped_right = (
-            dev.right_anchor_rank
-            if sdev.right_anchor_rank == "END"
-            else sdev.right_anchor_rank
-        )
-        if dev.multi_hit_nodes == sdev.multi_hit_nodes or not sdev.multi_hit_nodes:
-            merged_mh = dev.multi_hit_nodes
-        elif not dev.multi_hit_nodes:
-            merged_mh = sdev.multi_hit_nodes
-        else:
-            merged_mh = tuple(sorted(set(dev.multi_hit_nodes) | set(sdev.multi_hit_nodes)))
-        mapped_dev = DeviationSegment(
-            hap_id=dev.hap_id,
-            src_path=dev.src_path,
-            left_anchor_rank=mapped_left,
-            right_anchor_rank=mapped_right,
-            branch_start_idx=dev.branch_start_idx + sdev.branch_start_idx,
-            branch_end_idx=dev.branch_start_idx + sdev.branch_end_idx,
-            branch_steps=sdev.branch_steps,
-            branch_provenance=sdev.branch_provenance,
-            backbone_steps=sdev.backbone_steps,
-            multi_hit_nodes=merged_mh,
-            is_unanchored_start=False,
-            is_unanchored_end=False,
-        )
-        refined.extend(
-            reanchor_deviation(
-                dev=mapped_dev,
-                backbone_steps=backbone_steps,
-                nodes=nodes,
-                lo=lo_ab,
-                hi=hi_ab,
-                parent_key=child_key,
-                ancestor_keys=next_ancestors,
-                covered_ranks_out=covered_ranks_out,
+            last_anc = sub_chain[-1]
+            b_suff = (
+                backbone_steps[last_anc.rank_in_b + 1 : hi_ab]
+                if use_lazy_b
+                else tuple(backbone_steps[last_anc.rank_in_b + 1 : hi_ab])
             )
+            if cur_dev.branch_steps[last_anc.branch_step_idx + 1 :] == b_suff:
+                if is_compact_cov:
+                    covered_ranks_out.add_range(last_anc.rank_in_b, hi_ab)
+                else:
+                    for r in range(last_anc.rank_in_b, hi_ab):
+                        covered_ranks_out.add(r)
+
+        temp_frag = _make_temp_fragment(
+            cur_dev.hap_id,
+            cur_dev.src_path,
+            cur_dev.branch_steps,
+            cur_dev.branch_provenance,
+            nodes,
         )
+        raw_sub_devs = extract_deviations(
+            fragment=temp_frag,
+            main_chain=sub_chain,
+            backbone_steps=backbone_steps,
+            is_top_level=False,
+            lo=lo_ab,
+            hi=hi_ab,
+            all_projected_anchors=sub_anchors,
+        )
+        if not raw_sub_devs:
+            continue
+
+        mapped_devs: list[DeviationSegment] = []
+        for sdev in raw_sub_devs:
+            mapped_left = (
+                cur_dev.left_anchor_rank
+                if sdev.left_anchor_rank == "START"
+                else sdev.left_anchor_rank
+            )
+            mapped_right = (
+                cur_dev.right_anchor_rank
+                if sdev.right_anchor_rank == "END"
+                else sdev.right_anchor_rank
+            )
+            if (
+                cur_dev.multi_hit_nodes == sdev.multi_hit_nodes
+                or not sdev.multi_hit_nodes
+            ):
+                merged_mh = cur_dev.multi_hit_nodes
+            elif not cur_dev.multi_hit_nodes:
+                merged_mh = sdev.multi_hit_nodes
+            else:
+                merged_mh = tuple(
+                    sorted(set(cur_dev.multi_hit_nodes) | set(sdev.multi_hit_nodes))
+                )
+            mapped_devs.append(
+                DeviationSegment(
+                    hap_id=cur_dev.hap_id,
+                    src_path=cur_dev.src_path,
+                    left_anchor_rank=mapped_left,
+                    right_anchor_rank=mapped_right,
+                    branch_start_idx=cur_dev.branch_start_idx + sdev.branch_start_idx,
+                    branch_end_idx=cur_dev.branch_start_idx + sdev.branch_end_idx,
+                    branch_steps=sdev.branch_steps,
+                    branch_provenance=sdev.branch_provenance,
+                    backbone_steps=sdev.backbone_steps,
+                    multi_hit_nodes=merged_mh,
+                    is_unanchored_start=False,
+                    is_unanchored_end=False,
+                    left_anchor_contiguous=(
+                        cur_dev.left_anchor_contiguous
+                        if sdev.left_anchor_rank == "START"
+                        else sdev.left_anchor_contiguous
+                    ),
+                )
+            )
+
+        if cur_parent_key not in active_ancestors:
+            active_ancestors.add(cur_parent_key)
+            stack.append(("POP_ANC", cur_parent_key))
+        for mdev in reversed(mapped_devs):
+            stack.append(("WORK", mdev, lo_ab, hi_ab, child_key))
+
     return refined
 
 
@@ -507,6 +558,7 @@ def extract_candidate_blocks(
     base_source_order: int = 0,
     claimed_source_intervals: AbstractSet[tuple[str, int, int]] = frozenset(),
     precomputed_b_sets: tuple[AbstractSet[str], set[str], set[str]] | None = None,
+    out_run_starts: list[int] | None = None,
 ) -> list[CandidateBlock]:
     """
     §3.1 & §3.5 (`F15`, `T4`, `T9`, `T11`, `T19`): Extract candidate blocks from a terminal deviation.
@@ -621,8 +673,13 @@ def extract_candidate_blocks(
                             partial_content=False,
                             repeat_residual=top_undecomposable_repeat,
                             multi_hit=bool(dev.multi_hit_nodes),
+                            left_anchor_contiguous=(
+                                s_i == 0 and dev.left_anchor_contiguous
+                            ),
                         )
                     )
+                    if out_run_starts is not None:
+                        out_run_starts.append(int(s_i))
                     order_idx_fast += 1
                 return candidates_fast
 
@@ -712,14 +769,18 @@ def extract_candidate_blocks(
             return True
         return False
 
-    runs: list[tuple[list[Step], list[StepProvenance]]] = []
+    runs: list[tuple[int, list[Step], list[StepProvenance]]] = []
+    cur_start_idx = -1
     cur_steps: list[Step] = []
     cur_prov: list[StepProvenance] = []
 
-    for st, pv in zip(dev.branch_steps, dev.branch_provenance):
+    for step_idx, (st, pv) in enumerate(
+        zip(dev.branch_steps, dev.branch_provenance)
+    ):
         if _is_separator(st):
             if cur_steps:
-                runs.append((cur_steps, cur_prov))
+                runs.append((cur_start_idx, cur_steps, cur_prov))
+                cur_start_idx = -1
                 cur_steps = []
                 cur_prov = []
             continue
@@ -737,19 +798,22 @@ def extract_candidate_blocks(
                 else (prev.src_start == pv.src_end)
             )
             if not (same_source and contiguous):
-                runs.append((cur_steps, cur_prov))
+                runs.append((cur_start_idx, cur_steps, cur_prov))
+                cur_start_idx = -1
                 cur_steps = []
                 cur_prov = []
 
+        if not cur_steps:
+            cur_start_idx = step_idx
         cur_steps.append(st)
         cur_prov.append(pv)
 
     if cur_steps:
-        runs.append((cur_steps, cur_prov))
+        runs.append((cur_start_idx, cur_steps, cur_prov))
 
     candidates: list[CandidateBlock] = []
     order_idx = base_source_order
-    for r_steps, r_prov in runs:
+    for r_start_idx, r_steps, r_prov in runs:
         has_new_step = any(
             (not _is_full_step(st)) or (st.node_id not in b_interval_nodes)
             for st in r_steps
@@ -792,8 +856,15 @@ def extract_candidate_blocks(
                 partial_content=False,
                 repeat_residual=is_rep_residual,
                 multi_hit=bool(dev.multi_hit_nodes),
+                left_anchor_contiguous=(
+                    r_start_idx == 0
+                    and dev.left_anchor_contiguous
+                    and r_steps[0].slice_start == 0
+                ),
             )
         )
+        if out_run_starts is not None:
+            out_run_starts.append(int(r_start_idx))
         order_idx += 1
 
     return candidates
@@ -1050,7 +1121,9 @@ def screen_and_fold_candidate(
                 )
             )
 
-        for c_idx, (_, _, k_steps, k_prov, k_seq) in enumerate(kept_slices, start=1):
+        for c_idx, (u_start, _, k_steps, k_prov, k_seq) in enumerate(
+            kept_slices, start=1
+        ):
             k_len = len(k_seq)
             c_id = (
                 raw_cand.candidate_id
@@ -1121,6 +1194,9 @@ def screen_and_fold_candidate(
                     partial_content=bool(masked_intervals),
                     repeat_residual=raw_cand.repeat_residual,
                     multi_hit=raw_cand.multi_hit,
+                    left_anchor_contiguous=(
+                        u_start == 0 and raw_cand.left_anchor_contiguous
+                    ),
                 )
             )
             logs_out.append(
@@ -1167,6 +1243,7 @@ def screen_and_fold_candidate(
             partial_content=raw_cand.partial_content,
             repeat_residual=raw_cand.repeat_residual,
             multi_hit=raw_cand.multi_hit,
+            left_anchor_contiguous=raw_cand.left_anchor_contiguous,
         )
     )
     logs_out.append(
@@ -1264,6 +1341,9 @@ class ParallelGroupSolution:
     cand_to_nested_sig: dict[str, tuple[tuple[Any, tuple[int, ...]], ...]]
     cand_to_reconstructed_len: dict[str, int]
     cand_to_flags: dict[str, tuple[bool, bool, bool]] = field(default_factory=dict)
+    rep0_cand_spans: dict[str, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
 
 
 def steps_to_pieces(
@@ -1272,6 +1352,9 @@ def steps_to_pieces(
     piece_boundaries: Sequence[int],
     nodes: Mapping[str, str],
     members: Sequence[str],
+    first_join_before: Literal["source_contiguous", "spacer", "synthetic"] = (
+        "source_contiguous"
+    ),
 ) -> tuple[Piece, ...]:
     """
     Convert a sequence of `steps` and `provenance` into `Piece`s, splitting at cycle-folding
@@ -1301,7 +1384,7 @@ def steps_to_pieces(
         merged = merge_contiguous_provenance(chunk_p, chunk_seq)
         for m_prov, m_seq in merged:
             join_type: Literal["source_contiguous", "spacer", "synthetic"] = (
-                "source_contiguous" if len(pieces) == 0 else "synthetic"
+                first_join_before if len(pieces) == 0 else "synthetic"
             )
             pieces.append(
                 Piece(
@@ -1627,6 +1710,14 @@ def _solve_multi_member_component(
                         partial_content=parent_occ.partial_content,
                         repeat_residual=rb.repeat_residual or parent_occ.repeat_residual,
                         multi_hit=rb.multi_hit or m_mh or parent_occ.multi_hit,
+                        left_anchor_contiguous=(
+                            (
+                                rb.left_anchor_contiguous
+                                and d.exemplar.left_anchor_contiguous
+                            )
+                            if rb.left_anchor_rank == "START"
+                            else rb.left_anchor_contiguous
+                        ),
                     )
                     child_group_cands[g_key].append(ext_c)
                     if occ_idx == 0:
@@ -1652,32 +1743,41 @@ def _solve_multi_member_component(
         ]
     ] = []
 
-    for g_key in sorted_child_keys:
-        a_r, b_r = g_key
-        lo_ab = 0 if a_r == "START" else int(a_r) + 1
-        hi_ab = n_b if b_r == "END" else int(b_r)
-        b_slice_steps = b_steps[lo_ab:hi_ab]
-        sol = solve_parallel_group(
-            left_anchor_rank=a_r,
-            right_anchor_rank=b_r,
-            backbone_slice_steps=b_slice_steps,
-            candidates=child_group_cands[g_key],
-            graph=graph,
-            config=config,
-            parent_state_key=child_state_key,
-            ancestor_keys=next_ancestors,
-        )
-        if sol.non_backbone_reps:
-            a_pos = -1 if a_r == "START" else int(a_r)
-            b_pos = n_b if b_r == "END" else int(b_r)
-            active_child_solutions.append((g_key, b_pos, b_pos - a_pos, a_pos, sol))
-            for r in sol.non_backbone_reps:
-                if r.repeat_residual:
-                    extra_repeat_residual = True
-                if r.multi_hit:
-                    extra_multi_hit = True
-                if r.partial_content:
-                    extra_partial_content = True
+    old_rec_limit = sys.getrecursionlimit()
+    needed_rec_limit = min(100_000, len(comp) * 4 + 1024)
+    raised_rec_limit = needed_rec_limit > old_rec_limit
+    if raised_rec_limit:
+        sys.setrecursionlimit(needed_rec_limit)
+    try:
+        for g_key in sorted_child_keys:
+            a_r, b_r = g_key
+            lo_ab = 0 if a_r == "START" else int(a_r) + 1
+            hi_ab = n_b if b_r == "END" else int(b_r)
+            b_slice_steps = b_steps[lo_ab:hi_ab]
+            sol = solve_parallel_group(
+                left_anchor_rank=a_r,
+                right_anchor_rank=b_r,
+                backbone_slice_steps=b_slice_steps,
+                candidates=child_group_cands[g_key],
+                graph=graph,
+                config=config,
+                parent_state_key=child_state_key,
+                ancestor_keys=next_ancestors,
+            )
+            if sol.non_backbone_reps:
+                a_pos = -1 if a_r == "START" else int(a_r)
+                b_pos = n_b if b_r == "END" else int(b_r)
+                active_child_solutions.append((g_key, b_pos, b_pos - a_pos, a_pos, sol))
+                for r in sol.non_backbone_reps:
+                    if r.repeat_residual:
+                        extra_repeat_residual = True
+                    if r.multi_hit:
+                        extra_multi_hit = True
+                    if r.partial_content:
+                        extra_partial_content = True
+    finally:
+        if raised_rec_limit:
+            sys.setrecursionlimit(old_rec_limit)
 
     all_comp_occurrences: list[ExtractedCandidate] = []
     for d in comp:
@@ -1818,7 +1918,7 @@ def _solve_multi_member_component(
     cur_b_steps: list[Step] = []
     cur_b_prov: list[StepProvenance] = []
     cur_b_first_join: Literal["source_contiguous", "spacer", "synthetic"] = (
-        "source_contiguous"
+        b_sec.pieces[0].join_before if b_sec.pieces else "synthetic"
     )
 
     def _flush_b_run() -> None:
@@ -1864,7 +1964,13 @@ def _solve_multi_member_component(
                         ] = "spacer"
                     else:
                         first_join = (
-                            "synthetic" if len(raw_out_pieces) > 0 else "source_contiguous"
+                            "synthetic"
+                            if len(raw_out_pieces) > 0
+                            else (
+                                rep.pieces[0].join_before
+                                if rep.pieces
+                                else "synthetic"
+                            )
                         )
                     used_by = frozenset(
                         rep_used_by_parent_cands.get(
@@ -1991,6 +2097,11 @@ def solve_parallel_group(
             piece_boundaries=exemplar.piece_boundaries,
             nodes=graph.nodes,
             members=tuple(sorted(sup_haps)),
+            first_join_before=(
+                "source_contiguous"
+                if exemplar.left_anchor_contiguous
+                else "synthetic"
+            ),
         )
         dedup_list.append(
             DedupCandidate(
@@ -2125,20 +2236,27 @@ def solve_parallel_group(
     rep0_aligner: Any | None = None
     rep0_occurrences: list[ExtractedCandidate] = []
     rep0_cand_flags: dict[str, tuple[bool, bool, bool]] = {}
+    rep0_cand_spans: dict[str, tuple[int, int, int, int]] = {}
     real_reps: list[ClusterRepresentative] = []
 
     for rc in real_comps:
         if has_rep0:
             if (len(rc.seq) > 1000 or len(rep0_seq) > 1000) and rep0_aligner is None:
                 rep0_aligner = mappy.Aligner(seq=rep0_seq, preset="asm20")
-            if check_similarity_merge(
-                seq_s=rc.seq,
-                seq_r=rep0_seq,
-                min_sv_len=config.min_sv_len,
-                cluster_id=config.cluster_id,
-                cluster_win_id=config.cluster_win_id,
-                aligner=rep0_aligner,
-            ):
+            merged_rep0, rep0_ts, rep0_te, rep0_del_bp = (
+                _check_similarity_merge_with_span(
+                    seq_s=rc.seq,
+                    seq_r=rep0_seq,
+                    min_sv_len=config.min_sv_len,
+                    cluster_id=config.cluster_id,
+                    cluster_win_id=config.cluster_win_id,
+                    aligner=rep0_aligner,
+                )
+            )
+            if merged_rep0:
+                span_info = (len(rc.seq), rep0_ts, rep0_te, rep0_del_bp)
+                for occ in rc.member_occurrences:
+                    rep0_cand_spans[occ.candidate_id] = span_info
                 rep0_occurrences.extend(rc.member_occurrences)
                 rep0_cand_flags.update(rc.cand_to_flags)
                 continue
@@ -2206,8 +2324,45 @@ def solve_parallel_group(
 
     # Synthetic sequences: exact sequence deduplication only (§3.6.2 Step 4)
     synth_reps: list[ClusterRepresentative] = []
+    synth_rep0_span_cache: dict[str, tuple[bool, int, int, int]] = {}
     for sc in synth_comps:
         if has_rep0 and sc.seq == rep0_seq:
+            len_rep0 = len(rep0_seq)
+            for occ in sc.member_occurrences:
+                if occ.seq == rep0_seq:
+                    rep0_cand_spans[occ.candidate_id] = (
+                        len_rep0,
+                        0,
+                        len_rep0,
+                        0,
+                    )
+                else:
+                    cached_span = synth_rep0_span_cache.get(occ.seq)
+                    if cached_span is None:
+                        if (
+                            len(occ.seq) > EDLIB_MAX_LEN
+                            or len_rep0 > EDLIB_MAX_LEN
+                        ) and rep0_aligner is None:
+                            rep0_aligner = mappy.Aligner(
+                                seq=rep0_seq, preset="asm20"
+                            )
+                        cached_span = _check_similarity_merge_with_span(
+                            seq_s=occ.seq,
+                            seq_r=rep0_seq,
+                            min_sv_len=config.min_sv_len,
+                            cluster_id=config.cluster_id,
+                            cluster_win_id=config.cluster_win_id,
+                            aligner=rep0_aligner,
+                        )
+                        synth_rep0_span_cache[occ.seq] = cached_span
+                    merged_occ, o_ts, o_te, o_del = cached_span
+                    if merged_occ:
+                        rep0_cand_spans[occ.candidate_id] = (
+                            len(occ.seq),
+                            o_ts,
+                            o_te,
+                            o_del,
+                        )
             rep0_occurrences.extend(sc.member_occurrences)
             rep0_cand_flags.update(sc.cand_to_flags)
             continue
@@ -2320,6 +2475,7 @@ def solve_parallel_group(
         cand_to_nested_sig=cand_to_nested_sig,
         cand_to_reconstructed_len=cand_to_reconstructed_len,
         cand_to_flags=cand_to_flags,
+        rep0_cand_spans=rep0_cand_spans,
     )
 
 
@@ -2368,6 +2524,107 @@ def assemble_pan_and_offsets(
                 if rs == ev.ref_start:
                     cen_events_by_step[r_i].append(ev)
                     break
+
+    n_ref = len(graph.ref_fragment.steps)
+    frags_by_src_path: dict[str, list[PathFragment]] | None = None
+    frag_cum_cache: dict[int, np.ndarray | list[int]] = {}
+
+    def _find_orig_frag(
+        src_path: str, src_start: int, src_end: int
+    ) -> PathFragment | None:
+        nonlocal frags_by_src_path
+        if frags_by_src_path is None:
+            frags_by_src_path = collections.defaultdict(list)
+            frags_by_src_path[graph.ref_fragment.src_path].append(
+                graph.ref_fragment
+            )
+            for af in graph.alt_fragments:
+                frags_by_src_path[af.src_path].append(af)
+        cands = frags_by_src_path.get(src_path, ())
+        for f in cands:
+            if f.base_offset <= src_start <= src_end <= f.base_offset + f.total_len:
+                return f
+        return cands[0] if cands else None
+
+    def _verify_first_piece_source_contiguous(r_idx: int, p: Piece) -> bool:
+        if r_idx == 0:
+            if graph.alt_fragments:
+                frag = _find_orig_frag(p.src_path, p.src_start, p.src_end)
+                if frag is not None:
+                    return (
+                        p.src_start == frag.base_offset
+                        if p.src_strand == "+"
+                        else p.src_end == frag.base_offset + frag.total_len
+                    )
+            else:
+                if ":" in p.src_path:
+                    try:
+                        w_s_str, w_e_str = p.src_path.rsplit(":", 1)[1].split(
+                            "-", 1
+                        )
+                        w_s, w_e = int(w_s_str), int(w_e_str)
+                        return (
+                            p.src_start == w_s
+                            if p.src_strand == "+"
+                            else p.src_end == w_e
+                        )
+                    except ValueError:
+                        return False
+                return p.src_start == 0 if p.src_strand == "+" else False
+            return False
+
+        if 1 <= r_idx <= n_ref:
+            if not graph.alt_fragments:
+                return True
+            frag = _find_orig_frag(p.src_path, p.src_start, p.src_end)
+            if frag is None or len(frag.steps) == 0:
+                return True
+            ref_prev = graph.ref_fragment.steps[r_idx - 1]
+            l_prev = (
+                graph.ref_step_ranges[r_idx - 1][1]
+                - graph.ref_step_ranges[r_idx - 1][0]
+            )
+            if p.src_strand == "+":
+                want_s = p.src_start - l_prev
+                want_e = p.src_start
+                want_orient = ref_prev.orient
+            else:
+                want_s = p.src_end
+                want_e = p.src_end + l_prev
+                want_orient = "-" if ref_prev.orient == "+" else "+"
+            if (
+                want_s < frag.base_offset
+                or want_e > frag.base_offset + frag.total_len
+            ):
+                return False
+            fid = id(frag)
+            cum = frag_cum_cache.get(fid)
+            if cum is None:
+                if isinstance(frag.provenance, LazyProvenanceTuple):
+                    cum = frag.provenance._get_cum()
+                else:
+                    cum = [pv.src_start for pv in frag.provenance] + [
+                        frag.base_offset + frag.total_len
+                    ]
+                frag_cum_cache[fid] = cum
+            if isinstance(cum, np.ndarray):
+                k = int(np.searchsorted(cum, want_s, side="left"))
+            else:
+                k = bisect.bisect_left(cum, want_s)
+            if (
+                0 <= k < len(frag.steps)
+                and int(cum[k]) == want_s
+                and int(cum[k + 1]) == want_e
+            ):
+                pred_st = frag.steps[k]
+                return (
+                    _is_full_step(pred_st)
+                    and pred_st.node_id == ref_prev.node_id
+                    and pred_st.orient == want_orient
+                )
+            return False
+
+        return False
 
     def _emit_slot_blocks_at_step(
         r_idx: int,
@@ -2422,13 +2679,19 @@ def assemble_pan_and_offsets(
                         pan_chunks.append("N" * spacer_n)
                         pan_cursor += spacer_n
                     if p_i == 0:
-                        eff_join: Literal[
-                            "source_contiguous", "spacer", "synthetic"
-                        ] = (
-                            "spacer"
-                            if (need_leading_spacer or rep_i > 0)
-                            else p.join_before
-                        )
+                        if need_leading_spacer or rep_i > 0:
+                            eff_join: Literal[
+                                "source_contiguous", "spacer", "synthetic"
+                            ] = "spacer"
+                        elif (
+                            p.join_before == "source_contiguous"
+                            and not _verify_first_piece_source_contiguous(
+                                r_idx, p
+                            )
+                        ):
+                            eff_join = "synthetic"
+                        else:
+                            eff_join = p.join_before
                     else:
                         eff_join = p.join_before
 
@@ -2475,8 +2738,6 @@ def assemble_pan_and_offsets(
             pan_cursor += spacer_n
 
         return pan_cursor - slot_start_pan
-
-    n_ref = len(graph.ref_fragment.steps)
 
     # Fast vectorized path on chromosome-scale LazyStepTuple reference backbone
     if (
@@ -2672,6 +2933,15 @@ class _ContigAnalysis:
     node_visit_counts: Mapping[str, int]
     has_main_chain: bool = False
     contig_idx: int = -1
+    normalized_inv_rank_spans: list[tuple[int, int]] = field(
+        default_factory=list
+    )
+    small_dev_bp_spans: list[tuple[int, int, int]] = field(
+        default_factory=list
+    )
+    unnormalized_gap_spans: list[tuple[int, int]] = field(
+        default_factory=list
+    )
 
 
 def _supports_fork() -> bool:
@@ -2942,9 +3212,41 @@ def _analyze_single_normal_fragment(
                     cov_ranks.add(r)
 
     unnorm_rank_spans: list[tuple[int, int]] = []
+    unnorm_gap_spans: list[tuple[int, int]] = []
+    norm_inv_rank_spans: list[tuple[int, int]] = []
     for ch in inv_res.chains:
         if not ch.normalized:
             unnorm_rank_spans.append((ch.rmin, ch.rmax))
+        else:
+            norm_inv_rank_spans.append((ch.rmin, ch.rmax))
+    if inv_res.unnormalized_branch_ranges and main_chain:
+        u_ranges_sp = inv_res.unnormalized_branch_ranges
+        if isinstance(main_chain, LazyProjectedAnchorSequence):
+            mc_b_u = main_chain.branch_step_idx
+            mc_r_u = main_chain.rank_in_b
+            for k_u in range(int(mc_b_u.shape[0]) - 1):
+                bs_u = int(mc_b_u[k_u]) + 1
+                be_u = int(mc_b_u[k_u + 1])
+                if any(max(bs_u, us) < min(be_u, ue) for us, ue in u_ranges_sp):
+                    r_lo_u = int(mc_r_u[k_u])
+                    r_hi_u = int(mc_r_u[k_u + 1])
+                    if r_lo_u + 1 <= r_hi_u - 1:
+                        unnorm_rank_spans.append((r_lo_u + 1, r_hi_u - 1))
+                    else:
+                        unnorm_gap_spans.append((r_lo_u, r_hi_u))
+        else:
+            for k_u in range(len(main_chain) - 1):
+                bs_u = main_chain[k_u].branch_step_idx + 1
+                be_u = main_chain[k_u + 1].branch_step_idx
+                if any(max(bs_u, us) < min(be_u, ue) for us, ue in u_ranges_sp):
+                    r_lo_u = main_chain[k_u].rank_in_b
+                    r_hi_u = main_chain[k_u + 1].rank_in_b
+                    if r_lo_u + 1 <= r_hi_u - 1:
+                        unnorm_rank_spans.append((r_lo_u + 1, r_hi_u - 1))
+                    else:
+                        unnorm_gap_spans.append((r_lo_u, r_hi_u))
+    if len(unnorm_rank_spans) > 1:
+        unnorm_rank_spans = sorted(set(unnorm_rank_spans))
 
     visit_counts = compute_raw_visit_counts(norm_frag.steps)
     analysis = _ContigAnalysis(
@@ -2958,6 +3260,8 @@ def _analyze_single_normal_fragment(
         node_visit_counts=visit_counts,
         has_main_chain=bool(main_chain),
         contig_idx=frag_idx,
+        normalized_inv_rank_spans=norm_inv_rank_spans,
+        unnormalized_gap_spans=unnorm_gap_spans,
     )
 
     if for_ipc:
@@ -3111,6 +3415,15 @@ def _analyze_single_normal_fragment(
                 if exact_ref_match_mask is not None:
                     cand_mask &= ~exact_ref_match_mask
 
+                dropped_small_mask = (~cand_mask) & (b_bp > 0)
+                if exact_ref_match_mask is not None:
+                    dropped_small_mask &= ~exact_ref_match_mask
+                for k_sm in np.flatnonzero(dropped_small_mask).tolist():
+                    if not _ov_unnorm(int(b_starts[k_sm]), int(b_ends[k_sm])):
+                        analysis.small_dev_bp_spans.append(
+                            (int(mc_r[k_sm]), int(mc_r[k_sm + 1]), int(b_bp[k_sm]))
+                        )
+
                 ref_codes_abs = np.abs(ref_steps._codes)
                 for k in np.flatnonzero(cand_mask).tolist():
                     b_s = int(b_starts[k])
@@ -3128,10 +3441,18 @@ def _analyze_single_normal_fragment(
                     ):
                         if b_e - b_s == 1 and r_right - r_s == 1:
                             if int(f_nids[b_s]) != int(ref_codes_abs[r_s]):
+                                if int(b_bp[k]) > 0:
+                                    analysis.small_dev_bp_spans.append(
+                                        (r_left, r_right, int(b_bp[k]))
+                                    )
                                 continue
                         elif set(f_nids[b_s:b_e].tolist()).isdisjoint(
                             ref_codes_abs[r_s:r_right].tolist()
                         ):
+                            if int(b_bp[k]) > 0:
+                                analysis.small_dev_bp_spans.append(
+                                    (r_left, r_right, int(b_bp[k]))
+                                )
                             continue
                     br_st = norm_frag.steps[b_s:b_e]
                     b_st: Any = ref_steps[r_s:r_right]
@@ -3150,6 +3471,13 @@ def _analyze_single_normal_fragment(
                                 multi_hit_nodes=mh_flag,
                                 is_unanchored_start=False,
                                 is_unanchored_end=False,
+                                left_anchor_contiguous=(
+                                    True
+                                    if b_s >= b_e
+                                    else _step_boundary_contiguous(
+                                        norm_frag.provenance, b_s
+                                    )
+                                ),
                             )
                         )
 
@@ -3314,6 +3642,10 @@ def _analyze_single_normal_fragment(
                                     )
                                 )
                                 if not same_tokens:
+                                    if t_alt_bp > 0:
+                                        analysis.small_dev_bp_spans.append(
+                                            (ta, tb, t_alt_bp)
+                                        )
                                     continue
                     else:
                         t_alt_bp = sum(
@@ -3343,6 +3675,10 @@ def _analyze_single_normal_fragment(
                                     }
                                 )
                                 if not same_tokens:
+                                    if t_alt_bp > 0:
+                                        analysis.small_dev_bp_spans.append(
+                                            (ta, tb, t_alt_bp)
+                                        )
                                     continue
                 keep_prov = True
                 if (
@@ -3485,6 +3821,7 @@ def _screen_and_solve_one_pair(
         if not tdev.branch_provenance:
             cand_seq_idx += 1
             continue
+        rb_run_starts: list[int] = []
         raw_blocks = extract_candidate_blocks(
             dev=tdev,
             backbone_steps=ref_steps,
@@ -3500,10 +3837,11 @@ def _screen_and_solve_one_pair(
             ),
             base_source_order=next_src_order,
             claimed_source_intervals=claimed_source_intervals,
+            out_run_starts=rb_run_starts,
         )
         cand_seq_idx += 1
 
-        for rb in raw_blocks:
+        for rb, rb_start_idx in zip(raw_blocks, rb_run_starts):
             kept_c, unres_c, logs_c, had_mask, next_src_order = (
                 screen_and_fold_candidate(
                     raw_cand=rb,
@@ -3518,12 +3856,17 @@ def _screen_and_solve_one_pair(
             )
             if had_mask:
                 guard_res.hap_had_masked_repeat[rb.hap_id] = True
-                guard_res.contig_had_masked_repeat.add((rb.hap_id, rb.src_path))
+                guard_res.contig_had_masked_repeat.add(analysis.contig_idx)
             if kept_c:
                 guard_res.hap_had_kept_candidate[rb.hap_id] = True
-                guard_res.contig_had_kept_candidate.add((rb.hap_id, rb.src_path))
+                guard_res.contig_had_kept_candidate.add(analysis.contig_idx)
                 if any(kc.partial_content for kc in kept_c):
                     guard_res.has_partial_content = True
+                for kc in kept_c:
+                    guard_res.cand_dev_loc[kc.candidate_id] = (
+                        analysis.contig_idx,
+                        rb_start_idx,
+                    )
             guard_res.kept_candidates.extend(kept_c)
             guard_res.unresolved_records.extend(unres_c)
             guard_res.json_log_entries.extend(logs_c)
@@ -3564,13 +3907,38 @@ def _screen_and_solve_one_pair(
             rep.exemplar = replace(rep.exemplar, steps=(), provenance=(), seq="")
             rep.seq = ""
             rep.token_str = ""
+        cand_contig_idx = {
+            cid: loc[0] for cid, loc in guard_res.cand_dev_loc.items()
+        }
         if not sol.non_backbone_reps:
             sol.cand_to_rep_idx = {}
             sol.cand_to_nested_sig = {}
             sol.cand_to_reconstructed_len = {}
             sol.cand_to_flags = {}
+            sol.rep0_cand_spans = {}
+            guard_res.cand_dev_loc = {}
+        else:
+            rep0_cids = {
+                cid
+                for cid, r_idx in sol.cand_to_rep_idx.items()
+                if r_idx == 0
+            }
+            if rep0_cids:
+                guard_res.cand_dev_loc = {
+                    cid: loc
+                    for cid, loc in guard_res.cand_dev_loc.items()
+                    if cid in rep0_cids
+                }
+            else:
+                guard_res.cand_dev_loc = {}
         guard_res.kept_candidates = [
-            replace(kc, steps=(), provenance=(), seq="")
+            replace(
+                kc,
+                steps=(),
+                provenance=(),
+                seq="",
+                contig_idx=cand_contig_idx.get(kc.candidate_id, -1),
+            )
             for kc in guard_res.kept_candidates
         ]
 
@@ -3616,6 +3984,9 @@ def _contig_covers_anchor_pair(
     for u_lo, u_hi in analysis.unnormalized_rank_spans:
         if max(lo_r, u_lo) <= min(hi_r, u_hi):
             return False
+    for g_lo, g_hi in analysis.unnormalized_gap_spans:
+        if lo_r <= g_lo and g_hi <= hi_r:
+            return False
     for lj_lo, lj_hi in analysis.large_jump_rank_spans:
         if lo_r <= lj_lo and lj_hi <= hi_r:
             return False
@@ -3626,31 +3997,57 @@ def _contig_covers_rank_interval(
     analysis: _ContigAnalysis,
     rmin: int,
     rmax: int,
-    left_flank: int | None = None,
-    right_flank: int | None = None,
+    n_ref: int,
 ) -> bool:
-    """Return True iff `analysis`'s forward main chain spans across `[rmin, rmax]` (or its flanks)."""
-    if not analysis.has_main_chain:
+    """Return True iff `analysis`'s forward main chain strictly flanks `[rmin, rmax]` with no overlapping inversion or large-jump break."""
+    if not analysis.has_main_chain or not analysis.covered_ranks:
+        return False
+    if rmin <= 0 and rmax >= n_ref - 1:
         return False
     for u_lo, u_hi in analysis.unnormalized_rank_spans:
         if max(rmin, u_lo) <= min(rmax, u_hi):
             return False
-    for lj_lo, lj_hi in analysis.large_jump_rank_spans:
-        if max(rmin, lj_lo) < min(rmax, lj_hi):
+    for g_lo, g_hi in analysis.unnormalized_gap_spans:
+        if rmin <= g_lo and g_hi <= rmax:
             return False
-    if left_flank is not None and right_flank is not None:
-        if (
-            left_flank in analysis.covered_ranks
-            and right_flank in analysis.covered_ranks
-        ):
-            return True
+    for n_lo, n_hi in analysis.normalized_inv_rank_spans:
+        if max(rmin, n_lo) <= min(rmax, n_hi):
+            return False
+    for lj_lo, lj_hi in analysis.large_jump_rank_spans:
+        if max(rmin, lj_lo) <= min(rmax, lj_hi):
+            return False
+
     if isinstance(analysis.covered_ranks, CompactRankSet):
         min_cov = analysis.covered_ranks._min_val
         max_cov = analysis.covered_ranks._max_val
     else:
-        min_cov = min(analysis.covered_ranks) if analysis.covered_ranks else 10**9
-        max_cov = max(analysis.covered_ranks) if analysis.covered_ranks else -1
-    return min_cov <= rmin and max_cov >= rmax
+        min_cov = min(analysis.covered_ranks)
+        max_cov = max(analysis.covered_ranks)
+
+    left_ok = (min_cov < rmin) if rmin > 0 else (0 in analysis.covered_ranks)
+    right_ok = (
+        (max_cov > rmax)
+        if rmax < n_ref - 1
+        else ((n_ref - 1) in analysis.covered_ranks)
+    )
+    return left_ok and right_ok
+
+
+def _branch_steps_bp(
+    branch_steps: Sequence[Step],
+    graph: GFAGraph,
+) -> int:
+    """Compute total base length of `branch_steps` without depending on `branch_provenance`."""
+    if not branch_steps:
+        return 0
+    if (
+        isinstance(branch_steps, LazyStepTuple)
+        and graph._node_lens is not None
+    ):
+        br_nids = np.abs(branch_steps._codes)
+        if int(br_nids.max()) < int(graph._node_lens.shape[0]):
+            return int(graph._node_lens[br_nids].sum(dtype=np.int64))
+    return sum(_step_bp_len(st, graph.nodes) for st in branch_steps)
 
 
 def _resolve_haplotype_genotypes(
@@ -4190,7 +4587,7 @@ def run_chromosome_pipeline(
             for ca in ca_list:
                 if ca.contig_idx in carrier_contig_ids:
                     contig_calls[hap_id].append("1")
-                elif _contig_covers_rank_interval(ca, rmin, rmax, l_flank, r_flank):
+                elif _contig_covers_rank_interval(ca, rmin, rmax, n_ref):
                     contig_calls[hap_id].append("0")
                 else:
                     contig_calls[hap_id].append(".")
@@ -4314,6 +4711,178 @@ def run_chromosome_pipeline(
         )
 
     # 6c. Terminal normal groups G(a, b): DUP_TRA, CNV, DEL, and INS
+    # Precompute reference step lengths & per-contig sorted terminal deviation index for §5.2 INS genotyping
+    ref_step_lens_arr: np.ndarray | None = (
+        np.diff(graph._ref_cum_offsets)
+        if graph._ref_cum_offsets is not None
+        else None
+    )
+    dev_spans_by_contig: dict[int, list[tuple[int, int, int]]] = (
+        collections.defaultdict(list)
+    )
+    for (ta, tb), pair_entries in terminal_devs_by_pair.items():
+        for ca_d, tdev_d in pair_entries:
+            br_bp = _branch_steps_bp(tdev_d.branch_steps, graph)
+            if br_bp > 0:
+                dev_spans_by_contig[ca_d.contig_idx].append((ta, tb, br_bp))
+    for ca_s in contig_analyses:
+        if ca_s.small_dev_bp_spans:
+            dev_spans_by_contig[ca_s.contig_idx].extend(
+                ca_s.small_dev_bp_spans
+            )
+    dev_starts_by_contig: dict[int, list[int]] = {}
+    for c_idx, entries_c in dev_spans_by_contig.items():
+        entries_c.sort(key=lambda x: (x[0], x[1]))
+        dev_starts_by_contig[c_idx] = [e[0] for e in entries_c]
+
+    def _uncovered_ref_bp_open(
+        ca_obj: _ContigAnalysis,
+        r_a: int,
+        r_b: int,
+    ) -> int:
+        lo_r = max(0, r_a + 1)
+        hi_r = min(n_ref, r_b)
+        if lo_r >= hi_r:
+            return 0
+        cov = ca_obj.covered_ranks
+        if isinstance(cov, CompactRankSet):
+            uncov_mask = ~cov._mask[lo_r:hi_r]
+            if not bool(np.any(uncov_mask)):
+                return 0
+            if ref_step_lens_arr is not None:
+                return int(
+                    ref_step_lens_arr[lo_r:hi_r][uncov_mask].sum(dtype=np.int64)
+                )
+            return sum(
+                graph.ref_step_ranges[lo_r + off][1]
+                - graph.ref_step_ranges[lo_r + off][0]
+                for off in np.flatnonzero(uncov_mask).tolist()
+            )
+        return sum(
+            graph.ref_step_ranges[r][1] - graph.ref_step_ranges[r][0]
+            for r in range(lo_r, hi_r)
+            if r not in cov
+        )
+
+    def _dev_branch_bp_in_span(
+        contig_idx: int,
+        r_a: int,
+        r_b: int,
+    ) -> int:
+        entries_c = dev_spans_by_contig.get(contig_idx)
+        if not entries_c:
+            return 0
+        starts_c = dev_starts_by_contig[contig_idx]
+        pos = bisect.bisect_left(starts_c, r_a)
+        total_bp = 0
+        n_ent = len(entries_c)
+        while pos < n_ent:
+            ta_i, tb_i, br_bp_i = entries_c[pos]
+            if ta_i >= r_b:
+                break
+            if tb_i <= r_b:
+                total_bp += br_bp_i
+            pos += 1
+        return total_bp
+
+    def _case_a_rep0_matches_backbone(
+        tdev_here: DeviationSegment,
+        b_steps_slice: Sequence[Step],
+        c_list_here: Sequence[ExtractedCandidate],
+        cand_dev_loc: Mapping[str, tuple[int, int]],
+        rep0_cand_spans: Mapping[str, tuple[int, int, int, int]],
+    ) -> bool:
+        b_step_starts: list[int] = []
+        b_step_ends: list[int] = []
+        b_positions_by_tok: dict[tuple[str, str], list[int]] = (
+            collections.defaultdict(list)
+        )
+        cur_b_off = 0
+        for b_i, b_st in enumerate(b_steps_slice):
+            b_len = _step_bp_len(b_st, graph.nodes)
+            b_step_starts.append(cur_b_off)
+            cur_b_off += b_len
+            b_step_ends.append(cur_b_off)
+            b_positions_by_tok[(b_st.node_id, b_st.orient)].append(b_i)
+        len_b = cur_b_off
+
+        cands_at_step: dict[int, list[tuple[int, int, int, int]]] = (
+            collections.defaultdict(list)
+        )
+        kept_nonref_bp = 0
+        for kc in c_list_here:
+            span = rep0_cand_spans.get(kc.candidate_id)
+            loc = cand_dev_loc.get(kc.candidate_id)
+            if span is None or loc is None:
+                return False
+            kept_nonref_bp += span[0]
+            cands_at_step[loc[1]].append(span)
+
+        nonref_br_bp = 0
+        for st in tdev_here.branch_steps:
+            if not (_is_full_step(st) and st.node_id in graph.global_ref_nodes):
+                nonref_br_bp += _step_bp_len(st, graph.nodes)
+
+        dropped_nonref_bp = max(0, nonref_br_bp - kept_nonref_bp)
+        if dropped_nonref_bp >= config.min_sv_len:
+            return False
+
+        cursor_b = 0
+        b_step_cursor = 0
+        covered_b_bp = 0
+        extra_ref_br_bp = 0
+        total_internal_del_bp = 0
+        ins_excess_bp = 0
+
+        for step_idx, st in enumerate(tdev_here.branch_steps):
+            if step_idx in cands_at_step:
+                for kept_len, t_start, t_end, internal_del_bp in cands_at_step[
+                    step_idx
+                ]:
+                    eff_start = max(t_start, cursor_b)
+                    new_b_cov = max(0, t_end - eff_start)
+                    if new_b_cov > 0:
+                        covered_b_bp += new_b_cov
+                        cursor_b = t_end
+                        total_internal_del_bp += internal_del_bp
+                        ins_excess_bp += max(
+                            0, kept_len + internal_del_bp - new_b_cov
+                        )
+                    else:
+                        ins_excess_bp += kept_len
+            if _is_full_step(st) and st.node_id in graph.global_ref_nodes:
+                slen = _step_bp_len(st, graph.nodes)
+                tok = (st.node_id, st.orient)
+                pos_list = b_positions_by_tok.get(tok)
+                matched_b_idx = -1
+                if pos_list:
+                    p_lo = bisect.bisect_left(pos_list, b_step_cursor)
+                    while p_lo < len(pos_list):
+                        cand_b_i = pos_list[p_lo]
+                        if b_step_ends[cand_b_i] > cursor_b:
+                            matched_b_idx = cand_b_i
+                            break
+                        p_lo += 1
+                if matched_b_idx >= 0:
+                    bs_start = b_step_starts[matched_b_idx]
+                    bs_end = b_step_ends[matched_b_idx]
+                    ov_prev = max(0, cursor_b - bs_start)
+                    new_cov = bs_end - max(bs_start, cursor_b)
+                    covered_b_bp += new_cov
+                    cursor_b = bs_end
+                    b_step_cursor = matched_b_idx + 1
+                    ins_excess_bp += ov_prev
+                else:
+                    extra_ref_br_bp += slen
+
+        uncovered_b_bp = (len_b - covered_b_bp) + total_internal_del_bp
+        return (
+            extra_ref_br_bp + dropped_nonref_bp + uncovered_b_bp
+            < config.min_sv_len
+            and extra_ref_br_bp + dropped_nonref_bp + ins_excess_bp
+            < config.min_sv_len
+        )
+
     guard_unres_indices_by_pair: dict[tuple[int, int], list[int]] = (
         collections.defaultdict(list)
     )
@@ -4616,25 +5185,34 @@ def run_chromosome_pipeline(
                                 ]
                             )
                             br_is_sh = np.isin(br_codes_abs, shared_int)
-                            br_sh_lazy = LazyStepTuple(
-                                dev.branch_steps._codes[br_is_sh]
-                            )
-                            sh_cnv = detect_canonical_cnv(
-                                b_sh_lazy,
-                                br_sh_lazy,
-                                graph.nodes,
-                                config.min_sv_len,
-                            )
-                            if sh_cnv is not None:
-                                p_key = (
-                                    rank_a + 1 + int(sh_rel[0]),
-                                    rank_a + 1 + int(sh_rel[-1]) + 1,
-                                    sh_cnv.unit_tokens,
+                            br_sh_rel = np.flatnonzero(br_is_sh)
+                            n_br_sh = int(br_sh_rel.shape[0])
+                            if (
+                                n_br_sh > 0
+                                and int(br_sh_rel[-1]) - int(br_sh_rel[0]) + 1
+                                == n_br_sh
+                            ):
+                                br_sh_lazy = LazyStepTuple(
+                                    dev.branch_steps._codes[
+                                        int(br_sh_rel[0]) : int(br_sh_rel[-1]) + 1
+                                    ]
                                 )
-                                if p_key not in emitted_full_cnv_keys:
-                                    partial_cnv_intervals[p_key].append(
-                                        (ca, dev, sh_cnv)
+                                sh_cnv = detect_canonical_cnv(
+                                    b_sh_lazy,
+                                    br_sh_lazy,
+                                    graph.nodes,
+                                    config.min_sv_len,
+                                )
+                                if sh_cnv is not None:
+                                    p_key = (
+                                        rank_a + 1 + int(sh_rel[0]),
+                                        rank_a + 1 + int(sh_rel[-1]) + 1,
+                                        sh_cnv.unit_tokens,
                                     )
+                                    if p_key not in emitted_full_cnv_keys:
+                                        partial_cnv_intervals[p_key].append(
+                                            (ca, dev, sh_cnv)
+                                        )
                 else:
                     if b_nids_str is None:
                         if isinstance(b_slice_steps, LazyStepTuple):
@@ -4712,33 +5290,48 @@ def run_chromosome_pipeline(
                             + 1
                             == len(b_shared_indices)
                         ):
-                            b_sh_steps = [
-                                st
-                                for st in b_slice_steps
-                                if st.node_id in shared_nids
-                            ]
-                            br_sh_steps = [
-                                st
-                                for st in dev.branch_steps
+                            br_shared_indices = [
+                                i
+                                for i, st in enumerate(dev.branch_steps)
                                 if _is_full_step(st)
                                 and st.node_id in shared_nids
                             ]
-                            sh_cnv = detect_canonical_cnv(
-                                b_sh_steps,
-                                br_sh_steps,
-                                graph.nodes,
-                                config.min_sv_len,
-                            )
-                            if sh_cnv is not None:
-                                p_key = (
-                                    b_shared_indices[0],
-                                    b_shared_indices[-1] + 1,
-                                    sh_cnv.unit_tokens,
+                            if (
+                                br_shared_indices
+                                and br_shared_indices[-1]
+                                - br_shared_indices[0]
+                                + 1
+                                == len(br_shared_indices)
+                            ):
+                                b_sh_steps = [
+                                    st
+                                    for st in b_slice_steps
+                                    if st.node_id in shared_nids
+                                ]
+                                br_sh_steps = list(
+                                    dev.branch_steps[
+                                        br_shared_indices[0] : br_shared_indices[
+                                            -1
+                                        ]
+                                        + 1
+                                    ]
                                 )
-                                if p_key not in emitted_full_cnv_keys:
-                                    partial_cnv_intervals[p_key].append(
-                                        (ca, dev, sh_cnv)
+                                sh_cnv = detect_canonical_cnv(
+                                    b_sh_steps,
+                                    br_sh_steps,
+                                    graph.nodes,
+                                    config.min_sv_len,
+                                )
+                                if sh_cnv is not None:
+                                    p_key = (
+                                        b_shared_indices[0],
+                                        b_shared_indices[-1] + 1,
+                                        sh_cnv.unit_tokens,
                                     )
+                                    if p_key not in emitted_full_cnv_keys:
+                                        partial_cnv_intervals[p_key].append(
+                                            (ca, dev, sh_cnv)
+                                        )
 
             for (del_r_lo, del_r_hi), del_entries in sorted(
                 del_intervals.items()
@@ -4877,11 +5470,11 @@ def run_chromosome_pipeline(
         if sol is not None and sol.non_backbone_reps:
             ins_ref_pos = graph.ref_step_ranges[rank_b][0]
 
-            cands_by_contig: dict[tuple[str, str], list[ExtractedCandidate]] = (
+            cands_by_contig: dict[int, list[ExtractedCandidate]] = (
                 collections.defaultdict(list)
             )
             for kc in guard_res.kept_candidates:
-                cands_by_contig[(kc.hap_id, kc.src_path)].append(kc)
+                cands_by_contig[kc.contig_idx].append(kc)
 
             SignatureType = tuple[
                 tuple[int, ...],
@@ -4897,9 +5490,13 @@ def run_chromosome_pipeline(
             sig_has_mh: dict[SignatureType, bool] = {}
             sig_cand_ids: dict[SignatureType, set[str]] = collections.defaultdict(set)
 
+            dev_by_contig_at_pair = {
+                ca_d.contig_idx: tdev_d for ca_d, tdev_d in devs_at_pair
+            }
+
             for hap_id, ca_list in contigs_by_hap.items():
                 for ca in ca_list:
-                    ckey = (hap_id, ca.raw_fragment.src_path)
+                    ckey = ca.contig_idx
                     c_list = sorted(
                         cands_by_contig.get(ckey, ()),
                         key=lambda x: x.source_order,
@@ -4952,12 +5549,48 @@ def run_chromosome_pipeline(
                         elif ckey in guard_res.contig_had_masked_repeat:
                             contig_sig_by_hap[hap_id].append(".")
                         elif _contig_covers_anchor_pair(ca, rank_a, rank_b):
-                            contig_sig_by_hap[hap_id].append("0")
+                            tdev_here = dev_by_contig_at_pair.get(ca.contig_idx)
+                            c_list_here = [
+                                kc
+                                for kc in c_list
+                                if guard_res.cand_dev_loc.get(
+                                    kc.candidate_id, (-1, -1)
+                                )[0]
+                                == ca.contig_idx
+                            ]
+                            if tdev_here is not None and c_list_here:
+                                is_ref_like = _case_a_rep0_matches_backbone(
+                                    tdev_here,
+                                    b_slice_steps,
+                                    c_list_here,
+                                    guard_res.cand_dev_loc,
+                                    sol.rep0_cand_spans,
+                                )
+                            else:
+                                is_ref_like = (
+                                    _uncovered_ref_bp_open(ca, rank_a, rank_b)
+                                    < config.min_sv_len
+                                    and _dev_branch_bp_in_span(
+                                        ca.contig_idx, rank_a, rank_b
+                                    )
+                                    < config.min_sv_len
+                                )
+                            contig_sig_by_hap[hap_id].append(
+                                "0" if is_ref_like else "."
+                            )
                         else:
                             contig_sig_by_hap[hap_id].append(".")
                     elif ckey in guard_res.contig_had_masked_repeat:
                         contig_sig_by_hap[hap_id].append(".")
-                    elif _contig_covers_anchor_pair(ca, rank_a, rank_b):
+                    elif (
+                        _contig_covers_anchor_pair(ca, rank_a, rank_b)
+                        and _uncovered_ref_bp_open(ca, rank_a, rank_b)
+                        < config.min_sv_len
+                        and _dev_branch_bp_in_span(
+                            ca.contig_idx, rank_a, rank_b
+                        )
+                        < config.min_sv_len
+                    ):
                         contig_sig_by_hap[hap_id].append("0")
                     else:
                         contig_sig_by_hap[hap_id].append(".")

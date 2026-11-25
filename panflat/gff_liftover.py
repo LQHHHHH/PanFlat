@@ -618,19 +618,31 @@ def liftover_gff3_lines(
     container_postorder: list[_ParsedGFFFeature] = []
     visited_containers: set[int] = set()
 
-    def _visit_container(c_feat: _ParsedGFFFeature) -> None:
-        if c_feat.row_idx in visited_containers:
-            return
-        visited_containers.add(c_feat.row_idx)
-        if c_feat.feat_id:
-            for ch in children_by_parent.get(c_feat.feat_id, ()):
-                if ch.ftype not in SPLITTABLE_FEATURE_TYPES:
-                    _visit_container(ch)
-        container_postorder.append(c_feat)
-
     for feat in features:
-        if feat.ftype not in SPLITTABLE_FEATURE_TYPES:
-            _visit_container(feat)
+        if (
+            feat.ftype in SPLITTABLE_FEATURE_TYPES
+            or feat.row_idx in visited_containers
+        ):
+            continue
+        dfs_stack: list[tuple[_ParsedGFFFeature, bool]] = [(feat, False)]
+        while dfs_stack:
+            c_feat, expanded = dfs_stack.pop()
+            if expanded:
+                container_postorder.append(c_feat)
+                continue
+            if c_feat.row_idx in visited_containers:
+                continue
+            visited_containers.add(c_feat.row_idx)
+            dfs_stack.append((c_feat, True))
+            if c_feat.feat_id:
+                child_containers_to_visit = [
+                    ch
+                    for ch in children_by_parent.get(c_feat.feat_id, ())
+                    if ch.ftype not in SPLITTABLE_FEATURE_TYPES
+                    and ch.row_idx not in visited_containers
+                ]
+                for ch in reversed(child_containers_to_visit):
+                    dfs_stack.append((ch, False))
 
     eff_bounds_by_row: dict[int, tuple[int, int]] = {}
     for feat in container_postorder:
