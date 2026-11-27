@@ -28,7 +28,6 @@ import threading
 import time
 from typing import AbstractSet, Any, Iterator, Literal, Mapping, Sequence
 
-import edlib
 import mappy
 import numpy as np
 
@@ -101,9 +100,7 @@ from panflat.repeat_guard import (
     _repeat_mask_intervals_cached,
     check_similarity_merge,
     complement_intervals,
-    hit_covers_subinterval_mappy,
     merge_contiguous_provenance,
-    merge_intervals,
     repeat_mask_intervals,
     slice_candidate_by_intervals,
     subtract_reference_intervals_mappy,
@@ -1520,9 +1517,6 @@ class ParallelGroupSolution:
     rep0_cand_spans: dict[str, tuple[int, int, int, int]] = field(
         default_factory=dict
     )
-    rep0_cand_del_intervals: dict[str, tuple[tuple[int, int], ...]] = field(
-        default_factory=dict
-    )
 
 
 def steps_to_pieces(
@@ -1759,26 +1753,6 @@ def _solve_multi_member_component(
         tuple[int, tuple[int | Literal["START"], int | Literal["END"]]],
         list[ExtractedCandidate],
     ] = collections.defaultdict(list)
-    member_occ_cands_at_group: dict[
-        tuple[int, int, tuple[int | Literal["START"], int | Literal["END"]]],
-        list[ExtractedCandidate],
-    ] = collections.defaultdict(list)
-    member_term_devs: dict[
-        int,
-        list[
-            tuple[
-                tuple[int | Literal["START"], int | Literal["END"]],
-                int,
-                int,
-                tuple[Step, ...],
-                list[tuple[str, tuple[Step, ...]]],
-            ]
-        ],
-    ] = collections.defaultdict(list)
-    g_key_to_m_idxs: dict[
-        tuple[int | Literal["START"], int | Literal["END"]],
-        set[int],
-    ] = collections.defaultdict(set)
     member_covered_anchors: dict[int, set[int | Literal["START", "END"]]] = {}
     member_local_flags: dict[int, tuple[bool, bool]] = {}
     extra_repeat_residual = any(
@@ -1883,9 +1857,6 @@ def _solve_multi_member_component(
             next_child_order += len(raw_blocks)
 
             g_key = (tdev.left_anchor_rank, tdev.right_anchor_rank)
-            lo_ab = 0 if g_key[0] == "START" else int(g_key[0]) + 1
-            hi_ab = n_b if g_key[1] == "END" else int(g_key[1])
-            tdev_emitted_cands: list[tuple[str, tuple[Step, ...]]] = []
             for rb in raw_blocks:
                 if rb.repeat_residual:
                     extra_repeat_residual = True
@@ -1929,25 +1900,8 @@ def _solve_multi_member_component(
                     child_cid_to_parent_cids[ext_c.candidate_id].add(
                         parent_occ.candidate_id
                     )
-                    if track_exact_b_sec:
-                        member_occ_cands_at_group[(m_idx, occ_idx, g_key)].append(
-                            ext_c
-                        )
                     if occ_idx == 0:
                         member_cands_at_group[(m_idx, g_key)].append(ext_c)
-                        if track_exact_b_sec:
-                            g_key_to_m_idxs[g_key].add(m_idx)
-                            tdev_emitted_cands.append((ext_c.candidate_id, rb.steps))
-            if track_exact_b_sec and lo_ab < hi_ab:
-                member_term_devs[m_idx].append(
-                    (
-                        g_key,
-                        lo_ab,
-                        hi_ab,
-                        tuple(tdev.branch_steps),
-                        tdev_emitted_cands,
-                    )
-                )
         member_local_flags[m_idx] = (m_rep_res, m_mh)
 
     def _child_group_sort_key(
@@ -1968,13 +1922,6 @@ def _solve_multi_member_component(
             ParallelGroupSolution,
         ]
     ] = []
-    rep0_covered_spans_by_m_gkey: dict[
-        tuple[int, tuple[int | Literal["START"], int | Literal["END"]]],
-        list[tuple[int, int]],
-    ] = collections.defaultdict(list)
-    child_sol_by_gkey: dict[
-        tuple[int | Literal["START"], int | Literal["END"]], ParallelGroupSolution
-    ] = {}
 
     old_rec_limit = sys.getrecursionlimit()
     needed_rec_limit = min(100_000, len(comp) * 4 + 1024)
@@ -1996,40 +1943,7 @@ def _solve_multi_member_component(
                 config=config,
                 parent_state_key=child_state_key,
                 ancestor_keys=next_ancestors,
-                is_top_level=False,
             )
-            if track_exact_b_sec:
-                child_sol_by_gkey[g_key] = sol
-                for m_i in g_key_to_m_idxs.get(g_key, ()):
-                    for ch_c in member_cands_at_group.get((m_i, g_key), ()):
-                        if (
-                            sol.cand_to_rep_idx.get(ch_c.candidate_id) == 0
-                            and ch_c.candidate_id in sol.rep0_cand_spans
-                        ):
-                            _kept_len, t_start, t_end, _del_bp = sol.rep0_cand_spans[
-                                ch_c.candidate_id
-                            ]
-                            if t_start < t_end:
-                                del_ivs = sol.rep0_cand_del_intervals.get(
-                                    ch_c.candidate_id, ()
-                                )
-                                if not del_ivs:
-                                    rep0_covered_spans_by_m_gkey[(m_i, g_key)].append(
-                                        (t_start, t_end)
-                                    )
-                                else:
-                                    cur_s = t_start
-                                    for d_s, d_e in del_ivs:
-                                        if cur_s < d_s:
-                                            rep0_covered_spans_by_m_gkey[
-                                                (m_i, g_key)
-                                            ].append((cur_s, d_s))
-                                        if d_e > cur_s:
-                                            cur_s = d_e
-                                    if cur_s < t_end:
-                                        rep0_covered_spans_by_m_gkey[
-                                            (m_i, g_key)
-                                        ].append((cur_s, t_end))
             if sol.non_backbone_reps:
                 a_pos = -1 if a_r == "START" else int(a_r)
                 b_pos = n_b if b_r == "END" else int(b_r)
@@ -2059,889 +1973,17 @@ def _solve_multi_member_component(
     rep_used_by_parent_cands: dict[tuple[Any, int], set[str]] = collections.defaultdict(
         set
     )
-
-    b_sec_cut_set = set(b_sec.exemplar.piece_boundaries)
     step_excluded_cands: list[set[str]] = (
         [set() for _ in range(n_b)] if track_exact_b_sec else []
-    )
-    step_sub_exclusions: list[dict[int, tuple[list[str], list[tuple[int, int]]]]] = (
-        [{} for _ in range(n_b)] if track_exact_b_sec else []
     )
     b_step_lens: list[int] = (
         [st.step_len(graph.nodes) for st in b_steps] if track_exact_b_sec else []
     )
 
-    def _provs_contiguous(
-        p_prev: StepProvenance, p_next: StepProvenance
-    ) -> bool:
-        if (
-            p_prev.src_hap != p_next.src_hap
-            or p_prev.src_path != p_next.src_path
-            or p_prev.src_strand != p_next.src_strand
-        ):
-            return False
-        if p_prev.src_strand == "+":
-            return p_prev.src_end == p_next.src_start
-        return p_prev.src_start == p_next.src_end
-
-    if track_exact_b_sec:
-        active_gkey_set = {g_key for g_key, _, _, _, _ in active_child_solutions}
-        existing_cuts = (
-            b_sec_cut_set
-            | {b_pos for _, b_pos, _, _, _ in active_child_solutions}
-            | {0, n_b}
-        )
-        # Condition 1 ((M+X)*10 >= 9*50) caps I <= 5; Condition 2 caps X+I+D <= floor((1-dedup_id)*50).
-        sub_block_cap = min(
-            5, int((1.0 - config.dedup_id) * REF_SUB_BLOCK_SIZE + 1e-12)
-        )
-
-        def _step_full_node_len(st: Step) -> int:
-            return (
-                int(graph.nodes.node_len(st.node_id))
-                if isinstance(graph.nodes, CompactNodeStore)
-                else len(graph.nodes[st.node_id])
-            )
-
-        def _canon_partial_key(st: Step) -> tuple[str, int, int]:
-            full_len = _step_full_node_len(st)
-            end = st.slice_end if st.slice_end is not None else full_len
-            if st.orient == "+":
-                return (st.node_id, st.slice_start, end)
-            return (st.node_id, full_len - end, full_len - st.slice_start)
-
-        def _is_sub_block_benign_in_rep0(
-            rep0_b_seq_up: str,
-            rep0_ch_seqs: list[tuple[str, int, int]],
-            b_off_s: int,
-            step_uncov_ivs: list[tuple[int, int]],
-            uncov_step: int,
-        ) -> bool:
-            if not rep0_b_seq_up or not rep0_ch_seqs:
-                return False
-            flank_budget = sub_block_cap - uncov_step
-            if flank_budget < 0:
-                return False
-            flank = REF_SUB_BLOCK_SIZE
-            margin = max(2 * config.min_sv_len, 200)
-            for us, ue in step_uncov_ivs:
-                g_us = b_off_s + us
-                g_ue = b_off_s + ue
-                if g_us < flank or g_ue + flank > len(rep0_b_seq_up):
-                    return False
-                nb_seq = (
-                    rep0_b_seq_up[g_us - flank : g_us]
-                    + rep0_b_seq_up[g_ue : g_ue + flank]
-                )
-                matched = False
-                for ch_seq_up, ch_ts, ch_te in rep0_ch_seqs:
-                    if g_us < ch_ts or g_ue > ch_te:
-                        continue
-                    approx = max(0, g_us - ch_ts)
-                    w_s = max(0, approx - margin)
-                    w_e = min(len(ch_seq_up), approx + 2 * flank + margin)
-                    win_seq = ch_seq_up[w_s:w_e]
-                    if nb_seq in win_seq:
-                        matched = True
-                        break
-                    if flank_budget > 0:
-                        ed_res = edlib.align(
-                            nb_seq,
-                            win_seq,
-                            mode="HW",
-                            task="distance",
-                            k=flank_budget,
-                        )
-                        dist = ed_res.get("editDistance", -1)
-                        if 0 <= dist <= flank_budget:
-                            matched = True
-                            break
-                if not matched:
-                    return False
-            return True
-
-        def _absorb_short_covered_islands(
-            w_excl: set[int],
-            s_excl: dict[int, list[tuple[int, int]]],
-        ) -> None:
-            if not s_excl:
-                return
-
-            def _avail_left_info(
-                s_idx_q: int,
-            ) -> tuple[int, list[int], bool]:
-                acc = 0
-                bridge: list[int] = []
-                cur = s_idx_q
-                while cur > 0 and acc < config.min_sv_len:
-                    if cur in existing_cuts:
-                        return acc, bridge, True
-                    prev = cur - 1
-                    if not _provs_contiguous(b_prov[prev], b_prov[cur]):
-                        return acc, bridge, True
-                    if prev in w_excl:
-                        return acc, bridge, True
-                    if prev in s_excl:
-                        rem = b_step_lens[prev] - s_excl[prev][-1][1]
-                        return acc + rem, bridge, (rem == 0)
-                    acc += b_step_lens[prev]
-                    bridge.append(prev)
-                    cur = prev
-                return acc, bridge, (cur == 0)
-
-            def _avail_right_info(
-                s_idx_q: int,
-            ) -> tuple[int, list[int], bool]:
-                acc = 0
-                bridge: list[int] = []
-                cur = s_idx_q
-                while cur + 1 < n_b and acc < config.min_sv_len:
-                    nxt = cur + 1
-                    if nxt in existing_cuts:
-                        return acc, bridge, True
-                    if not _provs_contiguous(b_prov[cur], b_prov[nxt]):
-                        return acc, bridge, True
-                    if nxt in w_excl:
-                        return acc, bridge, True
-                    if nxt in s_excl:
-                        rem = s_excl[nxt][0][0]
-                        return acc + rem, bridge, (rem == 0)
-                    acc += b_step_lens[nxt]
-                    bridge.append(nxt)
-                    cur = nxt
-                return acc, bridge, (cur + 1 >= n_b)
-
-            island_changed = True
-            while island_changed:
-                island_changed = False
-                for s_idx in sorted(list(s_excl.keys())):
-                    st_len = b_step_lens[s_idx]
-                    ex_ivs = s_excl[s_idx]
-                    cov_ivs = complement_intervals(st_len, ex_ivs)
-                    new_ex = list(ex_ivs)
-                    step_mod = False
-                    for cs, ce in cov_ivs:
-                        if ce - cs >= config.min_sv_len:
-                            continue
-                        if cs == 0:
-                            avail_l, bridge_l, dead_l = _avail_left_info(s_idx)
-                        else:
-                            avail_l, bridge_l, dead_l = 0, [], False
-                        if ce == st_len:
-                            avail_r, bridge_r, dead_r = _avail_right_info(s_idx)
-                        else:
-                            avail_r, bridge_r, dead_r = 0, [], False
-                        if (ce - cs) + avail_l + avail_r < config.min_sv_len:
-                            new_ex.append((cs, ce))
-                            step_mod = True
-                            if cs == 0 and dead_l and bridge_l:
-                                w_excl.update(bridge_l)
-                            if ce == st_len and dead_r and bridge_r:
-                                w_excl.update(bridge_r)
-                    if step_mod:
-                        island_changed = True
-                        merged_ex = merge_intervals(new_ex)
-                        if (
-                            len(merged_ex) == 1
-                            and merged_ex[0][0] == 0
-                            and merged_ex[0][1] == st_len
-                        ):
-                            del s_excl[s_idx]
-                            w_excl.add(s_idx)
-                        else:
-                            s_excl[s_idx] = merged_ex
-
-        deferred_benign_by_m: dict[
-            int,
-            tuple[
-                list[str],
-                set[int],
-                dict[int, list[tuple[int, int]]],
-                dict[int, list[tuple[int, int]]],
-                dict[int, list[tuple[int, int]]],
-            ],
-        ] = {}
-
-        for m_idx, d in enumerate(m_child):
-            tdevs_m = member_term_devs.get(m_idx)
-            if not tdevs_m:
-                continue
-            d_full_sc_nids = {
-                st.node_id
-                for st in d.steps
-                if _is_full_step(st) and st.node_id in sec_sc_nonref
-            }
-            parent_cids_d = [p_occ.candidate_id for p_occ in d.occurrences]
-
-            tdev_records: list[dict[str, Any]] = []
-            member_total_uncov_bp = 0
-            for g_key, lo_ab, hi_ab, br_steps, tdev_emitted_cands in tdevs_m:
-                raw_rep0_spans = rep0_covered_spans_by_m_gkey.get((m_idx, g_key))
-                merged_rep0_spans = (
-                    merge_intervals(raw_rep0_spans) if raw_rep0_spans else []
-                )
-                sol_g = child_sol_by_gkey.get(g_key)
-                emitted_mc: collections.Counter[str] = collections.Counter()
-                emitted_part: collections.Counter[tuple[str, int, int]] = (
-                    collections.Counter()
-                )
-                has_active_r_gt_0 = False
-                if sol_g is not None and g_key in active_gkey_set:
-                    for ch_cid, rb_steps in tdev_emitted_cands:
-                        if sol_g.cand_to_rep_idx.get(ch_cid, 0) > 0:
-                            has_active_r_gt_0 = True
-                            for st in rb_steps:
-                                if _is_full_step(st):
-                                    if st.node_id in sec_mc_nonref:
-                                        emitted_mc[st.node_id] += 1
-                                else:
-                                    emitted_part[_canon_partial_key(st)] += 1
-
-                mc_budget: collections.Counter[str] = collections.Counter(
-                    st.node_id
-                    for st in br_steps
-                    if _is_full_step(st) and st.node_id in sec_mc_nonref
-                )
-                mc_budget.subtract(emitted_mc)
-                part_budget: collections.Counter[tuple[str, int, int]] = (
-                    collections.Counter(
-                        _canon_partial_key(st)
-                        for st in br_steps
-                        if not _is_full_step(st)
-                    )
-                )
-                part_budget.subtract(emitted_part)
-
-                n_span_steps = hi_ab - lo_ab
-                span_step_offs: list[int] = [0]
-                for s_idx in range(lo_ab, hi_ab):
-                    span_step_offs.append(span_step_offs[-1] + b_step_lens[s_idx])
-                span_total_bp = span_step_offs[-1]
-                snapped_rep0_spans = merged_rep0_spans
-                if (
-                    merged_rep0_spans
-                    and sol_g is not None
-                    and len(sol_g.backbone_seq) == span_total_bp
-                    and n_span_steps > 1
-                ):
-                    rep0_b_seq = sol_g.backbone_seq
-                    uncov_ivs: list[tuple[int, int]] = []
-                    u_cur = 0
-                    for rs_s, rs_e in merged_rep0_spans:
-                        if u_cur < rs_s:
-                            uncov_ivs.append((u_cur, rs_s))
-                        if rs_e > u_cur:
-                            u_cur = rs_e
-                    if u_cur < span_total_bp:
-                        uncov_ivs.append((u_cur, span_total_bp))
-                    if uncov_ivs:
-                        bound_set = set(span_step_offs)
-                        n_offs = len(span_step_offs)
-                        snapped_uncov: list[tuple[int, int]] = []
-                        n_u = len(uncov_ivs)
-                        for u_i, (u_s, u_e) in enumerate(uncov_ivs):
-                            if u_s in bound_set and u_e in bound_set:
-                                snapped_uncov.append((u_s, u_e))
-                                continue
-                            prev_lim = snapped_uncov[-1][1] if snapped_uncov else 0
-                            next_lim = (
-                                uncov_ivs[u_i + 1][0]
-                                if u_i + 1 < n_u
-                                else span_total_bp
-                            )
-                            del_len = u_e - u_s
-                            end_st_i = bisect.bisect_right(span_step_offs, u_e - 1) - 1
-                            end_st_hi = span_step_offs[end_st_i + 1]
-                            start_st_i = bisect.bisect_right(span_step_offs, u_s) - 1
-                            start_st_lo = span_step_offs[start_st_i]
-                            best_iv: tuple[int, int] | None = None
-                            best_key: tuple[int, int, int] | None = None
-                            b_lo_i = bisect.bisect_right(span_step_offs, u_s)
-                            b_hi_i = bisect.bisect_left(span_step_offs, u_e)
-                            r_chk = u_s
-                            for bi in range(b_lo_i, n_offs):
-                                b_start = span_step_offs[bi]
-                                cand_e = b_start + del_len
-                                if cand_e > next_lim:
-                                    break
-                                if (
-                                    rep0_b_seq[r_chk:b_start]
-                                    != rep0_b_seq[r_chk + del_len : cand_e]
-                                ):
-                                    break
-                                r_chk = b_start
-                                if cand_e in bound_set:
-                                    cand_key = (0, b_start - u_s, 0)
-                                    if best_key is None or cand_key < best_key:
-                                        best_key = cand_key
-                                        best_iv = (b_start, cand_e)
-                                    break
-                                if (
-                                    bi < b_hi_i
-                                    and u_s not in bound_set
-                                    and cand_e <= end_st_hi
-                                ):
-                                    cand_key = (1, b_start - u_s, 0)
-                                    if best_key is None or cand_key < best_key:
-                                        best_key = cand_key
-                                        best_iv = (b_start, cand_e)
-                            l_chk = u_e
-                            for bi in range(b_hi_i - 1, -1, -1):
-                                b_end = span_step_offs[bi]
-                                cand_s = b_end - del_len
-                                if cand_s < prev_lim:
-                                    break
-                                if (
-                                    rep0_b_seq[b_end:l_chk]
-                                    != rep0_b_seq[cand_s : l_chk - del_len]
-                                ):
-                                    break
-                                l_chk = b_end
-                                if cand_s in bound_set:
-                                    cand_key = (0, u_e - b_end, 1)
-                                    if best_key is None or cand_key < best_key:
-                                        best_key = cand_key
-                                        best_iv = (cand_s, b_end)
-                                    break
-                                if (
-                                    bi >= b_lo_i
-                                    and u_e not in bound_set
-                                    and cand_s >= start_st_lo
-                                ):
-                                    cand_key = (1, u_e - b_end, 1)
-                                    if best_key is None or cand_key < best_key:
-                                        best_key = cand_key
-                                        best_iv = (cand_s, b_end)
-                            snapped_uncov.append(
-                                best_iv if best_iv is not None else (u_s, u_e)
-                            )
-                        snapped_rep0_spans = []
-                        s_cur = 0
-                        for u_s, u_e in snapped_uncov:
-                            if s_cur < u_s:
-                                snapped_rep0_spans.append((s_cur, u_s))
-                            if u_e > s_cur:
-                                s_cur = u_e
-                        if s_cur < span_total_bp:
-                            snapped_rep0_spans.append((s_cur, span_total_bp))
-
-                missing_steps: list[int] = []
-                missing_step_uivs: dict[int, list[tuple[int, int]]] = {}
-                partial_steps: dict[
-                    int, tuple[int, int, int, int, int, list[tuple[int, int]]]
-                ] = {}
-                tdev_uncov_bp = 0
-                for local_i in range(n_span_steps):
-                    s_idx = lo_ab + local_i
-                    b_st = b_steps[s_idx]
-                    b_off_s = span_step_offs[local_i]
-                    b_off_e = span_step_offs[local_i + 1]
-                    b_st_len = b_off_e - b_off_s
-                    step_cov_ivs: list[tuple[int, int]] = []
-                    ov_bp = 0
-                    if snapped_rep0_spans:
-                        for rs_s, rs_e in snapped_rep0_spans:
-                            cs = max(b_off_s, rs_s)
-                            ce = min(b_off_e, rs_e)
-                            if cs < ce:
-                                step_cov_ivs.append((cs - b_off_s, ce - b_off_s))
-                                ov_bp += ce - cs
-                    if ov_bp == b_st_len:
-                        continue
-                    if _is_full_step(b_st):
-                        if b_st.node_id in d_full_sc_nids:
-                            continue
-                        if (
-                            b_st.node_id in sec_mc_nonref
-                            and mc_budget[b_st.node_id] > 0
-                        ):
-                            mc_budget[b_st.node_id] -= 1
-                            continue
-                    else:
-                        pkey = _canon_partial_key(b_st)
-                        if part_budget[pkey] > 0:
-                            part_budget[pkey] -= 1
-                            continue
-                    uncov_step = b_st_len - ov_bp
-                    tdev_uncov_bp += uncov_step
-                    if (
-                        ov_bp == 0
-                        or uncov_step >= config.min_sv_len
-                        or ov_bp * 2 <= b_st_len
-                    ):
-                        missing_steps.append(s_idx)
-                        missing_step_uivs[s_idx] = (
-                            [(0, b_st_len)]
-                            if ov_bp == 0
-                            else complement_intervals(b_st_len, step_cov_ivs)
-                        )
-                    else:
-                        step_uncov_ivs = complement_intervals(b_st_len, step_cov_ivs)
-                        partial_steps[s_idx] = (
-                            b_off_s,
-                            b_off_e,
-                            b_st_len,
-                            ov_bp,
-                            uncov_step,
-                            step_uncov_ivs,
-                        )
-
-                if not missing_steps and not partial_steps:
-                    continue
-                is_already_isolated = (
-                    has_active_r_gt_0
-                    and bool(missing_steps)
-                    and missing_steps == list(range(lo_ab, hi_ab))
-                    and lo_ab in existing_cuts
-                    and hi_ab in existing_cuts
-                )
-                member_total_uncov_bp += tdev_uncov_bp
-                tdev_records.append(
-                    {
-                        "g_key": g_key,
-                        "lo_ab": lo_ab,
-                        "span_step_offs": span_step_offs,
-                        "snapped_rep0_spans": snapped_rep0_spans,
-                        "sol_g": sol_g,
-                        "missing_steps": missing_steps,
-                        "missing_step_uivs": missing_step_uivs,
-                        "partial_steps": partial_steps,
-                        "is_already_isolated": is_already_isolated,
-                    }
-                )
-
-            if not tdev_records:
-                continue
-
-            whole_excl_steps: set[int] = set()
-            sub_excl_steps: dict[int, list[tuple[int, int]]] = {}
-            member_benign_whole: dict[int, list[tuple[int, int]]] = {}
-            member_benign_steps: dict[int, list[tuple[int, int]]] = {}
-            for rec in tdev_records:
-                if rec["is_already_isolated"]:
-                    whole_excl_steps.update(rec["missing_steps"])
-
-            if member_total_uncov_bp >= config.min_sv_len:
-                for rec in tdev_records:
-                    lo_ab = rec["lo_ab"]
-                    span_step_offs = rec["span_step_offs"]
-                    snapped_rep0_spans = rec["snapped_rep0_spans"]
-                    missing_steps = rec["missing_steps"]
-                    partial_steps = rec["partial_steps"]
-                    whole_excl_steps.update(missing_steps)
-                    if partial_steps and missing_steps:
-                        tdev_promoted: set[int] = set(missing_steps)
-                        changed = True
-                        while changed:
-                            changed = False
-                            for s_idx in sorted(tdev_promoted):
-                                s_off_s = span_step_offs[s_idx - lo_ab]
-                                s_off_e = span_step_offs[s_idx - lo_ab + 1]
-                                left_nbr = s_idx - 1
-                                if left_nbr in partial_steps:
-                                    _ls, le, _llen, lov, _lunc, l_uivs = (
-                                        partial_steps[left_nbr]
-                                    )
-                                    left_junc_uncov = not any(
-                                        rs_s <= le - 1 < rs_e
-                                        for rs_s, rs_e in snapped_rep0_spans
-                                    ) and not any(
-                                        rs_s <= s_off_s < rs_e
-                                        for rs_s, rs_e in snapped_rep0_spans
-                                    )
-                                    if left_junc_uncov:
-                                        if lov >= config.min_sv_len:
-                                            sub_excl_steps[left_nbr] = list(l_uivs)
-                                        else:
-                                            whole_excl_steps.add(left_nbr)
-                                        tdev_promoted.add(left_nbr)
-                                        del partial_steps[left_nbr]
-                                        changed = True
-                                right_nbr = s_idx + 1
-                                if right_nbr in partial_steps:
-                                    rs, _re, _rlen, rov, _runc, r_uivs = (
-                                        partial_steps[right_nbr]
-                                    )
-                                    right_junc_uncov = not any(
-                                        rs_s <= s_off_e - 1 < rs_e
-                                        for rs_s, rs_e in snapped_rep0_spans
-                                    ) and not any(
-                                        rs_s <= rs < rs_e
-                                        for rs_s, rs_e in snapped_rep0_spans
-                                    )
-                                    if right_junc_uncov:
-                                        if rov >= config.min_sv_len:
-                                            sub_excl_steps[right_nbr] = list(r_uivs)
-                                        else:
-                                            whole_excl_steps.add(right_nbr)
-                                        tdev_promoted.add(right_nbr)
-                                        del partial_steps[right_nbr]
-                                        changed = True
-
-                member_rem_partial_uncov_bp = sum(
-                    v[4]
-                    for rec in tdev_records
-                    for v in rec["partial_steps"].values()
-                )
-                if member_rem_partial_uncov_bp > 0:
-                    member_excluded_uncov_bp = (
-                        member_total_uncov_bp - member_rem_partial_uncov_bp
-                    )
-                    allow_benign_exempt = (
-                        member_excluded_uncov_bp > 0
-                        and member_rem_partial_uncov_bp < config.min_sv_len
-                        and sub_block_cap > 0
-                    )
-                    benign_edge_margin = max(REF_SUB_BLOCK_SIZE, config.min_sv_len)
-                    for rec in tdev_records:
-                        if not rec["partial_steps"]:
-                            continue
-                        rep0_b_seq_up: str | None = None
-                        rep0_ch_seqs: list[tuple[str, int, int]] | None = None
-                        for s_idx, (
-                            b_off_s,
-                            _b_off_e,
-                            b_st_len,
-                            ov_bp,
-                            uncov_step,
-                            step_uncov_ivs,
-                        ) in rec["partial_steps"].items():
-                            if (
-                                allow_benign_exempt
-                                and uncov_step <= sub_block_cap
-                                and ov_bp >= config.min_sv_len
-                                and all(
-                                    benign_edge_margin <= us
-                                    and ue <= b_st_len - benign_edge_margin
-                                    for us, ue in step_uncov_ivs
-                                )
-                            ):
-                                if rep0_b_seq_up is None:
-                                    sol_g_r = rec["sol_g"]
-                                    rep0_b_seq_up = (
-                                        sol_g_r.backbone_seq.upper()
-                                        if sol_g_r is not None
-                                        else ""
-                                    )
-                                    rep0_ch_seqs = []
-                                    if sol_g_r is not None:
-                                        for ch_c in member_cands_at_group.get(
-                                            (m_idx, rec["g_key"]), ()
-                                        ):
-                                            if (
-                                                sol_g_r.cand_to_rep_idx.get(
-                                                    ch_c.candidate_id
-                                                )
-                                                == 0
-                                                and ch_c.candidate_id
-                                                in sol_g_r.rep0_cand_spans
-                                            ):
-                                                _kl, c_ts, c_te, _cdb = (
-                                                    sol_g_r.rep0_cand_spans[
-                                                        ch_c.candidate_id
-                                                    ]
-                                                )
-                                                rep0_ch_seqs.append(
-                                                    (
-                                                        ch_c.seq.upper(),
-                                                        c_ts,
-                                                        c_te,
-                                                    )
-                                                )
-                                if _is_sub_block_benign_in_rep0(
-                                    rep0_b_seq_up,
-                                    rep0_ch_seqs or [],
-                                    b_off_s,
-                                    step_uncov_ivs,
-                                    uncov_step,
-                                ):
-                                    member_benign_steps[s_idx] = list(
-                                        step_uncov_ivs
-                                    )
-                                    continue
-                            if ov_bp >= config.min_sv_len:
-                                sub_excl_steps[s_idx] = list(step_uncov_ivs)
-                            else:
-                                whole_excl_steps.add(s_idx)
-            else:
-                for rec in tdev_records:
-                    rec_m_uivs = rec["missing_step_uivs"]
-                    for s_idx in rec["missing_steps"]:
-                        if s_idx not in whole_excl_steps:
-                            member_benign_whole[s_idx] = list(rec_m_uivs[s_idx])
-                    for s_idx, (
-                        _b_off_s,
-                        _b_off_e,
-                        _b_st_len,
-                        _ov_bp,
-                        _uncov_step,
-                        step_uncov_ivs,
-                    ) in rec["partial_steps"].items():
-                        if (
-                            s_idx not in whole_excl_steps
-                            and s_idx not in member_benign_whole
-                        ):
-                            member_benign_steps[s_idx] = list(step_uncov_ivs)
-
-            _absorb_short_covered_islands(whole_excl_steps, sub_excl_steps)
-            if whole_excl_steps:
-                for _ws in whole_excl_steps:
-                    member_benign_whole.pop(_ws, None)
-                    member_benign_steps.pop(_ws, None)
-
-            for s_idx in sorted(whole_excl_steps):
-                step_excluded_cands[s_idx].update(parent_cids_d)
-            for s_idx, ex_ivs in sub_excl_steps.items():
-                step_sub_exclusions[s_idx][m_idx] = (parent_cids_d, ex_ivs)
-            if member_benign_whole or member_benign_steps:
-                deferred_benign_by_m[m_idx] = (
-                    parent_cids_d,
-                    whole_excl_steps,
-                    sub_excl_steps,
-                    member_benign_whole,
-                    member_benign_steps,
-                )
-
-        if deferred_benign_by_m:
-            b_step_offs: list[int] = [0]
-            for _st_l in b_step_lens:
-                b_step_offs.append(b_step_offs[-1] + _st_l)
-            b_total_bp = b_step_offs[-1]
-            static_internal_cuts_bp: set[int] = set()
-            for _i in range(1, n_b):
-                if _i in existing_cuts or not _provs_contiguous(
-                    b_prov[_i - 1], b_prov[_i]
-                ):
-                    _off = b_step_offs[_i]
-                    if 0 < _off < b_total_bp:
-                        static_internal_cuts_bp.add(_off)
-
-            if (
-                static_internal_cuts_bp
-                or any(step_sub_exclusions)
-                or any(step_excluded_cands)
-            ):
-                cut_margin = max(REF_SUB_BLOCK_SIZE, config.min_sv_len)
-
-                def _collect_internal_cuts_bp() -> list[int]:
-                    cuts_bp: set[int] = set(static_internal_cuts_bp)
-                    for s_i in range(n_b):
-                        sub_map_i = step_sub_exclusions[s_i]
-                        if sub_map_i:
-                            off_i = b_step_offs[s_i]
-                            st_len_i = b_step_lens[s_i]
-                            base_ex_i = step_excluded_cands[s_i]
-                            local_pts: set[int] = {0, st_len_i}
-                            for _cids, ex_ivs in sub_map_i.values():
-                                for es, ee in ex_ivs:
-                                    local_pts.add(es)
-                                    local_pts.add(ee)
-                            s_pts = sorted(local_pts)
-                            prev_fs: frozenset[str] | None = None
-                            for ci in range(len(s_pts) - 1):
-                                seg_s = s_pts[ci]
-                                seg_e = s_pts[ci + 1]
-                                if seg_s >= seg_e:
-                                    continue
-                                seg_ex = set(base_ex_i)
-                                for cids, ex_ivs in sub_map_i.values():
-                                    for es, ee in ex_ivs:
-                                        if es <= seg_s and seg_e <= ee:
-                                            seg_ex.update(cids)
-                                            break
-                                cur_fs = frozenset(seg_ex)
-                                if prev_fs is not None and cur_fs != prev_fs:
-                                    g_pt = off_i + seg_s
-                                    if 0 < g_pt < b_total_bp:
-                                        cuts_bp.add(g_pt)
-                                prev_fs = cur_fs
-                        if s_i > 0:
-                            g_bnd = b_step_offs[s_i]
-                            if 0 < g_bnd < b_total_bp and g_bnd not in cuts_bp:
-                                if (
-                                    step_excluded_cands[s_i - 1]
-                                    or step_excluded_cands[s_i]
-                                    or step_sub_exclusions[s_i - 1]
-                                    or sub_map_i
-                                ):
-                                    ex_l = set(step_excluded_cands[s_i - 1])
-                                    len_l = b_step_lens[s_i - 1]
-                                    for cids, ex_ivs in step_sub_exclusions[
-                                        s_i - 1
-                                    ].values():
-                                        if ex_ivs and ex_ivs[-1][1] == len_l:
-                                            ex_l.update(cids)
-                                    ex_r = set(step_excluded_cands[s_i])
-                                    for cids, ex_ivs in sub_map_i.values():
-                                        if ex_ivs and ex_ivs[0][0] == 0:
-                                            ex_r.update(cids)
-                                    if ex_l != ex_r:
-                                        cuts_bp.add(g_bnd)
-                    return sorted(cuts_bp)
-
-                def _has_cut_in_open_range(
-                    sorted_cuts: list[int], lo_open: int, hi_open: int
-                ) -> bool:
-                    if not sorted_cuts:
-                        return False
-                    pos = bisect.bisect_right(sorted_cuts, lo_open)
-                    return pos < len(sorted_cuts) and sorted_cuts[pos] < hi_open
-
-                revoke_changed = True
-                while revoke_changed:
-                    revoke_changed = False
-                    sorted_cuts_bp = _collect_internal_cuts_bp()
-                    round_revocations: list[tuple[int, list[int], list[int]]] = []
-                    for bm_idx in sorted(deferred_benign_by_m.keys()):
-                        (
-                            _b_cids,
-                            _b_whole,
-                            _b_sub,
-                            b_benign_w,
-                            b_benign_p,
-                        ) = deferred_benign_by_m[bm_idx]
-                        rev_w: list[int] = []
-                        for s_idx, b_uivs in b_benign_w.items():
-                            off_s = b_step_offs[s_idx]
-                            if (
-                                bool(step_excluded_cands[s_idx])
-                                or bool(step_sub_exclusions[s_idx])
-                                or any(
-                                    _has_cut_in_open_range(
-                                        sorted_cuts_bp,
-                                        off_s + us - cut_margin,
-                                        off_s + ue + cut_margin,
-                                    )
-                                    for us, ue in b_uivs
-                                )
-                            ):
-                                rev_w.append(s_idx)
-                        rev_p: list[int] = []
-                        for s_idx, b_uivs in b_benign_p.items():
-                            off_s = b_step_offs[s_idx]
-                            sub_map_s = step_sub_exclusions[s_idx]
-                            hit_sub_overlap = bool(sub_map_s) and any(
-                                es < ue + cut_margin and us - cut_margin < ee
-                                for us, ue in b_uivs
-                                for om_idx, (_cids, ex_ivs) in sub_map_s.items()
-                                if om_idx != bm_idx
-                                for es, ee in ex_ivs
-                            )
-                            if hit_sub_overlap or any(
-                                _has_cut_in_open_range(
-                                    sorted_cuts_bp,
-                                    off_s + us - cut_margin,
-                                    off_s + ue + cut_margin,
-                                )
-                                for us, ue in b_uivs
-                            ):
-                                rev_p.append(s_idx)
-                        if rev_w or rev_p:
-                            round_revocations.append((bm_idx, rev_w, rev_p))
-
-                    if round_revocations:
-                        revoke_changed = True
-                        for bm_idx, rev_w, rev_p in round_revocations:
-                            (
-                                b_cids,
-                                b_whole,
-                                b_sub,
-                                b_benign_w,
-                                b_benign_p,
-                            ) = deferred_benign_by_m[bm_idx]
-                            for s_idx in rev_w:
-                                b_benign_w.pop(s_idx, None)
-                                b_whole.add(s_idx)
-                            for s_idx in rev_p:
-                                b_uivs = b_benign_p.pop(s_idx, None)
-                                if b_uivs is None:
-                                    continue
-                                rev_ov_bp = b_step_lens[s_idx] - sum(
-                                    ue - us for us, ue in b_uivs
-                                )
-                                if rev_ov_bp >= config.min_sv_len:
-                                    b_sub[s_idx] = b_uivs
-                                else:
-                                    b_whole.add(s_idx)
-                            _absorb_short_covered_islands(b_whole, b_sub)
-                            if b_whole:
-                                for _ws in b_whole:
-                                    b_benign_w.pop(_ws, None)
-                                    b_benign_p.pop(_ws, None)
-                            for s_idx in sorted(b_whole):
-                                step_excluded_cands[s_idx].update(b_cids)
-                                step_sub_exclusions[s_idx].pop(bm_idx, None)
-                            for s_idx, ex_ivs in b_sub.items():
-                                step_sub_exclusions[s_idx][bm_idx] = (b_cids, ex_ivs)
-                            if not b_benign_w and not b_benign_p:
-                                del deferred_benign_by_m[bm_idx]
-
-    has_excluded_b_steps = track_exact_b_sec and (
-        any(step_excluded_cands) or any(step_sub_exclusions)
-    )
-    b_segments_by_step: list[
-        list[tuple[Step, StepProvenance, int, frozenset[str]]]
-    ] = []
-    b_segments_flat: list[tuple[int, frozenset[str]]] = []
-    if has_excluded_b_steps:
-        for s_idx in range(n_b):
-            st = b_steps[s_idx]
-            pv = b_prov[s_idx]
-            st_len = b_step_lens[s_idx]
-            base_ex = step_excluded_cands[s_idx]
-            sub_map = step_sub_exclusions[s_idx]
-            if not sub_map:
-                ex_fs = frozenset(base_ex)
-                b_segments_by_step.append([(st, pv, st_len, ex_fs)])
-                b_segments_flat.append((st_len, ex_fs))
-            else:
-                cuts: set[int] = {0, st_len}
-                for _cids, ex_ivs in sub_map.values():
-                    for es, ee in ex_ivs:
-                        cuts.add(es)
-                        cuts.add(ee)
-                sorted_cuts = sorted(cuts)
-                raw_segs: list[tuple[int, int, frozenset[str]]] = []
-                for ci in range(len(sorted_cuts) - 1):
-                    seg_s = sorted_cuts[ci]
-                    seg_e = sorted_cuts[ci + 1]
-                    if seg_s >= seg_e:
-                        continue
-                    seg_ex = set(base_ex)
-                    for cids, ex_ivs in sub_map.values():
-                        for es, ee in ex_ivs:
-                            if es <= seg_s and seg_e <= ee:
-                                seg_ex.update(cids)
-                                break
-                    seg_ex_fs = frozenset(seg_ex)
-                    if raw_segs and raw_segs[-1][2] == seg_ex_fs:
-                        prev_s, _prev_e, _prev_fs = raw_segs[-1]
-                        raw_segs[-1] = (prev_s, seg_e, seg_ex_fs)
-                    else:
-                        raw_segs.append((seg_s, seg_e, seg_ex_fs))
-                full_nlen = (
-                    int(graph.nodes.node_len(st.node_id))
-                    if isinstance(graph.nodes, CompactNodeStore)
-                    else len(graph.nodes[st.node_id])
-                )
-                step_segs: list[tuple[Step, StepProvenance, int, frozenset[str]]] = []
-                for seg_s, seg_e, seg_ex_fs in raw_segs:
-                    seg_len = seg_e - seg_s
-                    if seg_s == 0 and seg_e == st_len:
-                        seg_st, seg_pv = st, pv
-                    else:
-                        seg_st = st.subslice(seg_s, seg_e, full_nlen)
-                        seg_pv = pv.subslice(seg_s, seg_e)
-                    step_segs.append((seg_st, seg_pv, seg_len, seg_ex_fs))
-                    b_segments_flat.append((seg_len, seg_ex_fs))
-                b_segments_by_step.append(step_segs)
-
     for occ in b_sec.occurrences:
-        choices_b: list[tuple[Any, tuple[int, ...]]] = []
-        for g_key, _, _, _, sol in active_child_solutions:
-            choices_b.append((g_key, (0,)))
-        if has_excluded_b_steps:
-            choices_b.append((("__b_excl__",), ()))
+        choices_b: list[tuple[Any, tuple[int, ...]]] = [
+            (g_key, (0,)) for g_key, _, _, _, _ in active_child_solutions
+        ]
         nested_choices_by_cand_id[occ.candidate_id] = tuple(choices_b)
         reconstructed_len_by_cand_id[occ.candidate_id] = len(b_sec.seq)
         cand_flags[occ.candidate_id] = (
@@ -2954,134 +1996,82 @@ def _solve_multi_member_component(
         cov = member_covered_anchors.get(m_idx, {"START", "END"})
         d_choices: list[tuple[Any, tuple[int, ...]]] = []
         rec_len = len(b_sec.seq)
+        child_non_rep0_bp = 0
         m_rep_res, m_mh = member_local_flags.get(m_idx, (False, False))
         m_part = False
-        d_rep_cid = d.occurrences[0].candidate_id
-        retained_b_bp = (
-            (
-                sum(
-                    seg_len
-                    for seg_len, seg_ex in b_segments_flat
-                    if d_rep_cid not in seg_ex
-                )
-                if has_excluded_b_steps
-                else len(b_sec.seq)
-            )
-            if track_exact_b_sec
-            else 0
-        )
-        child_non_rep0_bp = 0
-        occ_child_flags: list[list[bool]] = (
-            [[False, m_rep_res, m_mh] for _ in d.occurrences]
-            if track_exact_b_sec
-            else []
-        )
+        d_parent_cids = [p_occ.candidate_id for p_occ in d.occurrences]
 
         for g_key, _, _, _, sol in active_child_solutions:
             a_r, b_r = g_key
+            lo_ab = 0 if a_r == "START" else int(a_r) + 1
+            hi_ab = n_b if b_r == "END" else int(b_r)
             cands_here = member_cands_at_group.get((m_idx, g_key), [])
             if cands_here:
                 rep_list: list[int] = []
                 sub_nested_entries: list[tuple[Any, tuple[int, ...]]] = []
                 rep_len_sum = 0
                 for ch_c in sorted(cands_here, key=lambda x: x.source_order):
-                    if not track_exact_b_sec:
-                        ch_part, ch_rep, ch_mh = sol.cand_to_flags.get(
-                            ch_c.candidate_id,
-                            (
-                                ch_c.partial_content,
-                                ch_c.repeat_residual,
-                                ch_c.multi_hit,
-                            ),
-                        )
-                        m_part = m_part or ch_part
-                        m_rep_res = m_rep_res or ch_rep
-                        m_mh = m_mh or ch_mh
+                    ch_part, ch_rep, ch_mh = sol.cand_to_flags.get(
+                        ch_c.candidate_id,
+                        (
+                            ch_c.partial_content,
+                            ch_c.repeat_residual,
+                            ch_c.multi_hit,
+                        ),
+                    )
+                    m_part = m_part or ch_part
+                    m_rep_res = m_rep_res or ch_rep
+                    m_mh = m_mh or ch_mh
                     r_idx = sol.cand_to_rep_idx.get(ch_c.candidate_id, 0)
                     rep_list.append(r_idx)
                     if r_idx > 0:
-                        ch_rec_len = sol.cand_to_reconstructed_len.get(
+                        for p_cid in d_parent_cids:
+                            rep_used_by_parent_cands[(g_key, r_idx)].add(p_cid)
+                        ch_len = sol.cand_to_reconstructed_len.get(
                             ch_c.candidate_id,
                             sol.non_backbone_reps[r_idx - 1].length_bp_no_n,
                         )
-                        if not (track_exact_b_sec and ch_rec_len <= 0):
-                            for p_occ in d.occurrences:
-                                rep_used_by_parent_cands[(g_key, r_idx)].add(
-                                    p_occ.candidate_id
-                                )
-                        rep_len_sum += ch_rec_len
-                        if track_exact_b_sec:
-                            child_non_rep0_bp += ch_rec_len
+                        rep_len_sum += ch_len
+                        child_non_rep0_bp += ch_len
                     else:
                         rep_len_sum += len(sol.backbone_seq)
                     sub_sig = sol.cand_to_nested_sig.get(ch_c.candidate_id, ())
                     for sub_k, sub_v in sub_sig:
                         sub_nested_entries.append(((g_key, sub_k), sub_v))
 
-                if track_exact_b_sec:
-                    for occ_idx in range(len(d.occurrences)):
-                        occ_cands = member_occ_cands_at_group.get(
-                            (m_idx, occ_idx, g_key), ()
-                        )
-                        for ch_c_o in occ_cands:
-                            c_p, c_r, c_m = sol.cand_to_flags.get(
-                                ch_c_o.candidate_id,
-                                (
-                                    ch_c_o.partial_content,
-                                    ch_c_o.repeat_residual,
-                                    ch_c_o.multi_hit,
-                                ),
-                            )
-                            occ_child_flags[occ_idx][0] = (
-                                occ_child_flags[occ_idx][0] or c_p
-                            )
-                            occ_child_flags[occ_idx][1] = (
-                                occ_child_flags[occ_idx][1] or c_r
-                            )
-                            occ_child_flags[occ_idx][2] = (
-                                occ_child_flags[occ_idx][2] or c_m
-                            )
-
                 d_choices.append((g_key, tuple(rep_list)))
                 d_choices.extend(sub_nested_entries)
                 if rep_list != [0]:
                     rec_len += rep_len_sum - len(sol.backbone_seq)
+                    if track_exact_b_sec and lo_ab < hi_ab and all(r > 0 for r in rep_list):
+                        for st_i in range(lo_ab, hi_ab):
+                            step_excluded_cands[st_i].update(d_parent_cids)
             elif a_r in cov and b_r in cov:
                 d_choices.append((g_key, (0,)))
             else:
                 d_choices.append((g_key, (-1,)))
 
-        if has_excluded_b_steps:
-            excl_steps = tuple(
-                seg_i
-                for seg_i, (_seg_len, seg_ex) in enumerate(b_segments_flat)
-                if d_rep_cid in seg_ex
+        if track_exact_b_sec and active_child_solutions:
+            d_rep_cid = d_parent_cids[0]
+            retained_b_bp = sum(
+                b_step_lens[st_i]
+                for st_i in range(n_b)
+                if d_rep_cid not in step_excluded_cands[st_i]
             )
-            d_choices.append((("__b_excl__",), excl_steps))
+            exact_rec_len = retained_b_bp + child_non_rep0_bp
+        else:
+            exact_rec_len = max(len(d.seq), rec_len)
 
-        if track_exact_b_sec:
-            rec_len = retained_b_bp + child_non_rep0_bp
-
-        for occ_idx, p_occ in enumerate(d.occurrences):
+        for p_occ in d.occurrences:
             nested_choices_by_cand_id[p_occ.candidate_id] = tuple(d_choices)
-            reconstructed_len_by_cand_id[p_occ.candidate_id] = (
-                rec_len if track_exact_b_sec else max(len(d.seq), rec_len)
+            reconstructed_len_by_cand_id[p_occ.candidate_id] = exact_rec_len
+            cand_flags[p_occ.candidate_id] = (
+                p_occ.partial_content or m_part,
+                p_occ.repeat_residual or m_rep_res,
+                p_occ.multi_hit or m_mh,
             )
-            if track_exact_b_sec:
-                o_part, o_rep_res, o_mh = occ_child_flags[occ_idx]
-                cand_flags[p_occ.candidate_id] = (
-                    p_occ.partial_content or o_part,
-                    p_occ.repeat_residual or o_rep_res,
-                    p_occ.multi_hit or o_mh,
-                )
-            else:
-                cand_flags[p_occ.candidate_id] = (
-                    p_occ.partial_content or m_part,
-                    p_occ.repeat_residual or m_rep_res,
-                    p_occ.multi_hit or m_mh,
-                )
 
-    if not active_child_solutions and not has_excluded_b_steps:
+    if not active_child_solutions:
         b_pieces = tuple(
             replace(p, members=tuple(sorted(comp_support_haps))) for p in b_sec.pieces
         )
@@ -3122,6 +2112,21 @@ def _solve_multi_member_component(
     for slot_list in groups_by_slot.values():
         slot_list.sort(key=lambda item: (item[1], item[2]))
 
+    def _provs_contiguous(
+        p_prev: StepProvenance, p_next: StepProvenance
+    ) -> bool:
+        if (
+            p_prev.src_hap != p_next.src_hap
+            or p_prev.src_path != p_next.src_path
+            or p_prev.src_strand != p_next.src_strand
+        ):
+            return False
+        if p_prev.src_strand == "+":
+            return p_prev.src_end == p_next.src_start
+        return p_prev.src_start == p_next.src_end
+
+    b_sec_cut_set = set(b_sec.exemplar.piece_boundaries)
+    has_excluded_b_steps = track_exact_b_sec and any(step_excluded_cands)
     comp_members_sorted = tuple(sorted(comp_support_haps))
     cand_id_to_hap = {occ.candidate_id: occ.hap_id for occ in all_comp_occurrences}
 
@@ -3220,35 +2225,30 @@ def _solve_multi_member_component(
                 cur_b_first_join = "synthetic"
 
         if idx < n_b:
-            if has_excluded_b_steps:
-                for seg_st, seg_pv, _seg_len, seg_ex in b_segments_by_step[idx]:
-                    step_cands = (
-                        all_comp_cand_ids - seg_ex if seg_ex else all_comp_cand_ids
-                    )
-                    if cur_b_steps and step_cands != cur_b_cands:
-                        prev_prov = cur_b_prov[-1]
-                        _flush_b_run()
-                        cur_b_first_join = (
-                            "source_contiguous"
-                            if _provs_contiguous(prev_prov, seg_pv)
-                            else "synthetic"
-                        )
-                    if not cur_b_steps:
-                        cur_b_cands = step_cands
-                    cur_b_steps.append(seg_st)
-                    cur_b_prov.append(seg_pv)
-            else:
-                if not cur_b_steps:
-                    cur_b_cands = all_comp_cand_ids
-                cur_b_steps.append(b_steps[idx])
-                cur_b_prov.append(b_prov[idx])
+            step_cands = (
+                all_comp_cand_ids - step_excluded_cands[idx]
+                if has_excluded_b_steps and step_excluded_cands[idx]
+                else all_comp_cand_ids
+            )
+            if cur_b_steps and step_cands != cur_b_cands:
+                prev_prov = cur_b_prov[-1]
+                _flush_b_run()
+                cur_b_first_join = (
+                    "source_contiguous"
+                    if _provs_contiguous(prev_prov, b_prov[idx])
+                    else "synthetic"
+                )
+            if not cur_b_steps:
+                cur_b_cands = step_cands
+            cur_b_steps.append(b_steps[idx])
+            cur_b_prov.append(b_prov[idx])
 
     _flush_b_run()
 
     merged_pieces, merged_cands = _merge_adjacent_source_contiguous_pieces(
         raw_out_pieces,
         raw_out_cands,
-        require_same_cands=track_exact_b_sec,
+        require_same_cands=has_excluded_b_steps,
     )
     seq_parts: list[str] = []
     for p_i, p in enumerate(merged_pieces):
@@ -3257,11 +2257,10 @@ def _solve_multi_member_component(
         seq_parts.append(p.seq)
     full_seq = "".join(seq_parts)
     len_no_n = sum(len(p.seq) for p in merged_pieces)
-    is_synth_result = True if active_child_solutions else (config.dedup_mode == "off")
 
     return [
         ComponentResult(
-            is_synthetic=is_synth_result,
+            is_synthetic=True,
             seq=full_seq,
             length_bp_no_n=len_no_n,
             pieces=merged_pieces,
@@ -3290,7 +2289,6 @@ def solve_parallel_group(
     config: BuildConfig,
     parent_state_key: SubproblemStateKey | None = None,
     ancestor_keys: frozenset[SubproblemStateKey] = frozenset(),
-    is_top_level: bool = True,
 ) -> ParallelGroupSolution:
     """
     §3.6.1–§3.6.4 (`F16`, `F17`, `F18`, `T1`–`T5`, `T12`, `T18`, `T20`):
@@ -3466,82 +2464,22 @@ def solve_parallel_group(
                 )
         return built_results
 
-    def _is_step_subsequence(
-        sub_steps: Sequence[Step], super_steps: Sequence[Step]
-    ) -> bool:
-        if not sub_steps or not super_steps:
-            return False
-        sup_idx = 0
-        sup_pos = 0
-        n_sup = len(super_steps)
-        matched_bp = 0
-        for st in sub_steps:
-            full_len = (
-                graph.nodes.node_len(st.node_id)
-                if isinstance(graph.nodes, CompactNodeStore)
-                else len(graph.nodes[st.node_id])
-            )
-            sub_lo = st.slice_start
-            sub_hi = full_len if st.slice_end is None else st.slice_end
-            matched = False
-            while sup_idx < n_sup:
-                sup_st = super_steps[sup_idx]
-                if sup_st.node_id == st.node_id and sup_st.orient == st.orient:
-                    sup_lo = sup_st.slice_start
-                    sup_hi = full_len if sup_st.slice_end is None else sup_st.slice_end
-                    eff_lo = max(sup_lo, sup_pos)
-                    if eff_lo <= sub_lo < sub_hi <= sup_hi:
-                        sup_pos = sub_hi
-                        if sup_pos >= sup_hi:
-                            sup_idx += 1
-                            sup_pos = 0
-                        matched_bp += sub_hi - sub_lo
-                        matched = True
-                        break
-                sup_idx += 1
-                sup_pos = 0
-            if not matched:
-                return False
-        sup_bp = sum(st.step_len(graph.nodes) for st in super_steps)
-        return matched_bp < sup_bp
-
-    def _active_support_haps(
-        obj: ComponentResult | ClusterRepresentative,
-    ) -> set[str]:
-        if config.dedup_mode == "off":
-            return obj.support_haps
-        active = {
-            occ.hap_id
-            for occ in obj.member_occurrences
-            if obj.reconstructed_len_by_cand_id.get(
-                occ.candidate_id, obj.length_bp_no_n
-            )
-            > 0
-        }
-        return active or obj.support_haps
-
     def _real_comp_sort_key(c: ComponentResult) -> tuple[Any, ...]:
-        act_min = (
-            min(_active_support_haps(c))
-            if config.dedup_mode != "off"
-            else c.min_hap
-        )
         return (
             -c.length_bp_no_n,
             c.token_str,
-            act_min,
+            c.min_hap,
             c.exemplar.provenance[0].src_path,
             c.exemplar.provenance[0].src_start,
             c.exemplar.provenance[0].src_strand,
         )
 
     def _synth_comp_sort_key(c: ComponentResult) -> tuple[Any, ...]:
-        act_haps = _active_support_haps(c)
         return (
-            -len(act_haps),
+            -len(c.support_haps),
             -c.length_bp_no_n,
             c.token_str,
-            min(act_haps) if config.dedup_mode != "off" else c.min_hap,
+            c.min_hap,
             c.exemplar.provenance[0].src_path,
             c.exemplar.provenance[0].src_start,
             c.exemplar.provenance[0].src_strand,
@@ -3559,43 +2497,26 @@ def solve_parallel_group(
     rep0_occurrences: list[ExtractedCandidate] = []
     rep0_cand_flags: dict[str, tuple[bool, bool, bool]] = {}
     rep0_cand_spans: dict[str, tuple[int, int, int, int]] = {}
-    rep0_cand_del_intervals: dict[str, tuple[tuple[int, int], ...]] = {}
-    rep0_occ_span_cache: dict[
-        str, tuple[bool, int, int, int, tuple[tuple[int, int], ...]]
-    ] = {}
-    capture_rep0_del_ivs = config.dedup_mode != "off"
+    rep0_occ_span_cache: dict[str, tuple[bool, int, int, int]] = {}
 
-    def _get_occ_rep0_span(
-        occ_seq: str,
-    ) -> tuple[bool, int, int, int, tuple[tuple[int, int], ...]]:
+    def _get_occ_rep0_span(occ_seq: str) -> tuple[bool, int, int, int]:
         nonlocal rep0_aligner
-        cached_span = rep0_occ_span_cache.get(occ_seq)
-        if cached_span is None:
+        cached = rep0_occ_span_cache.get(occ_seq)
+        if cached is None:
             if (
                 len(occ_seq) > EDLIB_MAX_LEN or len(rep0_seq) > EDLIB_MAX_LEN
             ) and rep0_aligner is None:
                 rep0_aligner = mappy.Aligner(seq=rep0_seq, preset="asm20")
-            occ_del_ivs: list[tuple[int, int]] | None = (
-                [] if capture_rep0_del_ivs else None
-            )
-            m_occ, m_ts, m_te, m_del = _check_similarity_merge_with_span(
+            cached = _check_similarity_merge_with_span(
                 seq_s=occ_seq,
                 seq_r=rep0_seq,
                 min_sv_len=config.min_sv_len,
                 cluster_id=config.cluster_id,
                 cluster_win_id=config.cluster_win_id,
                 aligner=rep0_aligner,
-                del_intervals_out=occ_del_ivs,
             )
-            cached_span = (
-                m_occ,
-                m_ts,
-                m_te,
-                m_del,
-                tuple(occ_del_ivs) if occ_del_ivs else (),
-            )
-            rep0_occ_span_cache[occ_seq] = cached_span
-        return cached_span
+            rep0_occ_span_cache[occ_seq] = cached
+        return cached
 
     # Step 4a: Match against rep0 (splitting non-merging occurrences under dedup_mode != "off")
     remaining_real_comps: list[ComponentResult] = []
@@ -3609,9 +2530,6 @@ def solve_parallel_group(
                 len(rc.seq) > EDLIB_MAX_LEN or len_rep0 > EDLIB_MAX_LEN
             ) and rep0_aligner is None:
                 rep0_aligner = mappy.Aligner(seq=rep0_seq, preset="asm20")
-            rc_del_ivs: list[tuple[int, int]] | None = (
-                [] if capture_rep0_del_ivs else None
-            )
             merged_rep0, rep0_ts, rep0_te, rep0_del_bp = (
                 _check_similarity_merge_with_span(
                     seq_s=rc.seq,
@@ -3620,7 +2538,6 @@ def solve_parallel_group(
                     cluster_id=config.cluster_id,
                     cluster_win_id=config.cluster_win_id,
                     aligner=rep0_aligner,
-                    del_intervals_out=rc_del_ivs,
                 )
             )
             if not merged_rep0:
@@ -3628,22 +2545,17 @@ def solve_parallel_group(
                 continue
 
             span_info = (len(rc.seq), rep0_ts, rep0_te, rep0_del_bp)
-            rc_del_ivs_tup = tuple(rc_del_ivs) if rc_del_ivs else ()
             rc_failing_occs: list[ExtractedCandidate] = []
             for occ in rc.member_occurrences:
                 if occ.seq == rc.seq:
                     rep0_cand_spans[occ.candidate_id] = span_info
-                    if rc_del_ivs_tup:
-                        rep0_cand_del_intervals[occ.candidate_id] = rc_del_ivs_tup
                     rep0_occurrences.append(occ)
                     if occ.candidate_id in rc.cand_to_flags:
                         rep0_cand_flags[occ.candidate_id] = rc.cand_to_flags[
                             occ.candidate_id
                         ]
                 else:
-                    merged_occ, o_ts, o_te, o_del, o_del_ivs = _get_occ_rep0_span(
-                        occ.seq
-                    )
+                    merged_occ, o_ts, o_te, o_del = _get_occ_rep0_span(occ.seq)
                     if merged_occ:
                         rep0_cand_spans[occ.candidate_id] = (
                             len(occ.seq),
@@ -3651,17 +2563,12 @@ def solve_parallel_group(
                             o_te,
                             o_del,
                         )
-                        if o_del_ivs:
-                            rep0_cand_del_intervals[occ.candidate_id] = o_del_ivs
                         rep0_occurrences.append(occ)
                         if occ.candidate_id in rc.cand_to_flags:
                             rep0_cand_flags[occ.candidate_id] = rc.cand_to_flags[
                                 occ.candidate_id
                             ]
-                    elif config.dedup_mode == "off" or (
-                        is_top_level
-                        and _is_step_subsequence(occ.steps, rc.exemplar.steps)
-                    ):
+                    elif config.dedup_mode == "off" or len(occ.seq) <= len(rc.seq):
                         rep0_occurrences.append(occ)
                         if occ.candidate_id in rc.cand_to_flags:
                             rep0_cand_flags[occ.candidate_id] = rc.cand_to_flags[
@@ -3681,72 +2588,20 @@ def solve_parallel_group(
             if sc.seq != rep0_seq:
                 remaining_synth_comps.append(sc)
                 continue
-            if config.dedup_mode == "off":
-                for occ in sc.member_occurrences:
-                    if occ.seq == rep0_seq:
-                        rep0_cand_spans[occ.candidate_id] = (
-                            len_rep0,
-                            0,
-                            len_rep0,
-                            0,
-                        )
-                    else:
-                        merged_occ, o_ts, o_te, o_del, o_del_ivs = _get_occ_rep0_span(
-                            occ.seq
-                        )
-                        if merged_occ:
-                            rep0_cand_spans[occ.candidate_id] = (
-                                len(occ.seq),
-                                o_ts,
-                                o_te,
-                                o_del,
-                            )
-                            if o_del_ivs:
-                                rep0_cand_del_intervals[occ.candidate_id] = o_del_ivs
-                rep0_occurrences.extend(sc.member_occurrences)
-                rep0_cand_flags.update(sc.cand_to_flags)
-                continue
-
-            sc_passing: list[
-                tuple[
-                    ExtractedCandidate,
-                    tuple[int, int, int, int],
-                    tuple[tuple[int, int], ...],
-                ]
-            ] = []
-            sc_failing_occs: list[ExtractedCandidate] = []
             for occ in sc.member_occurrences:
                 if occ.seq == rep0_seq:
-                    sc_passing.append((occ, (len_rep0, 0, len_rep0, 0), ()))
+                    rep0_cand_spans[occ.candidate_id] = (len_rep0, 0, len_rep0, 0)
                 else:
-                    merged_occ, o_ts, o_te, o_del, o_del_ivs = _get_occ_rep0_span(
-                        occ.seq
-                    )
+                    merged_occ, o_ts, o_te, o_del = _get_occ_rep0_span(occ.seq)
                     if merged_occ:
-                        sc_passing.append(
-                            (occ, (len(occ.seq), o_ts, o_te, o_del), o_del_ivs)
+                        rep0_cand_spans[occ.candidate_id] = (
+                            len(occ.seq),
+                            o_ts,
+                            o_te,
+                            o_del,
                         )
-                    else:
-                        sc_failing_occs.append(occ)
-            if not sc_passing:
-                remaining_synth_comps.append(sc)
-                continue
-            for occ, s_info, s_del_ivs in sc_passing:
-                rep0_cand_spans[occ.candidate_id] = s_info
-                if s_del_ivs:
-                    rep0_cand_del_intervals[occ.candidate_id] = s_del_ivs
-                rep0_occurrences.append(occ)
-                if occ.candidate_id in sc.cand_to_flags:
-                    rep0_cand_flags[occ.candidate_id] = sc.cand_to_flags[
-                        occ.candidate_id
-                    ]
-            if sc_failing_occs:
-                had_rep0_split = True
-                for sub_c in _build_components_from_candidates(sc_failing_occs):
-                    if sub_c.is_synthetic:
-                        remaining_synth_comps.append(sub_c)
-                    else:
-                        remaining_real_comps.append(sub_c)
+            rep0_occurrences.extend(sc.member_occurrences)
+            rep0_cand_flags.update(sc.cand_to_flags)
 
         if had_rep0_split:
             remaining_real_comps.sort(key=_real_comp_sort_key)
@@ -3758,100 +2613,47 @@ def solve_parallel_group(
     # Step 4b: 4-criterion similarity clustering among surviving real sequences
     real_reps: list[ClusterRepresentative] = []
     for rc in remaining_real_comps:
-        rc_is_hetero = len(set(rc.piece_cand_ids)) > 1 or any(
-            rc.nested_choices_by_cand_id.values()
-        )
-        rc_has_multi_seq = any(
-            occ_m.seq != rc.seq for occ_m in rc.member_occurrences
-        )
         merged_into: ClusterRepresentative | None = None
-        if not rc_is_hetero:
-            for rep in real_reps:
-                rep_is_hetero = len(set(rep.piece_cand_ids)) > 1 or any(
-                    rep.nested_choices_by_cand_id.values()
-                )
-                require_full_span = (
-                    rep_is_hetero
-                    or config.dedup_mode == "pan"
-                    or (config.dedup_mode != "off" and rc_has_multi_seq)
-                )
-                if (
-                    require_full_span
-                    and abs(len(rep.seq) - len(rc.seq)) >= config.min_sv_len
-                ):
-                    continue
-                if (
-                    len(rc.seq) > EDLIB_MAX_LEN or len(rep.seq) > EDLIB_MAX_LEN
-                ) and rep.aligner is None:
-                    rep.aligner = mappy.Aligner(seq=rep.seq, preset="asm20")
-                if require_full_span:
-                    merged_ok, m_ts, m_te, m_del = _check_similarity_merge_with_span(
-                        seq_s=rc.seq,
-                        seq_r=rep.seq,
-                        min_sv_len=config.min_sv_len,
-                        cluster_id=config.cluster_id,
-                        cluster_win_id=config.cluster_win_id,
-                        aligner=rep.aligner,
-                    )
-                    if (
-                        merged_ok
-                        and (m_ts + (len(rep.seq) - m_te) + m_del) < config.min_sv_len
-                    ):
-                        all_occs_full_span = True
-                        checked_seqs: set[str] = {rc.seq}
-                        for occ_m in rc.member_occurrences:
-                            if occ_m.seq in checked_seqs:
-                                continue
-                            checked_seqs.add(occ_m.seq)
-                            if abs(len(rep.seq) - len(occ_m.seq)) >= config.min_sv_len:
-                                all_occs_full_span = False
-                                break
-                            if (
-                                len(occ_m.seq) > EDLIB_MAX_LEN
-                                or len(rep.seq) > EDLIB_MAX_LEN
-                            ) and rep.aligner is None:
-                                rep.aligner = mappy.Aligner(
-                                    seq=rep.seq, preset="asm20"
-                                )
-                            o_ok, o_ts, o_te, o_del = _check_similarity_merge_with_span(
-                                seq_s=occ_m.seq,
-                                seq_r=rep.seq,
-                                min_sv_len=config.min_sv_len,
-                                cluster_id=config.cluster_id,
-                                cluster_win_id=config.cluster_win_id,
-                                aligner=rep.aligner,
-                            )
-                            if (
-                                not o_ok
-                                or (o_ts + (len(rep.seq) - o_te) + o_del)
-                                >= config.min_sv_len
-                            ):
-                                all_occs_full_span = False
-                                break
-                        if all_occs_full_span:
-                            merged_into = rep
-                            break
-                elif check_similarity_merge(
+        for rep in real_reps:
+            if (
+                config.dedup_mode == "pan"
+                and abs(len(rep.seq) - len(rc.seq)) >= config.min_sv_len
+            ):
+                continue
+            if (
+                len(rc.seq) > EDLIB_MAX_LEN or len(rep.seq) > EDLIB_MAX_LEN
+            ) and rep.aligner is None:
+                rep.aligner = mappy.Aligner(seq=rep.seq, preset="asm20")
+            if config.dedup_mode == "pan":
+                merged_ok, m_ts, m_te, m_del = _check_similarity_merge_with_span(
                     seq_s=rc.seq,
                     seq_r=rep.seq,
                     min_sv_len=config.min_sv_len,
                     cluster_id=config.cluster_id,
                     cluster_win_id=config.cluster_win_id,
                     aligner=rep.aligner,
+                )
+                if (
+                    merged_ok
+                    and (m_ts + (len(rep.seq) - m_te) + m_del) < config.min_sv_len
                 ):
                     merged_into = rep
                     break
+            elif check_similarity_merge(
+                seq_s=rc.seq,
+                seq_r=rep.seq,
+                min_sv_len=config.min_sv_len,
+                cluster_id=config.cluster_id,
+                cluster_win_id=config.cluster_win_id,
+                aligner=rep.aligner,
+            ):
+                merged_into = rep
+                break
 
         if merged_into is not None:
             merged_into.support_haps.update(rc.support_haps)
             merged_into.member_occurrences.extend(rc.member_occurrences)
-            target_nested = merged_into.nested_choices_by_cand_id.get(
-                merged_into.exemplar.candidate_id, ()
-            )
-            for occ in rc.member_occurrences:
-                merged_into.nested_choices_by_cand_id[occ.candidate_id] = (
-                    target_nested
-                )
+            merged_into.nested_choices_by_cand_id.update(rc.nested_choices_by_cand_id)
             merged_into.reconstructed_len_by_cand_id.update(
                 {
                     occ.candidate_id: merged_into.length_bp_no_n
@@ -3896,109 +2698,13 @@ def solve_parallel_group(
 
     # Synthetic sequences: exact sequence deduplication only (§3.6.2 Step 4)
     synth_reps: list[ClusterRepresentative] = []
-    merged_synth_rep_ids: set[int] = set()
-
-    def _cand_piece_mask(
-        n_pieces: int,
-        piece_cand_ids: Sequence[frozenset[str]],
-        cid: str,
-    ) -> tuple[int, ...]:
-        if not piece_cand_ids or len(piece_cand_ids) != n_pieces:
-            return tuple(range(n_pieces))
-        return tuple(
-            p_i
-            for p_i, cset in enumerate(piece_cand_ids)
-            if not cset or cid in cset
-        )
-
     for sc in remaining_synth_comps:
-        sc_is_hetero = len(set(sc.piece_cand_ids)) > 1 or any(
-            sc.nested_choices_by_cand_id.values()
-        )
         exact_target: ClusterRepresentative | None = None
         for rep in real_reps + synth_reps:
-            if rep.seq != sc.seq:
-                continue
-            if config.dedup_mode != "off":
-                rep_is_hetero_ex = len(set(rep.piece_cand_ids)) > 1 or any(
-                    rep.nested_choices_by_cand_id.values()
-                )
-                if sc_is_hetero or rep_is_hetero_ex:
-                    n_p = len(rep.pieces)
-                    if not (
-                        n_p == len(sc.pieces)
-                        and len(rep.piece_cand_ids) == n_p
-                        and len(sc.piece_cand_ids) == n_p
-                        and all(
-                            len(p1.seq) == len(p2.seq)
-                            and p1.seq == p2.seq
-                            and (
-                                i == 0
-                                or (p1.join_before == "spacer")
-                                == (p2.join_before == "spacer")
-                            )
-                            for i, (p1, p2) in enumerate(zip(rep.pieces, sc.pieces))
-                        )
-                    ):
-                        continue
-                    rep_sig_info: dict[
-                        tuple[tuple[Any, tuple[int, ...]], ...],
-                        tuple[tuple[int, ...], int, int],
-                    ] = {}
-                    rep_sig_conflict = False
-                    for occ_r in rep.member_occurrences:
-                        cid_r = occ_r.candidate_id
-                        sig_r = rep.nested_choices_by_cand_id.get(cid_r, ())
-                        mask_r = _cand_piece_mask(n_p, rep.piece_cand_ids, cid_r)
-                        rlen_r = rep.reconstructed_len_by_cand_id.get(
-                            cid_r, rep.length_bp_no_n
-                        )
-                        prev = rep_sig_info.get(sig_r)
-                        if prev is None:
-                            rep_sig_info[sig_r] = (mask_r, rlen_r, rlen_r)
-                        elif prev[0] != mask_r:
-                            rep_sig_conflict = True
-                            break
-                        else:
-                            rep_sig_info[sig_r] = (
-                                prev[0],
-                                min(prev[1], rlen_r),
-                                max(prev[2], rlen_r),
-                            )
-                    if rep_sig_conflict:
-                        continue
-                    for occ_s in sc.member_occurrences:
-                        cid_s = occ_s.candidate_id
-                        sig_s = sc.nested_choices_by_cand_id.get(cid_s, ())
-                        info_r = rep_sig_info.get(sig_s)
-                        if info_r is None:
-                            continue
-                        mask_s = _cand_piece_mask(n_p, sc.piece_cand_ids, cid_s)
-                        rlen_s = sc.reconstructed_len_by_cand_id.get(
-                            cid_s, sc.length_bp_no_n
-                        )
-                        new_lo = min(info_r[1], rlen_s)
-                        new_hi = max(info_r[2], rlen_s)
-                        if (
-                            mask_s != info_r[0]
-                            or (new_hi - new_lo) >= config.min_sv_len
-                        ):
-                            rep_sig_conflict = True
-                            break
-                        rep_sig_info[sig_s] = (info_r[0], new_lo, new_hi)
-                    if rep_sig_conflict:
-                        continue
-            exact_target = rep
-            break
-
+            if rep.seq == sc.seq:
+                exact_target = rep
+                break
         if exact_target is not None:
-            if exact_target.is_synthetic:
-                merged_synth_rep_ids.add(id(exact_target))
-            prev_rep_cids = (
-                frozenset(occ.candidate_id for occ in exact_target.member_occurrences)
-                if any(not c1 for c1 in exact_target.piece_cand_ids)
-                else frozenset()
-            )
             exact_target.support_haps.update(sc.support_haps)
             exact_target.member_occurrences.extend(sc.member_occurrences)
             exact_target.nested_choices_by_cand_id.update(sc.nested_choices_by_cand_id)
@@ -4014,16 +2720,9 @@ def solve_parallel_group(
                     for p1, p2 in zip(exact_target.pieces, sc.pieces)
                 )
             ):
-                sc_all_cids = (
-                    frozenset(occ.candidate_id for occ in sc.member_occurrences)
-                    if any(not c2 for c2 in sc.piece_cand_ids)
-                    else frozenset()
-                )
                 exact_target.piece_cand_ids = tuple(
-                    (c1 or prev_rep_cids) | (c2 or sc_all_cids)
-                    for c1, c2 in zip(
-                        exact_target.piece_cand_ids, sc.piece_cand_ids
-                    )
+                    c1 | c2
+                    for c1, c2 in zip(exact_target.piece_cand_ids, sc.piece_cand_ids)
                 )
             else:
                 new_occ_ids = frozenset(
@@ -4065,13 +2764,8 @@ def solve_parallel_group(
             )
 
     all_non_backbone = real_reps + synth_reps
-    active_haps_by_rep: dict[int, set[str]] = {}
     for rep in all_non_backbone:
-        act_haps = _active_support_haps(rep)
-        active_haps_by_rep[id(rep)] = act_haps
-        rep.support_hap_count = len(act_haps)
-        if config.dedup_mode != "off":
-            rep.min_hap = min(act_haps)
+        rep.support_hap_count = len(rep.support_haps)
 
     all_non_backbone.sort(
         key=lambda r: (
@@ -4104,73 +2798,9 @@ def solve_parallel_group(
         rep.rep_idx = idx_r
         rep.aligner = None
         if not rep.is_synthetic:
-            sup_sorted = tuple(sorted(active_haps_by_rep[id(rep)]))
-            if len(rep.piece_cand_ids) == len(rep.pieces) and (
-                len(set(rep.piece_cand_ids)) > 1
-                or (
-                    config.dedup_mode != "off"
-                    and any(
-                        pc and len(pc) < len(rep.member_occurrences)
-                        for pc in rep.piece_cand_ids
-                    )
-                )
-            ):
-                occ_cid_to_hap = {
-                    occ.candidate_id: occ.hap_id
-                    for occ in rep.member_occurrences
-                }
-                rep.pieces = tuple(
-                    replace(
-                        p,
-                        members=(
-                            tuple(
-                                sorted(
-                                    {
-                                        occ_cid_to_hap[c]
-                                        for c in pc
-                                        if c in occ_cid_to_hap
-                                    }
-                                )
-                            )
-                            or sup_sorted
-                        ),
-                    )
-                    for p, pc in zip(rep.pieces, rep.piece_cand_ids)
-                )
-            else:
-                rep.pieces = tuple(
-                    replace(p, members=sup_sorted) for p in rep.pieces
-                )
-        elif (
-            config.dedup_mode != "off"
-            and len(rep.piece_cand_ids) == len(rep.pieces)
-            and (
-                id(rep) in merged_synth_rep_ids
-                or any(
-                    pc and len(pc) < len(rep.member_occurrences)
-                    for pc in rep.piece_cand_ids
-                )
-            )
-        ):
-            occ_cid_to_hap = {
-                occ.candidate_id: occ.hap_id
-                for occ in rep.member_occurrences
-            }
+            sup_sorted = tuple(sorted(rep.support_haps))
             rep.pieces = tuple(
-                replace(
-                    p,
-                    members=tuple(
-                        sorted(
-                            {
-                                occ_cid_to_hap[c]
-                                for c in pc
-                                if c in occ_cid_to_hap
-                            }
-                            or set(p.members)
-                        )
-                    ),
-                )
-                for p, pc in zip(rep.pieces, rep.piece_cand_ids)
+                replace(p, members=sup_sorted) for p in rep.pieces
             )
         for occ in rep.member_occurrences:
             cand_to_rep_idx[occ.candidate_id] = idx_r
@@ -4198,9 +2828,7 @@ def solve_parallel_group(
         cand_to_reconstructed_len=cand_to_reconstructed_len,
         cand_to_flags=cand_to_flags,
         rep0_cand_spans=rep0_cand_spans,
-        rep0_cand_del_intervals=rep0_cand_del_intervals,
     )
-
 
 # ============================================================================
 # §3.6.4, §3.8.4-D & §5.1–§5.3 Right-Anchor Slot Assembly & Coordinate Backfilling
@@ -5635,7 +4263,6 @@ def _screen_and_solve_one_pair(
             ancestor_keys=frozenset({top_state_key}),
         )
         sol.backbone_seq = ""
-        sol.rep0_cand_del_intervals = {}
         keep_token_str = config.dedup_mode == "pan"
         for rep in sol.non_backbone_reps:
             rep.aligner = None
@@ -5657,7 +4284,6 @@ def _screen_and_solve_one_pair(
             sol.cand_to_reconstructed_len = {}
             sol.cand_to_flags = {}
             sol.rep0_cand_spans = {}
-            sol.rep0_cand_del_intervals = {}
             guard_res.cand_dev_loc = {}
         else:
             rep0_cids = {
@@ -6179,20 +4805,6 @@ def _subslice_piece(
     )
 
 
-def _pieces_are_source_contiguous(prev_p: Piece, curr_p: Piece) -> bool:
-    """Return True iff `curr_p` is directly source-contiguous after `prev_p` on either strand."""
-    if (
-        curr_p.join_before != "source_contiguous"
-        or prev_p.src_hap != curr_p.src_hap
-        or prev_p.src_path != curr_p.src_path
-        or prev_p.src_strand != curr_p.src_strand
-    ):
-        return False
-    if prev_p.src_strand == "+":
-        return prev_p.src_end == curr_p.src_start
-    return prev_p.src_start == curr_p.src_end
-
-
 def _subtract_intervals_against_wave(
     seq_up: str,
     cur_ivs: Sequence[tuple[int, int]],
@@ -6485,114 +5097,6 @@ def _deduplicate_representatives_across_chromosome(
             tail_wave = None
             tail_dirty = False
 
-    def _find_subinterval_homologous_hit_in_waves(
-        ctx_seq: str,
-        p_s: int,
-        p_e: int,
-        min_hit_len: int = 0,
-        blocked_wave_targets: dict[tuple[int, int], set[int]] | None = None,
-        ins_block_wave_targets_out: dict[tuple[int, int], set[int]] | None = None,
-    ) -> tuple[Any, tuple[int, ...], tuple[int, ...]] | None:
-        nonlocal tail_wave, tail_dirty
-
-        def _wave_find_subinterval_hit(
-            wave: _WaveIndex,
-            w_key: tuple[int, int],
-        ) -> tuple[Any, tuple[int, ...], tuple[int, ...]] | None:
-            blk_tp = (
-                blocked_wave_targets.get(w_key)
-                if blocked_wave_targets is not None
-                else None
-            )
-            out_tp: set[int] | None = (
-                set() if ins_block_wave_targets_out is not None else None
-            )
-            main_hits = list(
-                wave.aligner_main.map(ctx_seq, buf=seq_buf_main, cs=True)
-                if seq_buf_main is not None
-                else wave.aligner_main.map(ctx_seq, cs=True)
-            )
-            for h in main_hits:
-                if (h.q_en - h.q_st) >= min_hit_len and hit_covers_subinterval_mappy(
-                    h,
-                    p_s,
-                    p_e,
-                    dedup_id,
-                    wave.t_starts,
-                    wave.t_ends,
-                    min_hit_len=min_hit_len,
-                    query_seq=ctx_seq,
-                    blocked_t_pieces=blk_tp,
-                    ins_block_t_pieces_out=out_tp,
-                ):
-                    return h, wave.t_starts, wave.t_ends
-            if len(ctx_seq) <= 500:
-                blk_tp_short = (
-                    (blk_tp | out_tp)
-                    if (blk_tp and out_tp)
-                    else (set(out_tp) if out_tp else blk_tp)
-                )
-                saln = wave.get_short_aligner()
-                short_hits = list(
-                    saln.map(ctx_seq, buf=seq_buf_short, cs=True)
-                    if seq_buf_short is not None
-                    else saln.map(ctx_seq, cs=True)
-                )
-                for h in short_hits:
-                    if (
-                        (h.q_en - h.q_st) >= min_hit_len
-                        and hit_covers_subinterval_mappy(
-                            h,
-                            p_s,
-                            p_e,
-                            dedup_id,
-                            wave.t_starts,
-                            wave.t_ends,
-                            min_hit_len=min_hit_len,
-                            query_seq=ctx_seq,
-                            blocked_t_pieces=blk_tp_short,
-                            ins_block_t_pieces_out=out_tp,
-                        )
-                    ):
-                        return h, wave.t_starts, wave.t_ends
-            if out_tp and ins_block_wave_targets_out is not None:
-                ins_block_wave_targets_out.setdefault(w_key, set()).update(out_tp)
-            return None
-
-        for w_idx, w in enumerate(sealed_waves):
-            found = _wave_find_subinterval_hit(w, (0, w_idx))
-            if found is not None:
-                return found
-        for sw_idx, sw in enumerate(active_subwaves):
-            found = _wave_find_subinterval_hit(sw, (1, sw_idx))
-            if found is not None:
-                return found
-        if tail_pieces and tail_gate.has_seed_hit(ctx_seq, tail_pieces):
-            if tail_wave is None or not tail_dirty:
-                if tail_wave is None:
-                    tail_wave = _build_pan_dedup_wave_index(tail_pieces)
-                    tail_delta_pieces.clear()
-                    tail_delta_gate.clear()
-                    tail_dirty = False
-                found = _wave_find_subinterval_hit(tail_wave, (2, 0))
-                if found is not None:
-                    return found
-            else:
-                found = _wave_find_subinterval_hit(tail_wave, (2, 0))
-                if found is not None:
-                    return found
-                if tail_delta_gate.has_seed_hit(ctx_seq, tail_delta_pieces):
-                    tail_wave = _build_pan_dedup_wave_index(tail_pieces)
-                    tail_delta_pieces.clear()
-                    tail_delta_gate.clear()
-                    tail_dirty = False
-                    if ins_block_wave_targets_out is not None:
-                        ins_block_wave_targets_out.pop((2, 0), None)
-                    found = _wave_find_subinterval_hit(tail_wave, (2, 0))
-                    if found is not None:
-                        return found
-        return None
-
     queue_pos = 0
     n_entries = len(entries)
     carryover: list[_PendingRepState] = []
@@ -6753,97 +5257,6 @@ def _deduplicate_representatives_across_chromosome(
             seq_trimmed = False
             modified_piece_cands: set[str] | None = set()
             gap_since_last_kept = False
-            piece_end_masked: list[tuple[bool, bool]] = []
-            piece_unmasked_edges: list[tuple[int, int]] = []
-            untouched_short_entries: list[tuple[int, int]] = []
-
-            # Rep-local >= min_sv_len self-dedup pool: visible ONLY inside the
-            # orig_pieces loop below (never visible to untouched_short_entries).
-            # Global _accept_piece_seq is deferred until AFTER untouched_short_entries.
-            pending_accept_seqs: list[str] = []
-            self_exact_seqs: set[str] = set()
-            self_subwaves: list[_WaveIndex] = []
-            self_tail_pieces: list[str] = []
-            self_tail_bp = 0
-            self_gate: _TailSeedGate | None = None
-            self_wave: _WaveIndex | None = None
-            self_dirty = False
-
-            def _screen_ivs_against_self(
-                q_seq_up: str,
-                ivs: list[tuple[int, int]],
-                start_self_sub_idx: int,
-            ) -> list[tuple[int, int]]:
-                nonlocal pan_masked_bp, pan_short_residual_bp
-                nonlocal self_gate, self_wave, self_dirty
-                if ivs and self_exact_seqs:
-                    kept_ex: list[tuple[int, int]] = []
-                    for iv_s, iv_e in ivs:
-                        if q_seq_up[iv_s:iv_e] in self_exact_seqs:
-                            pan_masked_bp += iv_e - iv_s
-                        else:
-                            kept_ex.append((iv_s, iv_e))
-                    ivs = kept_ex
-                for sw_idx in range(start_self_sub_idx, len(self_subwaves)):
-                    if not ivs:
-                        return ivs
-                    ivs, dm, dsr = _subtract_intervals_against_wave(
-                        q_seq_up,
-                        ivs,
-                        self_subwaves[sw_idx],
-                        min_sv_len,
-                        dedup_id,
-                        seq_buf_main,
-                        seq_buf_short,
-                    )
-                    pan_masked_bp += dm
-                    pan_short_residual_bp += dsr
-                if ivs and self_tail_pieces:
-                    if self_gate is None:
-                        self_gate = _TailSeedGate()
-                    if any(
-                        self_gate.has_seed_hit(q_seq_up[iv_s:iv_e], self_tail_pieces)
-                        for iv_s, iv_e in ivs
-                    ):
-                        if self_dirty or self_wave is None:
-                            self_wave = _build_pan_dedup_wave_index(self_tail_pieces)
-                            self_dirty = False
-                        ivs, dm, dsr = _subtract_intervals_against_wave(
-                            q_seq_up,
-                            ivs,
-                            self_wave,
-                            min_sv_len,
-                            dedup_id,
-                            seq_buf_main,
-                            seq_buf_short,
-                        )
-                        pan_masked_bp += dm
-                        pan_short_residual_bp += dsr
-                return ivs
-
-            def _accept_self_piece_seq(sp_up: str) -> None:
-                nonlocal self_tail_bp, self_wave, self_dirty
-                if len(sp_up) < min_sv_len:
-                    return
-                pending_accept_seqs.append(sp_up)
-                self_exact_seqs.add(sp_up)
-                self_exact_seqs.add(revcomp(sp_up))
-                self_tail_pieces.append(sp_up)
-                self_tail_bp += len(sp_up)
-                self_dirty = True
-                if (
-                    self_tail_bp >= _PAN_DEDUP_SUBWAVE_BP
-                    or len(self_tail_pieces) >= _PAN_DEDUP_SUBWAVE_MAX_PIECES
-                ):
-                    self_subwaves.append(
-                        _build_pan_dedup_wave_index(self_tail_pieces)
-                    )
-                    self_tail_pieces.clear()
-                    self_tail_bp = 0
-                    if self_gate is not None:
-                        self_gate.clear()
-                    self_wave = None
-                    self_dirty = False
 
             orig_pieces = item.rep.pieces
             orig_pc_list = item.rep.piece_cand_ids
@@ -6860,17 +5273,10 @@ def _deduplicate_representatives_across_chromosome(
                     surv_ivs = _screen_ivs_against_active(
                         seq_up, item.piece_ivs[orig_p_idx], n_sub
                     )
-                    if surv_ivs and (
-                        self_exact_seqs or self_subwaves or self_tail_pieces
-                    ):
-                        surv_ivs = _screen_ivs_against_self(seq_up, surv_ivs, 0)
 
                 emitted_sub_for_piece = 0
-                first_start_for_piece = -1
-                first_end_for_piece = -1
-                last_start_for_piece = -1
                 last_end_for_piece = -1
-                self_sub_idx_before_p = len(self_subwaves)
+                sub_idx_before_p = len(active_subwaves)
                 iv_queue: collections.deque[tuple[tuple[int, int], bool]] = (
                     collections.deque(
                         (iv, i > 0) for i, iv in enumerate(surv_ivs)
@@ -6879,8 +5285,8 @@ def _deduplicate_representatives_across_chromosome(
                 while iv_queue:
                     raw_iv, need_rescreen = iv_queue.popleft()
                     if need_rescreen:
-                        sub_final_ivs = _screen_ivs_against_self(
-                            seq_up, [raw_iv], self_sub_idx_before_p
+                        sub_final_ivs = _screen_ivs_against_active(
+                            seq_up, [raw_iv], sub_idx_before_p
                         )
                         if not sub_final_ivs:
                             continue
@@ -6919,12 +5325,8 @@ def _deduplicate_representatives_across_chromosome(
                         pieces_changed = True
                     new_pieces.append(sp)
                     new_piece_cand_ids.append(orig_pc)
-                    _accept_self_piece_seq(seq_up if is_full_orig else sp.seq.upper())
-                    if first_start_for_piece < 0:
-                        first_start_for_piece = iv_s
-                        first_end_for_piece = iv_e
+                    _accept_piece_seq(seq_up if is_full_orig else sp.seq.upper())
                     emitted_sub_for_piece += 1
-                    last_start_for_piece = iv_s
                     last_end_for_piece = iv_e
 
                 piece_seq_modified = (
@@ -6939,398 +5341,12 @@ def _deduplicate_representatives_across_chromosome(
                         modified_piece_cands = None
                     elif modified_piece_cands is not None:
                         modified_piece_cands.update(orig_pc)
-                elif 0 < len(p.seq) < min_sv_len:
-                    untouched_short_entries.append((orig_p_idx, len(new_pieces) - 1))
-
-                if not p.seq:
-                    piece_end_masked.append((False, False))
-                    piece_unmasked_edges.append((0, 0))
-                elif emitted_sub_for_piece == 0:
-                    piece_end_masked.append((True, True))
-                    piece_unmasked_edges.append((0, 0))
-                else:
-                    piece_end_masked.append(
-                        (
-                            first_start_for_piece > 0,
-                            last_end_for_piece < len(p.seq),
-                        )
-                    )
-                    piece_unmasked_edges.append(
-                        (
-                            first_end_for_piece if first_start_for_piece == 0 else 0,
-                            (
-                                len(p.seq) - last_start_for_piece
-                                if last_end_for_piece == len(p.seq)
-                                else 0
-                            ),
-                        )
-                    )
 
                 if emitted_sub_for_piece == 0:
                     if new_pieces:
                         gap_since_last_kept = True
                 else:
                     gap_since_last_kept = last_end_for_piece < len(p.seq)
-
-            if self_gate is not None:
-                self_gate.release()
-                self_gate = None
-            self_subwaves.clear()
-            self_tail_pieces.clear()
-            self_exact_seqs.clear()
-            self_wave = None
-
-            if untouched_short_entries:
-                dropped_new_idxs: set[int] = set()
-                checked_unmsk_by_orig: dict[int, tuple[int, int]] = {}
-                tested_pairs_by_orig: dict[int, set[tuple[int, int]]] = {}
-                blocked_targets_by_orig: dict[int, dict[tuple[int, int], set[int]]] = {}
-                in_ge_min_short_run: set[int] = set()
-                run_idxs: list[int] = []
-                run_bp = 0
-                for o_idx, _ in untouched_short_entries:
-                    if (
-                        run_idxs
-                        and o_idx == run_idxs[-1] + 1
-                        and _pieces_are_source_contiguous(
-                            orig_pieces[run_idxs[-1]], orig_pieces[o_idx]
-                        )
-                    ):
-                        run_idxs.append(o_idx)
-                        run_bp += len(orig_pieces[o_idx].seq)
-                    else:
-                        if run_bp >= min_sv_len:
-                            in_ge_min_short_run.update(run_idxs)
-                        run_idxs = [o_idx]
-                        run_bp = len(orig_pieces[o_idx].seq)
-                if run_bp >= min_sv_len:
-                    in_ge_min_short_run.update(run_idxs)
-
-                def _mark_short_piece_dropped(drop_orig_idx: int, drop_new_idx: int) -> None:
-                    nonlocal pan_masked_bp, modified_piece_cands, short_changed
-                    dropped_new_idxs.add(drop_new_idx)
-                    piece_end_masked[drop_orig_idx] = (True, True)
-                    piece_unmasked_edges[drop_orig_idx] = (0, 0)
-                    short_changed = True
-                    pan_masked_bp += len(item.piece_seqs_up[drop_orig_idx])
-                    d_pc = (
-                        orig_pc_list[drop_orig_idx]
-                        if drop_orig_idx < len(orig_pc_list)
-                        else frozenset()
-                    )
-                    if not d_pc:
-                        modified_piece_cands = None
-                    elif modified_piece_cands is not None:
-                        modified_piece_cands.update(d_pc)
-
-                n_orig_p = len(orig_pieces)
-                short_changed = True
-                while short_changed:
-                    short_changed = False
-                    for orig_p_idx, new_p_idx in untouched_short_entries:
-                        if new_p_idx in dropped_new_idxs:
-                            continue
-                        left_touch_masked = (
-                            orig_p_idx > 0
-                            and piece_end_masked[orig_p_idx - 1][1]
-                            and _pieces_are_source_contiguous(
-                                orig_pieces[orig_p_idx - 1],
-                                orig_pieces[orig_p_idx],
-                            )
-                        )
-                        right_touch_masked = (
-                            orig_p_idx + 1 < n_orig_p
-                            and piece_end_masked[orig_p_idx + 1][0]
-                            and _pieces_are_source_contiguous(
-                                orig_pieces[orig_p_idx],
-                                orig_pieces[orig_p_idx + 1],
-                            )
-                        )
-                        if not (
-                            left_touch_masked
-                            or right_touch_masked
-                            or orig_p_idx in in_ge_min_short_run
-                        ):
-                            continue
-
-                        seq_up = item.piece_seqs_up[orig_p_idx]
-                        seq_len = len(seq_up)
-                        base_cap = (
-                            min(200, max(50, (500 - seq_len) // 2))
-                            if seq_len < 500
-                            else 50
-                        )
-                        flank_cap = max(base_cap, min_sv_len - seq_len)
-
-                        # Single-pass left scan capturing all 4 canonical cutpoints
-                        l_chunks: list[str] = []
-                        l_rem = flank_cap
-                        l_cur = orig_p_idx
-                        l_taken = 0
-                        l_unmsk: int | None = None
-                        l_short: int | None = None
-                        l_first_ge: int | None = None
-                        l_bounds: list[int] = []
-                        while (
-                            l_rem > 0
-                            and l_cur > 0
-                            and _pieces_are_source_contiguous(
-                                orig_pieces[l_cur - 1], orig_pieces[l_cur]
-                            )
-                        ):
-                            nxt_l = l_cur - 1
-                            s_l = item.piece_seqs_up[nxt_l]
-                            s_l_len = len(s_l)
-                            take_len = min(l_rem, s_l_len)
-                            if s_l_len >= min_sv_len:
-                                if l_short is None:
-                                    l_short = l_taken
-                                if (
-                                    l_unmsk is None
-                                    and piece_unmasked_edges[nxt_l][1] < take_len
-                                ):
-                                    l_unmsk = l_taken + piece_unmasked_edges[nxt_l][1]
-                                l_chunks.append(
-                                    s_l[-take_len:] if take_len < s_l_len else s_l
-                                )
-                                l_taken += take_len
-                                l_rem -= take_len
-                                if l_first_ge is None:
-                                    l_first_ge = l_taken
-                            else:
-                                if l_unmsk is None and piece_end_masked[nxt_l][1]:
-                                    l_unmsk = l_taken
-                                l_chunks.append(
-                                    s_l[-take_len:] if take_len < s_l_len else s_l
-                                )
-                                l_taken += take_len
-                                l_rem -= take_len
-                            l_bounds.append(l_taken)
-                            l_cur = nxt_l
-                        l_chunks.reverse()
-                        left_full = "".join(l_chunks)
-                        l_full = len(left_full)
-                        if l_short is None:
-                            l_short = l_full
-                        if l_unmsk is None:
-                            l_unmsk = l_full
-                        if l_first_ge is None:
-                            l_first_ge = l_full
-
-                        # Single-pass right scan (exact mirror of left scan)
-                        r_chunks: list[str] = []
-                        r_rem = flank_cap
-                        r_cur = orig_p_idx
-                        r_taken = 0
-                        r_unmsk: int | None = None
-                        r_short: int | None = None
-                        r_first_ge: int | None = None
-                        r_bounds: list[int] = []
-                        while (
-                            r_rem > 0
-                            and r_cur + 1 < n_orig_p
-                            and _pieces_are_source_contiguous(
-                                orig_pieces[r_cur], orig_pieces[r_cur + 1]
-                            )
-                        ):
-                            nxt_r = r_cur + 1
-                            s_r = item.piece_seqs_up[nxt_r]
-                            s_r_len = len(s_r)
-                            take_len = min(r_rem, s_r_len)
-                            if s_r_len >= min_sv_len:
-                                if r_short is None:
-                                    r_short = r_taken
-                                if (
-                                    r_unmsk is None
-                                    and piece_unmasked_edges[nxt_r][0] < take_len
-                                ):
-                                    r_unmsk = r_taken + piece_unmasked_edges[nxt_r][0]
-                                r_chunks.append(
-                                    s_r[:take_len] if take_len < s_r_len else s_r
-                                )
-                                r_taken += take_len
-                                r_rem -= take_len
-                                if r_first_ge is None:
-                                    r_first_ge = r_taken
-                            else:
-                                if r_unmsk is None and piece_end_masked[nxt_r][0]:
-                                    r_unmsk = r_taken
-                                r_chunks.append(
-                                    s_r[:take_len] if take_len < s_r_len else s_r
-                                )
-                                r_taken += take_len
-                                r_rem -= take_len
-                            r_bounds.append(r_taken)
-                            r_cur = nxt_r
-                        right_full = "".join(r_chunks)
-                        r_full = len(right_full)
-                        if r_short is None:
-                            r_short = r_full
-                        if r_unmsk is None:
-                            r_unmsk = r_full
-                        if r_first_ge is None:
-                            r_first_ge = r_full
-
-                        unmsk_state = (l_unmsk, r_unmsk)
-                        if checked_unmsk_by_orig.get(orig_p_idx) == unmsk_state:
-                            continue
-                        checked_unmsk_by_orig[orig_p_idx] = unmsk_state
-
-                        # Strictly piece-boundary minimal-reach masked cutpoints
-                        # (k=1, k=2 masked pieces and first boundary reaching
-                        # min_sv_len - seq_len - min(opp_unmsk, opp_short));
-                        # never slice mid-piece to avoid spurious short-stub hits.
-                        l_unmsk_short = min(l_unmsk, l_short)
-                        r_unmsk_short = min(r_unmsk, r_short)
-                        need_l_msk = min_sv_len - seq_len - r_unmsk_short
-                        l_msk_b = [b_l for b_l in l_bounds if b_l > l_unmsk]
-                        l_first_msk = l_msk_b[0] if l_msk_b else l_full
-                        l_second_msk = (
-                            l_msk_b[1] if len(l_msk_b) >= 2 else l_first_msk
-                        )
-                        l_min_msk = next(
-                            (b_l for b_l in l_msk_b if b_l >= need_l_msk),
-                            l_first_msk,
-                        )
-                        need_solo = min_sv_len - seq_len
-                        l_solo_msk = next(
-                            (b_l for b_l in l_msk_b if b_l >= need_solo),
-                            l_first_msk,
-                        )
-                        l_pre_solo_msk = next(
-                            (b_l for b_l in reversed(l_msk_b) if b_l < need_solo),
-                            l_first_msk,
-                        )
-
-                        need_r_msk = min_sv_len - seq_len - l_unmsk_short
-                        r_msk_b = [b_r for b_r in r_bounds if b_r > r_unmsk]
-                        r_first_msk = r_msk_b[0] if r_msk_b else r_full
-                        r_second_msk = (
-                            r_msk_b[1] if len(r_msk_b) >= 2 else r_first_msk
-                        )
-                        r_min_msk = next(
-                            (b_r for b_r in r_msk_b if b_r >= need_r_msk),
-                            r_first_msk,
-                        )
-                        r_solo_msk = next(
-                            (b_r for b_r in r_msk_b if b_r >= need_solo),
-                            r_first_msk,
-                        )
-                        r_pre_solo_msk = next(
-                            (b_r for b_r in reversed(r_msk_b) if b_r < need_solo),
-                            r_first_msk,
-                        )
-
-                        full_ctx = left_full + seq_up + right_full
-                        raw_cand_pairs = (
-                            (l_full, r_full),
-                            (l_unmsk, r_unmsk),
-                            (l_short, r_short),
-                            (l_unmsk, r_short),
-                            (l_short, r_unmsk),
-                            (l_first_ge, r_unmsk),
-                            (l_unmsk, r_first_ge),
-                            (l_first_ge, r_short),
-                            (l_short, r_first_ge),
-                            (l_min_msk, r_unmsk),
-                            (l_unmsk, r_min_msk),
-                            (l_min_msk, r_short),
-                            (l_short, r_min_msk),
-                            (l_first_msk, r_unmsk),
-                            (l_unmsk, r_first_msk),
-                            (l_first_msk, r_short),
-                            (l_short, r_first_msk),
-                            (l_second_msk, r_unmsk),
-                            (l_unmsk, r_second_msk),
-                            (l_second_msk, r_short),
-                            (l_short, r_second_msk),
-                            (l_pre_solo_msk, r_unmsk),
-                            (l_unmsk, r_pre_solo_msk),
-                            (l_pre_solo_msk, r_short),
-                            (l_short, r_pre_solo_msk),
-                            (l_solo_msk, r_unmsk),
-                            (l_unmsk, r_solo_msk),
-                            (l_solo_msk, r_short),
-                            (l_short, r_solo_msk),
-                            (l_min_msk, r_min_msk),
-                            (l_first_msk, r_first_msk),
-                            (l_second_msk, r_second_msk),
-                            (l_pre_solo_msk, r_pre_solo_msk),
-                            (l_solo_msk, r_solo_msk),
-                            (l_full, r_unmsk),
-                            (l_unmsk, r_full),
-                            (l_full, r_short),
-                            (l_short, r_full),
-                            (l_first_ge, r_first_ge),
-                            (l_full, r_first_ge),
-                            (l_first_ge, r_full),
-                        )
-                        seen_pairs = tested_pairs_by_orig.setdefault(orig_p_idx, set())
-                        for l_len, r_len in raw_cand_pairs:
-                            if (l_len, r_len) in seen_pairs:
-                                continue
-                            seen_pairs.add((l_len, r_len))
-                            if l_len + seq_len + r_len < min_sv_len:
-                                continue
-                            ctx_sub = full_ctx[
-                                l_full - l_len : l_full + seq_len + r_len
-                            ]
-                            p_s = l_len
-                            p_e = l_len + seq_len
-                            is_full_pair = l_len == l_full and r_len == r_full
-                            rec_blocks: dict[tuple[int, int], set[int]] | None = (
-                                {} if is_full_pair else None
-                            )
-                            blk_map = (
-                                None
-                                if is_full_pair
-                                else blocked_targets_by_orig.get(orig_p_idx)
-                            )
-                            found_hit = _find_subinterval_homologous_hit_in_waves(
-                                ctx_sub,
-                                p_s,
-                                p_e,
-                                min_sv_len,
-                                blocked_wave_targets=blk_map,
-                                ins_block_wave_targets_out=rec_blocks,
-                            )
-                            if is_full_pair and rec_blocks:
-                                dst_blk = blocked_targets_by_orig.setdefault(
-                                    orig_p_idx, {}
-                                )
-                                for wk, tp_set in rec_blocks.items():
-                                    dst_blk.setdefault(wk, set()).update(tp_set)
-                            if found_hit is not None:
-                                _mark_short_piece_dropped(orig_p_idx, new_p_idx)
-                                break
-
-                if dropped_new_idxs:
-                    pieces_changed = True
-                    seq_trimmed = True
-                    filtered_pieces: list[Piece] = []
-                    filtered_piece_cand_ids: list[frozenset[str]] = []
-                    prev_kept_idx = -1
-                    for n_idx, (np_p, np_pc) in enumerate(
-                        zip(new_pieces, new_piece_cand_ids)
-                    ):
-                        if n_idx in dropped_new_idxs:
-                            continue
-                        if not filtered_pieces:
-                            if n_idx > 0 and np_p.join_before != "synthetic":
-                                np_p = replace(np_p, join_before="synthetic")
-                        elif prev_kept_idx < n_idx - 1:
-                            if np_p.join_before != "spacer":
-                                np_p = replace(np_p, join_before="spacer")
-                        filtered_pieces.append(np_p)
-                        filtered_piece_cand_ids.append(np_pc)
-                        prev_kept_idx = n_idx
-                    new_pieces = filtered_pieces
-                    new_piece_cand_ids = filtered_piece_cand_ids
-
-            # Deferred global commit: publish surviving >= min_sv_len pieces of item.rep
-            # strictly AFTER untouched_short_entries finishes so own flanks never self-hijack.
-            for acc_seq in pending_accept_seqs:
-                _accept_piece_seq(acc_seq)
 
             rep_results[(item.pair, item.rep.rep_idx)] = (
                 new_pieces,
@@ -7414,7 +5430,6 @@ def _deduplicate_representatives_across_chromosome(
             sol.cand_to_reconstructed_len = {}
             sol.cand_to_flags = {}
             sol.rep0_cand_spans = {}
-            sol.rep0_cand_del_intervals = {}
         else:
             had_orig_cands = {
                 old_r for old_r in sol.cand_to_rep_idx.values() if old_r > 0
@@ -7537,7 +5552,6 @@ def _deduplicate_representatives_across_chromosome(
                 sol.cand_to_reconstructed_len = {}
                 sol.cand_to_flags = {}
                 sol.rep0_cand_spans = {}
-                sol.rep0_cand_del_intervals = {}
             else:
                 sol.non_backbone_reps = tuple(kept_reps)
                 sol.cand_to_rep_idx = new_cand_to_rep_idx

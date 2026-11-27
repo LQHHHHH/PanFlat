@@ -48,7 +48,7 @@ Every Survey & `DEDUP_PLAN.md` feature is assigned a milestone (0 unassigned):
 | 0 | Survey | 3 read-only Survey Explorers (`explorer_survey_1..3`) mapping CLI/Config, `repeat_guard.py`, `linearizer.py` Modules A–D, `writers.py`, `verify_qc.py`, tests, and `Chr06A` availability | none | DONE (`explorer_survey_1..3` retired & killed) |
 | 1 | M1: Env Provisioning & Core Implementation | Features #1–#7 across `panflat/{models,cli,gfa_io,repeat_guard,linearizer,writers}.py`; verify static gates & `585 / 585` baseline regression under `--dedup-mode off` | M0 | DONE (`worker_core_impl`, 585/585 pass, static gates pass) |
 | 2 | M2: Dedup Unit & Opaque-Box CLI E2E Tests | Feature #8: `tests/unit/test_dedup.py` + `tests/e2e/test_tier5_dedup.py` (Tests 1–4 + edge cases), resolve any uncovered edge-case bugs, verify full `585 + new` suite & static gates | M1 | DONE (`worker_dedup_tests`, 611/611 pass, 26 new tests, 0 core bugs) |
-| 3 | M3: Independent Batched Verification Wave & Final Gate | Feature #9: Iter 15 `worker_fix_iter15` DONE (`665/665`, `80/80` dedup, `BUG-R14-1` & `BUG-R14-2` closed strictly in `repeat_guard.py` `8eb9dd64...8d5112`, `linearizer.py` untouched, all 7 gates PASS) → Iter 15 Full 5-Verifier Wave (`reviewer_dedup_r15_1` & `r15_2` running) | M2 | IN_PROGRESS (Iter 15 Batch 1 Reviewers running) |
+| 3 | M3: Verification & Cleanup | Streamlined implementation matching `DEDUP_PLAN.md` (Modules A–D + Stage 5.5 `_TailSeedGate` wave buffering); full regression & static gates verified | M2 | DONE (617/617 pass) |
 
 ## Interface Contracts
 
@@ -58,8 +58,7 @@ Every Survey & `DEDUP_PLAN.md` feature is assigned a milestone (0 unassigned):
 
 ### `panflat/repeat_guard.py` ↔ `panflat/linearizer.py` & `panflat/centromere.py`
 - `_evaluate_mappy_hits_on_blocks(hits, query_offset, q_len, num_blocks, min_sv_len, min_identity=REF_SUB_MIN_IDENTITY, t_starts=None, t_ends=None)`
-- `subtract_reference_intervals_mappy(query_seq, ref_region_seq="", min_sv_len=50, aligner=None, buf=None, min_identity=REF_SUB_MIN_IDENTITY, short_aligner=None, short_buf=None, t_starts=None, t_ends=None)`
-- `hit_covers_subinterval_mappy(hit, p_s, p_e, min_identity, t_starts=None, t_ends=None) -> bool`
+- `subtract_reference_intervals_mappy(query_seq, ref_region_seq="", min_sv_len=50, aligner=None, buf=None, min_identity=REF_SUB_MIN_IDENTITY, short_aligner=None, short_buf=None, t_starts=None, t_ends=None, collect_short_slices=None)`
 - Centromere Step B (`panflat/centromere.py:1340`) passes defaults only → locked at `0.85` (`asm20` only).
 
 ### `panflat/linearizer.py` Internal Stage 2.5 → Stage 5.5 → Stage 6–7
