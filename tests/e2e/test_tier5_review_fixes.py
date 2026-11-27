@@ -445,8 +445,8 @@ def test_tier5_rf05_1200_layer_nested_reanchor_and_t22_multithread_determinism_c
 def test_tier5_rf06_wave1_case_a_b_affine_c1_and_spacer_n_tamper_cli(
     tmp_path: Path,
 ) -> None:
-    """Wave 1 opaque-box CLI E2E checks: Case A 50bp DEL+1bp INS -> '.', Case B 2x25bp INS -> '.', 30I/30D+1SNP merge, short-query C1b/C1c separation, and spacer tamper after Ref N*100 -> exit 1 + [INV2]."""
-    # 1. Case A (50 bp DEL D1 + 1 bp INS in D2 -> INS='.' alongside DEL='1') + Case B (2x25 bp novel INS -> '.', 2x24 bp -> '0')
+    """Wave 1 opaque-box CLI E2E checks: Case A 50bp DEL+1bp INS -> '.', Case B separated <50bp sub-deviations -> '0', 30I/30D+1SNP merge, short-query C1b/C1c separation, and spacer tamper after Ref N*100 -> exit 1 + [INV2]."""
+    # 1. Case A (50 bp DEL D1 + 1 bp INS in D2 -> INS='.' alongside DEL='1') + Case B (2x25 bp / 2x24 bp separated <50 bp sub-devs -> '0' per §4.1)
     b_ins = SyntheticInputBuilder(tmp_path / "w1_ins", chrom="Chr01", backbone_prefix="Ref#1#")
     d1 = make_complex_seq(50, seed=6701)
     d2 = make_complex_seq(100, seed=6702)
@@ -478,7 +478,7 @@ def test_tier5_rf06_wave1_case_a_b_affine_c1_and_spacer_n_tamper_cli(
     assert ins_gt["AltX#1"] == "1"
     assert ins_gt["Alt50Del1Ins#1"] == "."
     assert ins_gt["AltDSnp#1"] == "0"
-    assert ins_gt["Alt2x25Ins#1"] == "."
+    assert ins_gt["Alt2x25Ins#1"] == "0"
     assert ins_gt["Alt2x24Ins#1"] == "0"
 
     # 2. Item 3.1/3.2 CLI: 30I+1SNP & 30D+1SNP merge into 1 allele; s218 in U170+U170_1snp & rc(U170)+U170_1snp stays 2 alleles
@@ -1557,5 +1557,145 @@ def test_tier5_rf11_wave6_stage4_stage6e_and_extract_islands_cli(tmp_path: Path)
         f4 = Path(f"{bun_t4.prefix}{suffix}")
         assert f1.exists() and f4.exists(), f"Missing output {suffix}"
         assert _sha256_file(f1) == _sha256_file(f4), f"T22 mismatch on w6_rg {suffix}"
+
+
+def test_tier5_rf12_audit_4_1_wide_ins_scattered_snps_and_rep0_subgroups_cli(
+    tmp_path: Path,
+) -> None:
+    """Opaque-box CLI E2E regression for REVIEW_AUDIT_REPORT.md §4.1 wide multi-anchor INS genotyping & T22 parity."""
+    # Locus A: 10 kb wide replacement INS spanning 50 x 1-bp SNP bubbles (Alt50Snps -> '0')
+    # Locus B: Wide replacement INS G(a, b) with sub-group rep0-merged 60bp SNP (AltRep0Ok -> '0'),
+    #          30bp+30bp scattered SNPs (AltScatSnps -> '0'), plus '.' controls:
+    #          sub-group 100bp DEL + 60bp SNP (AltRep0DelFail -> '.'),
+    #          sub-group 100bp INS (AltSubIns -> '.'), pure 100bp DEL (AltSubDel -> '.'),
+    #          and 600bp satellite repeat (AltSubRepeat -> '.')
+    b = SyntheticInputBuilder(tmp_path / "audit41_cli", chrom="Chr01", backbone_prefix="Ref#1#")
+
+    ref_steps: list[str] = []
+    alt_wide_a: list[str] = []
+    alt_50snps: list[str] = []
+
+    # Anchor A0
+    b.add_node("a0", make_complex_seq(200, seed=81000))
+    ref_steps.append("a0+")
+    alt_wide_a.append("a0+")
+    alt_50snps.append("a0+")
+    for k in range(50):
+        anc = f"ua_{k}"
+        s_ref = f"sr_{k}"
+        s_alt = f"sa_{k}"
+        b.add_node(anc, make_complex_seq(199, seed=81100 + k))
+        b.add_node(s_ref, "A" if k % 2 == 0 else "G")
+        b.add_node(s_alt, "C" if k % 2 == 0 else "T")
+        ref_steps.extend([f"{anc}+", f"{s_ref}+"])
+        alt_50snps.extend([f"{anc}+", f"{s_alt}+"])
+    b.add_node("xa", make_complex_seq(250, seed=81900))
+    b.add_node("ab", make_complex_seq(200, seed=81901))
+    ref_steps.append("ab+")
+    alt_wide_a.extend(["xa+", "ab+"])
+    alt_50snps.append("ab+")
+
+    # Locus B after anchor ab: ab - d1(100) - m1(60) - u1(100) - n1(30) - u2(100) - n2(30) - b_end(200)
+    d1 = make_complex_seq(100, seed=82001)
+    m1 = make_complex_seq(60, seed=82002)
+    u1 = make_complex_seq(100, seed=82003)
+    n1 = make_complex_seq(30, seed=82004)
+    u2 = make_complex_seq(100, seed=82005)
+    n2 = make_complex_seq(30, seed=82006)
+    b_end = make_complex_seq(200, seed=82007)
+    b.add_node("d1", d1)
+    b.add_node("m1", m1)
+    b.add_node("u1", u1)
+    b.add_node("n1", n1)
+    b.add_node("u2", u2)
+    b.add_node("n2", n2)
+    b.add_node("b_end", b_end)
+    b.add_node("xb", make_complex_seq(300, seed=82008))
+    b.add_node("m1_snp", mutate_seq_snps(m1, positions=[30]))
+    b.add_node("n1_snp", mutate_seq_snps(n1, positions=[15]))
+    b.add_node("n2_snp", mutate_seq_snps(n2, positions=[15]))
+    b.add_node("y_ins", make_complex_seq(120, seed=82009))
+    b.add_node("r_sat", make_satellite_seq(20, 600, seed=82010))
+
+    locus_b_ref = ["d1+", "m1+", "u1+", "n1+", "u2+", "n2+", "b_end+"]
+    locus_a_end_rank = len(ref_steps) - 1
+    ref_steps_full = ref_steps + locus_b_ref
+    locus_b_end_rank = len(ref_steps_full) - 1
+
+    b.set_ref_path("Ref#1#Chr01", ref_steps_full)
+    b.add_path("AltWideA#1#Chr01", alt_wide_a + locus_b_ref)
+    b.add_path("Alt50Snps#1#Chr01", alt_50snps + locus_b_ref)
+    b.add_path("AltWideB#1#Chr01", ref_steps + ["xb+", "b_end+"])
+    b.add_path(
+        "AltScatAndRep0Ok#1#Chr01",
+        ref_steps + ["d1+", "m1_snp+", "u1+", "n1_snp+", "u2+", "n2_snp+", "b_end+"],
+    )
+    b.add_path(
+        "AltRep0DelFail#1#Chr01",
+        ref_steps + ["m1_snp+", "u1+", "n1+", "u2+", "n2+", "b_end+"],
+    )
+    b.add_path(
+        "AltSubIns#1#Chr01",
+        ref_steps + ["d1+", "y_ins+", "u1+", "n1+", "u2+", "n2+", "b_end+"],
+    )
+    b.add_path(
+        "AltSubDel#1#Chr01",
+        ref_steps + ["m1+", "u1+", "n1+", "u2+", "n2+", "b_end+"],
+    )
+    b.add_path(
+        "AltSubRepeat#1#Chr01",
+        ref_steps + ["d1+", "m1+", "u1+", "n1+", "r_sat+", "n2+", "b_end+"],
+    )
+    inp = b.write("audit41_cli")
+
+    p1, bun1 = run_build(
+        inp,
+        out_prefix=tmp_path / "audit41_cli" / "out_t1",
+        extra_args=["--threads", "1"],
+    )
+    p4, bun4 = run_build(
+        inp,
+        out_prefix=tmp_path / "audit41_cli" / "out_t4",
+        extra_args=["--threads", "4"],
+        extra_env={"PANFLAT_FORCE_FORK": "1"},
+    )
+    assert p1.returncode == 0 and bun1 is not None, f"t1 failed: {p1.stderr}"
+    assert p4.returncode == 0 and bun4 is not None, f"t4 failed: {p4.stderr}"
+    run_verify(bun1.prefix, inp.gfa_path, inp.ref_fa_path, check=True)
+    run_verify(bun4.prefix, inp.gfa_path, inp.ref_fa_path, check=True)
+    assert_all_global_invariants(bun1, inp.gfa_path, inp.ref_fa_path)
+
+    ins_a = next(
+        r for r in bun1.sv_rows if r["type"] == "INS" and r["anchors"] == f"0..{locus_a_end_rank}"
+    )
+    gt_a = bun1.genotypes[ins_a["event_id"]]
+    assert gt_a["Ref#1"] == "0"
+    assert gt_a["AltWideA#1"] == "1"
+    assert gt_a["Alt50Snps#1"] == "0"
+    assert int(ins_a["n_called"]) == 9
+
+    ins_b = next(
+        r
+        for r in bun1.sv_rows
+        if r["type"] == "INS" and r["anchors"] == f"{locus_a_end_rank}..{locus_b_end_rank}"
+    )
+    gt_b = bun1.genotypes[ins_b["event_id"]]
+    assert gt_b["Ref#1"] == "0"
+    assert gt_b["AltWideA#1"] == "0"
+    assert gt_b["Alt50Snps#1"] == "0"
+    assert gt_b["AltWideB#1"] == "1"
+    assert gt_b["AltScatAndRep0Ok#1"] == "0"
+    assert gt_b["AltRep0DelFail#1"] == "."
+    assert gt_b["AltSubIns#1"] == "."
+    assert gt_b["AltSubDel#1"] == "."
+    assert gt_b["AltSubRepeat#1"] == "."
+    assert int(ins_b["n_called"]) == 5
+
+    for suffix in _CORE_OUTPUT_SUFFIXES:
+        f1 = Path(f"{bun1.prefix}{suffix}")
+        f4 = Path(f"{bun4.prefix}{suffix}")
+        assert f1.exists() and f4.exists(), f"Missing output {suffix}"
+        assert _sha256_file(f1) == _sha256_file(f4), f"T22 mismatch on audit41_cli {suffix}"
+
 
 

@@ -941,7 +941,8 @@ def test_rf2_wave1_case_a_monotone_coverage_and_case_b_dropped_small_ins(
     _, _, res_sw = _run_pipeline_from_builder(tmp_path, "w1_p27b", gb_sw, "Ref#1#Chr01", ref_sw)
     assert [e for e in res_sw.sv_events if e.event_type == "INS"][0].genotypes["AltSwapRep#1"] == "."
 
-    # 6. Challenger 1 NEW Bug 4: Stage 4 dropped <50bp novel insertions (compact & string IDs)
+    # 6. §4.1 per-sub-deviation Case B: independent <50bp insertions separated by unique anchors call '0',
+    # while two 25bp insertions inside ONE sub-deviation (separated by a multi-copy ref node) still call '.'
     for use_int in (True, False):
         gb_b4 = SyntheticGFAFixtureBuilder()
         id_fn = (lambda i: str(i)) if use_int else (lambda i: f"n{i}")
@@ -969,8 +970,8 @@ def test_rf2_wave1_case_a_monotone_coverage_and_case_b_dropped_small_ins(
             tmp_path, f"w1_b4_{use_int}", gb_b4, "Ref#1#Chr01", ref_b4
         )
         gt_b4 = [e for e in res_b4.sv_events if e.event_type == "INS"][0].genotypes
-        assert gt_b4["Alt2x25Ins#1"] == "."
-        assert gt_b4["Alt2x49Ins#1"] == "."
+        assert gt_b4["Alt2x25Ins#1"] == "0"
+        assert gt_b4["Alt2x49Ins#1"] == "0"
         assert gt_b4["Alt2x24Ins#1"] == "0"
 
 
@@ -3854,5 +3855,232 @@ def test_rf3_wave6_stage6e_unified_recall_fairness_and_latency() -> None:
         assert check_similarity_merge(ua + ub, ua + ub + sep_r1 + ua + db + ub) is True
     assert check_similarity_merge(u1_r1 + u2_r1, "A" * 200 + u1_r1 + u2_r1 + "A" * 200) is True
     assert check_similarity_merge(u1_r1 + u2_r1, ("AT" * 100) + u1_r1 + u2_r1 + ("AT" * 100)) is True
+
+
+@pytest.mark.parametrize("use_compact_ids", [True, False])
+def test_audit_4_1_wide_multi_anchor_ins_genotyping_per_subdeviation(
+    tmp_path: Path,
+    use_compact_ids: bool,
+) -> None:
+    """REVIEW_AUDIT_REPORT.md §4.1: wide multi-anchor G(a, b) INS genotyping evaluates sub-deviations individually and honors sub-group rep0 exemptions."""
+    id_fn = (lambda i: str(i)) if use_compact_ids else (lambda i: f"n{i}")
+
+    # 1. §4.1 Scenario 1: Ref = A - N1(30bp) - U(100bp) - N2(30bp) - B,
+    #    Alt1 = A - X(200bp) - B, Alt2 = A - N1_snp - U - N2_snp - B -> '0'
+    gb1 = SyntheticGFAFixtureBuilder()
+    n1 = make_complex_seq(30, seed=51001)
+    n2 = make_complex_seq(30, seed=51002)
+    gb1.add_node(id_fn(1), make_complex_seq(150, seed=51000))  # A
+    gb1.add_node(id_fn(2), n1)
+    gb1.add_node(id_fn(3), make_complex_seq(100, seed=51003))  # U
+    gb1.add_node(id_fn(4), n2)
+    gb1.add_node(id_fn(5), make_complex_seq(150, seed=51004))  # B
+    gb1.add_node(id_fn(6), make_complex_seq(200, seed=51005))  # X
+    gb1.add_node(id_fn(7), mutate_seq_snps(n1, [15]))
+    gb1.add_node(id_fn(8), mutate_seq_snps(n2, [15]))
+    ref1 = [(id_fn(i), "+") for i in (1, 2, 3, 4, 5)]
+    gb1.add_p_path("Ref#1#Chr01", ref1)
+    gb1.add_p_path("Alt1#1#Chr01", [(id_fn(1), "+"), (id_fn(6), "+"), (id_fn(5), "+")])
+    gb1.add_p_path(
+        "Alt2#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(7), "+"), (id_fn(3), "+"), (id_fn(8), "+"), (id_fn(5), "+")],
+    )
+    _, _, res1 = _run_pipeline_from_builder(
+        tmp_path, f"audit41_s1_{use_compact_ids}", gb1, "Ref#1#Chr01", ref1
+    )
+    ins1 = [e for e in res1.sv_events if e.event_type == "INS"][0]
+    assert ins1.genotypes["Alt1#1"] == "1"
+    assert ins1.genotypes["Alt2#1"] == "0"
+    assert ins1.n_called == 3
+
+    # 2. §4.1 Scenario 1b: 10 kb wide interval with 50 x 1-bp SNP bubbles (99.5% identity) -> '0'
+    gb_10k = SyntheticGFAFixtureBuilder()
+    next_id = 1
+    ref_10k: list[tuple[str, str]] = []
+    alt_snps_10k: list[tuple[str, str]] = []
+    a_id = id_fn(next_id)
+    next_id += 1
+    gb_10k.add_node(a_id, make_complex_seq(200, seed=52000))
+    ref_10k.append((a_id, "+"))
+    alt_snps_10k.append((a_id, "+"))
+    for k in range(50):
+        anc_id = id_fn(next_id)
+        next_id += 1
+        gb_10k.add_node(anc_id, make_complex_seq(199, seed=52100 + k))
+        ref_base = "A" if k % 2 == 0 else "G"
+        alt_base = "C" if k % 2 == 0 else "T"
+        s_ref = id_fn(next_id)
+        s_alt = id_fn(next_id + 1)
+        next_id += 2
+        gb_10k.add_node(s_ref, ref_base)
+        gb_10k.add_node(s_alt, alt_base)
+        ref_10k.extend([(anc_id, "+"), (s_ref, "+")])
+        alt_snps_10k.extend([(anc_id, "+"), (s_alt, "+")])
+    b_id = id_fn(next_id)
+    x_id = id_fn(next_id + 1)
+    gb_10k.add_node(b_id, make_complex_seq(200, seed=52900))
+    gb_10k.add_node(x_id, make_complex_seq(300, seed=52901))
+    ref_10k.append((b_id, "+"))
+    alt_snps_10k.append((b_id, "+"))
+    gb_10k.add_p_path("Ref#1#Chr01", ref_10k)
+    gb_10k.add_p_path("AltWide#1#Chr01", [(a_id, "+"), (x_id, "+"), (b_id, "+")])
+    gb_10k.add_p_path("Alt50Snps#1#Chr01", alt_snps_10k)
+    _, _, res_10k = _run_pipeline_from_builder(
+        tmp_path, f"audit41_10k_{use_compact_ids}", gb_10k, "Ref#1#Chr01", ref_10k
+    )
+    ins_10k = [e for e in res_10k.sv_events if e.event_type == "INS"][0]
+    assert ins_10k.genotypes["AltWide#1"] == "1"
+    assert ins_10k.genotypes["Alt50Snps#1"] == "0"
+    assert ins_10k.n_called == 3
+
+    # 3. §4.1 Scenario 2: Sub-group rep0 exemption + negative controls inside wide G(A, B)
+    gb2 = SyntheticGFAFixtureBuilder()
+    d1 = make_complex_seq(100, seed=53001)
+    m1 = make_complex_seq(60, seed=53002)
+    u_seq = make_complex_seq(100, seed=53003)
+    m2 = make_complex_seq(60, seed=53004)
+    gb2.add_node(id_fn(1), make_complex_seq(150, seed=53000))  # A (0)
+    gb2.add_node(id_fn(2), d1)                                 # D1 (1)
+    gb2.add_node(id_fn(3), m1)                                 # M1 (2)
+    gb2.add_node(id_fn(4), u_seq)                              # U (3)
+    gb2.add_node(id_fn(5), m2)                                 # M2 (4)
+    gb2.add_node(id_fn(6), make_complex_seq(150, seed=53005))  # B (5)
+    gb2.add_node(id_fn(7), make_complex_seq(250, seed=53006))  # X wide replacement
+    gb2.add_node(id_fn(8), mutate_seq_snps(m1, [30]))          # M1_snp (60bp -> rep0)
+    gb2.add_node(id_fn(9), mutate_seq_snps(m2, [30]))          # M2_snp (60bp -> rep0)
+    gb2.add_node(id_fn(10), make_complex_seq(120, seed=53007)) # Y sub-group non-backbone INS
+    gb2.add_node(id_fn(11), make_satellite_seq(20, 600, seed=53008))  # R_sat masked repeat
+    ref2 = [(id_fn(i), "+") for i in (1, 2, 3, 4, 5, 6)]
+    gb2.add_p_path("Ref#1#Chr01", ref2)
+    gb2.add_p_path("AltWide#1#Chr01", [(id_fn(1), "+"), (id_fn(7), "+"), (id_fn(6), "+")])
+    # Sub-group rep0 matches (both M1_snp and M2_snp merge into rep0 in their own sub-groups) -> '0'
+    gb2.add_p_path(
+        "AltSubRep0Ok#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(2), "+"), (id_fn(8), "+"), (id_fn(4), "+"), (id_fn(9), "+"), (id_fn(6), "+")],
+    )
+    # Sub-group rep0 failure: 100bp D1 deleted while M1_snp merges into rep0(D1+M1) under HW -> '.'
+    gb2.add_p_path(
+        "AltSubRep0DelFail#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(8), "+"), (id_fn(4), "+"), (id_fn(5), "+"), (id_fn(6), "+")],
+    )
+    # Sub-group non-backbone INS Y(120bp) at (1, 3) -> '.' on wide G(0, 5)
+    gb2.add_p_path(
+        "AltSubIns#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(2), "+"), (id_fn(10), "+"), (id_fn(4), "+"), (id_fn(5), "+"), (id_fn(6), "+")],
+    )
+    # Sub-group pure 100bp DEL at (0, 2) -> '.' on wide G(0, 5)
+    gb2.add_p_path(
+        "AltSubPureDel#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(3), "+"), (id_fn(4), "+"), (id_fn(5), "+"), (id_fn(6), "+")],
+    )
+    # Sub-group repeat-masked 600bp satellite at (3, 5) -> '.' on wide G(0, 5)
+    gb2.add_p_path(
+        "AltSubRepeat#1#Chr01",
+        [(id_fn(1), "+"), (id_fn(2), "+"), (id_fn(3), "+"), (id_fn(4), "+"), (id_fn(11), "+"), (id_fn(6), "+")],
+    )
+    _, _, res2 = _run_pipeline_from_builder(
+        tmp_path, f"audit41_s2_{use_compact_ids}", gb2, "Ref#1#Chr01", ref2
+    )
+    wide_ins = next(
+        e for e in res2.sv_events if e.event_type == "INS" and e.anchors == "0..5"
+    )
+    assert wide_ins.genotypes["Ref#1"] == "0"
+    assert wide_ins.genotypes["AltWide#1"] == "1"
+    assert wide_ins.genotypes["AltSubRep0Ok#1"] == "0"
+    assert wide_ins.genotypes["AltSubRep0DelFail#1"] == "."
+    assert wide_ins.genotypes["AltSubIns#1"] == "."
+    assert wide_ins.genotypes["AltSubPureDel#1"] == "."
+    assert wide_ins.genotypes["AltSubRepeat#1"] == "."
+    assert wide_ins.n_called == 3
+
+    # 4. Under dedup_mode="pan": if sub-group non-backbone INS Y(120bp) is subtracted in Stage 5.5
+    #    (matched by a higher-support upstream locus), AltSubPanIns must STILL get '.' on wide G(1, 6);
+    #    Module A-subtracted 60bp M1_snp emits '.' (Module D contract), while scattered <50bp SNPs still call '0'!
+    gb_pan = SyntheticGFAFixtureBuilder()
+    y_seq = make_complex_seq(120, seed=54007)
+    n_p1 = make_complex_seq(30, seed=54008)
+    n_p2 = make_complex_seq(30, seed=54009)
+    gb_pan.add_node("1", make_complex_seq(150, seed=54000))  # anchor 0
+    gb_pan.add_node("2", make_complex_seq(150, seed=54001))  # anchor 1
+    gb_pan.add_node("3", make_complex_seq(100, seed=54002))  # D1 (2)
+    gb_pan.add_node("4", make_complex_seq(60, seed=54003))   # M1 (3)
+    gb_pan.add_node("5", make_complex_seq(100, seed=54004))  # U (4)
+    gb_pan.add_node("6", n_p1)                               # Np1 (5)
+    gb_pan.add_node("7", make_complex_seq(100, seed=54010))  # U2 (6)
+    gb_pan.add_node("8", n_p2)                               # Np2 (7)
+    gb_pan.add_node("9", make_complex_seq(150, seed=54005))  # B (8)
+    gb_pan.add_node("10", make_complex_seq(250, seed=54006)) # X wide
+    gb_pan.add_node("11", y_seq)                             # Y
+    gb_pan.add_node("12", mutate_seq_snps(gb_pan.nodes["4"], [30]))  # M1_snp (Module A subtracted)
+    gb_pan.add_node("13", mutate_seq_snps(n_p1, [15]))       # Np1_snp (30bp)
+    gb_pan.add_node("14", mutate_seq_snps(n_p2, [15]))       # Np2_snp (30bp)
+    ref_pan = [(str(i), "+") for i in range(1, 10)]
+    gb_pan.add_p_path("Ref#1#Chr01", ref_pan)
+    # 2 haplotypes carry Y at upstream slot (0..1) so Y has support=2 > support=1 at sub-group (2..4)
+    gb_pan.add_p_path(
+        "DonorA#1#Chr01",
+        [("1", "+"), ("11", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+"), ("9", "+")],
+    )
+    gb_pan.add_p_path(
+        "DonorB#1#Chr01",
+        [("1", "+"), ("11", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+"), ("9", "+")],
+    )
+    gb_pan.add_p_path("AltWide#1#Chr01", [("1", "+"), ("2", "+"), ("10", "+"), ("9", "+")])
+    gb_pan.add_p_path(
+        "AltSubPanIns#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("11", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+"), ("9", "+")],
+    )
+    gb_pan.add_p_path(
+        "AltSubRefDedup#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("12", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+"), ("9", "+")],
+    )
+    gb_pan.add_p_path(
+        "AltSubSmallSnps#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("13", "+"), ("7", "+"), ("14", "+"), ("9", "+")],
+    )
+    gfa_pan = gb_pan.write_gfa(tmp_path / f"audit41_pan_{use_compact_ids}.gfa")
+    ref_fa_pan = gb_pan.write_fasta(
+        tmp_path / f"audit41_pan_{use_compact_ids}.ref.fa",
+        {"Chr01": gb_pan.spell_steps(ref_pan)},
+    )
+    cfg_pan = BuildConfig(
+        gfa=str(gfa_pan),
+        ref_fa=str(ref_fa_pan),
+        backbone_prefix="Ref#1#",
+        out_prefix=str(tmp_path / f"audit41_pan_{use_compact_ids}_out"),
+        dedup_mode="pan",
+        dedup_id=0.90,
+    )
+    graph_pan = load_and_validate_inputs(cfg_pan)
+    res_pan = run_chromosome_pipeline(graph_pan, cfg_pan)
+    wide_pan_ins = next(
+        e for e in res_pan.sv_events if e.event_type == "INS" and e.anchors == "1..8"
+    )
+    assert wide_pan_ins.genotypes["AltWide#1"] == "1"
+    assert wide_pan_ins.genotypes["AltSubPanIns#1"] == "."
+    assert wide_pan_ins.genotypes["AltSubRefDedup#1"] == "."
+    assert wide_pan_ins.genotypes["AltSubSmallSnps#1"] == "0"
+
+
+def test_audit_4_2_edlib_similarity_module_split_exports() -> None:
+    """REVIEW_AUDIT_REPORT.md §4.2: edlib affine alignment & C1 helpers reside in panflat.edlib_similarity with repeat_guard backward compatibility."""
+    import panflat.edlib_similarity as es_mod
+    import panflat.repeat_guard as rg_mod
+
+    assert es_mod.EDLIB_MAX_LEN == rg_mod.EDLIB_MAX_LEN == 1000
+    assert es_mod.parse_edlib_cigar_to_ops is rg_mod.parse_edlib_cigar_to_ops
+    assert es_mod._has_distinct_edlib_del_split_copy is rg_mod._has_distinct_edlib_del_split_copy
+
+    r = make_complex_seq(300, seed=55001)
+    s = mutate_seq_snps(r, [100, 200])
+    ok, ops, qs, qe, ts, te, del_bp = es_mod._evaluate_edlib_similarity_branch(
+        s=s, r=r, min_sv_len=50, cluster_id=0.95
+    )
+    assert ok is True
+    assert qs == 0 and qe == 300 and ts == 0 and te == 300 and del_bp == 0
+    assert sum(ln for op, ln in ops if op == "M") == 298
+    assert check_similarity_merge(s, r) is True
+    assert check_similarity_merge(r[:150], r[:150] + r[:150]) is False
+
 
 

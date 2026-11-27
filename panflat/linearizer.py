@@ -271,6 +271,7 @@ class GroupRepeatGuardResult:
     short_residual_bp: int = 0
     has_partial_content: bool = False
     cand_dev_loc: dict[str, tuple[int, int]] = field(default_factory=dict)
+    rep0_backbone_matched_contigs: set[int] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -3766,15 +3767,6 @@ def _analyze_single_normal_fragment(
                 if exact_ref_match_mask is not None:
                     cand_mask &= ~exact_ref_match_mask
 
-                dropped_small_mask = (~cand_mask) & (b_bp > 0)
-                if exact_ref_match_mask is not None:
-                    dropped_small_mask &= ~exact_ref_match_mask
-                for k_sm in np.flatnonzero(dropped_small_mask).tolist():
-                    if not _ov_unnorm(int(b_starts[k_sm]), int(b_ends[k_sm])):
-                        analysis.small_dev_bp_spans.append(
-                            (int(mc_r[k_sm]), int(mc_r[k_sm + 1]), int(b_bp[k_sm]))
-                        )
-
                 ref_codes_abs = np.abs(ref_steps._codes)
                 for k in np.flatnonzero(cand_mask).tolist():
                     b_s = int(b_starts[k])
@@ -3792,18 +3784,10 @@ def _analyze_single_normal_fragment(
                     ):
                         if b_e - b_s == 1 and r_right - r_s == 1:
                             if int(f_nids[b_s]) != int(ref_codes_abs[r_s]):
-                                if int(b_bp[k]) > 0:
-                                    analysis.small_dev_bp_spans.append(
-                                        (r_left, r_right, int(b_bp[k]))
-                                    )
                                 continue
                         elif set(f_nids[b_s:b_e].tolist()).isdisjoint(
                             ref_codes_abs[r_s:r_right].tolist()
                         ):
-                            if int(b_bp[k]) > 0:
-                                analysis.small_dev_bp_spans.append(
-                                    (r_left, r_right, int(b_bp[k]))
-                                )
                             continue
                     br_st = norm_frag.steps[b_s:b_e]
                     b_st: Any = ref_steps[r_s:r_right]
@@ -3993,10 +3977,6 @@ def _analyze_single_normal_fragment(
                                     )
                                 )
                                 if not same_tokens:
-                                    if t_alt_bp > 0:
-                                        analysis.small_dev_bp_spans.append(
-                                            (ta, tb, t_alt_bp)
-                                        )
                                     continue
                     else:
                         t_alt_bp = sum(
@@ -4026,10 +4006,6 @@ def _analyze_single_normal_fragment(
                                     }
                                 )
                                 if not same_tokens:
-                                    if t_alt_bp > 0:
-                                        analysis.small_dev_bp_spans.append(
-                                            (ta, tb, t_alt_bp)
-                                        )
                                     continue
                 keep_prov = True
                 if (
@@ -4144,6 +4120,106 @@ class _Stage5ForkContext:
 
 _STAGE5_FORK_CTX: _Stage5ForkContext | None = None
 _STAGE5_WORKER_TBUF_CACHE: tuple[int, int, Any, Any] | None = None
+
+
+def _case_a_rep0_matches_backbone(
+    tdev_here: DeviationSegment,
+    b_steps_slice: Sequence[Step],
+    c_list_here: Sequence[ExtractedCandidate],
+    cand_dev_loc: Mapping[str, tuple[int, int]],
+    rep0_cand_spans: Mapping[str, tuple[int, int, int, int]],
+    graph: GFAGraph,
+    min_sv_len: int,
+) -> bool:
+    """Return True iff all kept candidates in `tdev_here` merged into `rep0` and cover `B(ta, tb)` within `< min_sv_len`."""
+    b_step_starts: list[int] = []
+    b_step_ends: list[int] = []
+    b_positions_by_tok: dict[tuple[str, str], list[int]] = (
+        collections.defaultdict(list)
+    )
+    cur_b_off = 0
+    for b_i, b_st in enumerate(b_steps_slice):
+        b_len = _step_bp_len(b_st, graph.nodes)
+        b_step_starts.append(cur_b_off)
+        cur_b_off += b_len
+        b_step_ends.append(cur_b_off)
+        b_positions_by_tok[(b_st.node_id, b_st.orient)].append(b_i)
+    len_b = cur_b_off
+
+    cands_at_step: dict[int, list[tuple[int, int, int, int]]] = (
+        collections.defaultdict(list)
+    )
+    kept_nonref_bp = 0
+    for kc in c_list_here:
+        span = rep0_cand_spans.get(kc.candidate_id)
+        loc = cand_dev_loc.get(kc.candidate_id)
+        if span is None or loc is None:
+            return False
+        kept_nonref_bp += span[0]
+        cands_at_step[loc[1]].append(span)
+
+    nonref_br_bp = 0
+    for st in tdev_here.branch_steps:
+        if not (_is_full_step(st) and st.node_id in graph.global_ref_nodes):
+            nonref_br_bp += _step_bp_len(st, graph.nodes)
+
+    dropped_nonref_bp = max(0, nonref_br_bp - kept_nonref_bp)
+    if dropped_nonref_bp >= min_sv_len:
+        return False
+
+    cursor_b = 0
+    b_step_cursor = 0
+    covered_b_bp = 0
+    extra_ref_br_bp = 0
+    total_internal_del_bp = 0
+    ins_excess_bp = 0
+
+    for step_idx, st in enumerate(tdev_here.branch_steps):
+        if step_idx in cands_at_step:
+            for kept_len, t_start, t_end, internal_del_bp in cands_at_step[
+                step_idx
+            ]:
+                eff_start = max(t_start, cursor_b)
+                new_b_cov = max(0, t_end - eff_start)
+                if new_b_cov > 0:
+                    covered_b_bp += new_b_cov
+                    cursor_b = t_end
+                    total_internal_del_bp += internal_del_bp
+                    ins_excess_bp += max(
+                        0, kept_len + internal_del_bp - new_b_cov
+                    )
+                else:
+                    ins_excess_bp += kept_len
+        if _is_full_step(st) and st.node_id in graph.global_ref_nodes:
+            slen = _step_bp_len(st, graph.nodes)
+            tok = (st.node_id, st.orient)
+            pos_list = b_positions_by_tok.get(tok)
+            matched_b_idx = -1
+            if pos_list:
+                p_lo = bisect.bisect_left(pos_list, b_step_cursor)
+                while p_lo < len(pos_list):
+                    cand_b_i = pos_list[p_lo]
+                    if b_step_ends[cand_b_i] > cursor_b:
+                        matched_b_idx = cand_b_i
+                        break
+                    p_lo += 1
+            if matched_b_idx >= 0:
+                bs_start = b_step_starts[matched_b_idx]
+                bs_end = b_step_ends[matched_b_idx]
+                ov_prev = max(0, cursor_b - bs_start)
+                new_cov = bs_end - max(bs_start, cursor_b)
+                covered_b_bp += new_cov
+                cursor_b = bs_end
+                b_step_cursor = matched_b_idx + 1
+                ins_excess_bp += ov_prev
+            else:
+                extra_ref_br_bp += slen
+
+    uncovered_b_bp = (len_b - covered_b_bp) + total_internal_del_bp
+    return (
+        extra_ref_br_bp + dropped_nonref_bp + uncovered_b_bp < min_sv_len
+        and extra_ref_br_bp + dropped_nonref_bp + ins_excess_bp < min_sv_len
+    )
 
 
 def _screen_and_solve_one_pair(
@@ -4262,6 +4338,36 @@ def _screen_and_solve_one_pair(
             parent_state_key=g_state_key,
             ancestor_keys=frozenset({top_state_key}),
         )
+        cands_by_contig_s5: dict[int, list[ExtractedCandidate]] = (
+            collections.defaultdict(list)
+        )
+        for kc in guard_res.kept_candidates:
+            loc_kc = guard_res.cand_dev_loc.get(kc.candidate_id)
+            if loc_kc is not None:
+                cands_by_contig_s5[loc_kc[0]].append(kc)
+        for analysis, tdev in devs_at_pair:
+            ckey_s5 = analysis.contig_idx
+            if (
+                ckey_s5 in guard_res.contig_had_masked_repeat
+                or ckey_s5 in guard_res.contig_had_subtracted_homolog
+            ):
+                continue
+            c_list_s5 = cands_by_contig_s5.get(ckey_s5)
+            if c_list_s5 and all(
+                sol.cand_to_rep_idx.get(kc.candidate_id, 0) == 0
+                for kc in c_list_s5
+            ):
+                if _case_a_rep0_matches_backbone(
+                    tdev,
+                    b_slice,
+                    c_list_s5,
+                    guard_res.cand_dev_loc,
+                    sol.rep0_cand_spans,
+                    graph,
+                    config.min_sv_len,
+                ):
+                    guard_res.rep0_backbone_matched_contigs.add(ckey_s5)
+
         sol.backbone_seq = ""
         keep_token_str = config.dedup_mode == "pan"
         for rep in sol.non_backbone_reps:
@@ -4278,27 +4384,13 @@ def _screen_and_solve_one_pair(
         cand_contig_idx = {
             cid: loc[0] for cid, loc in guard_res.cand_dev_loc.items()
         }
+        sol.rep0_cand_spans = {}
+        guard_res.cand_dev_loc = {}
         if not sol.non_backbone_reps:
             sol.cand_to_rep_idx = {}
             sol.cand_to_nested_sig = {}
             sol.cand_to_reconstructed_len = {}
             sol.cand_to_flags = {}
-            sol.rep0_cand_spans = {}
-            guard_res.cand_dev_loc = {}
-        else:
-            rep0_cids = {
-                cid
-                for cid, r_idx in sol.cand_to_rep_idx.items()
-                if r_idx == 0
-            }
-            if rep0_cids:
-                guard_res.cand_dev_loc = {
-                    cid: loc
-                    for cid, loc in guard_res.cand_dev_loc.items()
-                    if cid in rep0_cids
-                }
-            else:
-                guard_res.cand_dev_loc = {}
         guard_res.kept_candidates = [
             replace(
                 kc,
@@ -6294,177 +6386,61 @@ def run_chromosome_pipeline(
         )
 
     # 6c. Terminal normal groups G(a, b): DUP_TRA, CNV, DEL, and INS
-    # Precompute reference step lengths & per-contig sorted terminal deviation index for §5.2 INS genotyping
-    ref_step_lens_arr: np.ndarray | None = (
-        np.diff(graph._ref_cum_offsets)
-        if graph._ref_cum_offsets is not None
-        else None
-    )
-    dev_spans_by_contig: dict[int, list[tuple[int, int, int]]] = (
+    # Precompute per-contig sorted disqualifying terminal sub-deviation spans for §5.2 INS genotyping
+    # (REVIEW_AUDIT_REPORT.md §4.1: evaluate each sub-deviation individually without cross-interval
+    # summation across anchors, exempting sub-deviations matched to rep0 within < min_sv_len).
+    disqualifying_spans_by_contig: dict[int, list[tuple[int, int]]] = (
         collections.defaultdict(list)
     )
-    for (ta, tb), pair_entries in terminal_devs_by_pair.items():
-        for ca_d, tdev_d in pair_entries:
-            br_bp = _branch_steps_bp(tdev_d.branch_steps, graph)
-            if br_bp > 0:
-                dev_spans_by_contig[ca_d.contig_idx].append((ta, tb, br_bp))
-    for ca_s in contig_analyses:
-        if ca_s.small_dev_bp_spans:
-            dev_spans_by_contig[ca_s.contig_idx].extend(
-                ca_s.small_dev_bp_spans
-            )
-    dev_starts_by_contig: dict[int, list[int]] = {}
-    for c_idx, entries_c in dev_spans_by_contig.items():
-        entries_c.sort(key=lambda x: (x[0], x[1]))
-        dev_starts_by_contig[c_idx] = [e[0] for e in entries_c]
-
-    def _uncovered_ref_bp_open(
-        ca_obj: _ContigAnalysis,
-        r_a: int,
-        r_b: int,
-    ) -> int:
-        lo_r = max(0, r_a + 1)
-        hi_r = min(n_ref, r_b)
-        if lo_r >= hi_r:
-            return 0
-        cov = ca_obj.covered_ranks
-        if isinstance(cov, CompactRankSet):
-            uncov_mask = ~cov._mask[lo_r:hi_r]
-            if not bool(np.any(uncov_mask)):
-                return 0
-            if ref_step_lens_arr is not None:
-                return int(
-                    ref_step_lens_arr[lo_r:hi_r][uncov_mask].sum(dtype=np.int64)
-                )
-            return sum(
-                graph.ref_step_ranges[lo_r + off][1]
-                - graph.ref_step_ranges[lo_r + off][0]
-                for off in np.flatnonzero(uncov_mask).tolist()
-            )
-        return sum(
-            graph.ref_step_ranges[r][1] - graph.ref_step_ranges[r][0]
-            for r in range(lo_r, hi_r)
-            if r not in cov
+    for pair_d in sorted_group_pairs:
+        ta, tb = pair_d
+        sub_guard = group_guard_by_pair[pair_d]
+        sub_ref_span_bp = (
+            graph.ref_step_ranges[tb][0] - graph.ref_step_ranges[ta][1]
         )
+        for ca_d, tdev_d in terminal_devs_by_pair[pair_d]:
+            ckey_d = ca_d.contig_idx
+            if (
+                ckey_d in sub_guard.contig_had_masked_repeat
+                or ckey_d in sub_guard.contig_had_subtracted_homolog
+            ):
+                disqualifying_spans_by_contig[ckey_d].append((ta, tb))
+            elif ckey_d in sub_guard.rep0_backbone_matched_contigs:
+                continue
+            elif ckey_d in sub_guard.contig_had_kept_candidate:
+                disqualifying_spans_by_contig[ckey_d].append((ta, tb))
+            else:
+                br_bp_d = _branch_steps_bp(tdev_d.branch_steps, graph)
+                if (
+                    sub_ref_span_bp >= config.min_sv_len
+                    or br_bp_d >= config.min_sv_len
+                ):
+                    disqualifying_spans_by_contig[ckey_d].append((ta, tb))
 
-    def _dev_branch_bp_in_span(
+    disqualifying_starts_by_contig: dict[int, list[int]] = {}
+    for c_idx, spans_c in disqualifying_spans_by_contig.items():
+        spans_c.sort()
+        disqualifying_starts_by_contig[c_idx] = [sp[0] for sp in spans_c]
+
+    def _contig_has_disqualifying_subdev(
         contig_idx: int,
         r_a: int,
         r_b: int,
-    ) -> int:
-        entries_c = dev_spans_by_contig.get(contig_idx)
-        if not entries_c:
-            return 0
-        starts_c = dev_starts_by_contig[contig_idx]
+    ) -> bool:
+        spans_c = disqualifying_spans_by_contig.get(contig_idx)
+        if not spans_c:
+            return False
+        starts_c = disqualifying_starts_by_contig[contig_idx]
         pos = bisect.bisect_left(starts_c, r_a)
-        total_bp = 0
-        n_ent = len(entries_c)
+        n_ent = len(spans_c)
         while pos < n_ent:
-            ta_i, tb_i, br_bp_i = entries_c[pos]
+            ta_i, tb_i = spans_c[pos]
             if ta_i >= r_b:
                 break
             if tb_i <= r_b:
-                total_bp += br_bp_i
+                return True
             pos += 1
-        return total_bp
-
-    def _case_a_rep0_matches_backbone(
-        tdev_here: DeviationSegment,
-        b_steps_slice: Sequence[Step],
-        c_list_here: Sequence[ExtractedCandidate],
-        cand_dev_loc: Mapping[str, tuple[int, int]],
-        rep0_cand_spans: Mapping[str, tuple[int, int, int, int]],
-    ) -> bool:
-        b_step_starts: list[int] = []
-        b_step_ends: list[int] = []
-        b_positions_by_tok: dict[tuple[str, str], list[int]] = (
-            collections.defaultdict(list)
-        )
-        cur_b_off = 0
-        for b_i, b_st in enumerate(b_steps_slice):
-            b_len = _step_bp_len(b_st, graph.nodes)
-            b_step_starts.append(cur_b_off)
-            cur_b_off += b_len
-            b_step_ends.append(cur_b_off)
-            b_positions_by_tok[(b_st.node_id, b_st.orient)].append(b_i)
-        len_b = cur_b_off
-
-        cands_at_step: dict[int, list[tuple[int, int, int, int]]] = (
-            collections.defaultdict(list)
-        )
-        kept_nonref_bp = 0
-        for kc in c_list_here:
-            span = rep0_cand_spans.get(kc.candidate_id)
-            loc = cand_dev_loc.get(kc.candidate_id)
-            if span is None or loc is None:
-                return False
-            kept_nonref_bp += span[0]
-            cands_at_step[loc[1]].append(span)
-
-        nonref_br_bp = 0
-        for st in tdev_here.branch_steps:
-            if not (_is_full_step(st) and st.node_id in graph.global_ref_nodes):
-                nonref_br_bp += _step_bp_len(st, graph.nodes)
-
-        dropped_nonref_bp = max(0, nonref_br_bp - kept_nonref_bp)
-        if dropped_nonref_bp >= config.min_sv_len:
-            return False
-
-        cursor_b = 0
-        b_step_cursor = 0
-        covered_b_bp = 0
-        extra_ref_br_bp = 0
-        total_internal_del_bp = 0
-        ins_excess_bp = 0
-
-        for step_idx, st in enumerate(tdev_here.branch_steps):
-            if step_idx in cands_at_step:
-                for kept_len, t_start, t_end, internal_del_bp in cands_at_step[
-                    step_idx
-                ]:
-                    eff_start = max(t_start, cursor_b)
-                    new_b_cov = max(0, t_end - eff_start)
-                    if new_b_cov > 0:
-                        covered_b_bp += new_b_cov
-                        cursor_b = t_end
-                        total_internal_del_bp += internal_del_bp
-                        ins_excess_bp += max(
-                            0, kept_len + internal_del_bp - new_b_cov
-                        )
-                    else:
-                        ins_excess_bp += kept_len
-            if _is_full_step(st) and st.node_id in graph.global_ref_nodes:
-                slen = _step_bp_len(st, graph.nodes)
-                tok = (st.node_id, st.orient)
-                pos_list = b_positions_by_tok.get(tok)
-                matched_b_idx = -1
-                if pos_list:
-                    p_lo = bisect.bisect_left(pos_list, b_step_cursor)
-                    while p_lo < len(pos_list):
-                        cand_b_i = pos_list[p_lo]
-                        if b_step_ends[cand_b_i] > cursor_b:
-                            matched_b_idx = cand_b_i
-                            break
-                        p_lo += 1
-                if matched_b_idx >= 0:
-                    bs_start = b_step_starts[matched_b_idx]
-                    bs_end = b_step_ends[matched_b_idx]
-                    ov_prev = max(0, cursor_b - bs_start)
-                    new_cov = bs_end - max(bs_start, cursor_b)
-                    covered_b_bp += new_cov
-                    cursor_b = bs_end
-                    b_step_cursor = matched_b_idx + 1
-                    ins_excess_bp += ov_prev
-                else:
-                    extra_ref_br_bp += slen
-
-        uncovered_b_bp = (len_b - covered_b_bp) + total_internal_del_bp
-        return (
-            extra_ref_br_bp + dropped_nonref_bp + uncovered_b_bp
-            < config.min_sv_len
-            and extra_ref_br_bp + dropped_nonref_bp + ins_excess_bp
-            < config.min_sv_len
-        )
+        return False
 
     guard_unres_indices_by_pair: dict[tuple[int, int], list[int]] = (
         collections.defaultdict(list)
@@ -7073,10 +7049,6 @@ def run_chromosome_pipeline(
             sig_has_mh: dict[SignatureType, bool] = {}
             sig_cand_ids: dict[SignatureType, set[str]] = collections.defaultdict(set)
 
-            dev_by_contig_at_pair = {
-                ca_d.contig_idx: tdev_d for ca_d, tdev_d in devs_at_pair
-            }
-
             for hap_id, ca_list in contigs_by_hap.items():
                 for ca in ca_list:
                     ckey = ca.contig_idx
@@ -7154,34 +7126,10 @@ def run_chromosome_pipeline(
                         ):
                             contig_sig_by_hap[hap_id].append(".")
                         elif _contig_covers_anchor_pair(ca, rank_a, rank_b):
-                            tdev_here = dev_by_contig_at_pair.get(ca.contig_idx)
-                            c_list_here = [
-                                kc
-                                for kc in c_list
-                                if guard_res.cand_dev_loc.get(
-                                    kc.candidate_id, (-1, -1)
-                                )[0]
-                                == ca.contig_idx
-                            ]
-                            if tdev_here is not None and c_list_here:
-                                is_ref_like = _case_a_rep0_matches_backbone(
-                                    tdev_here,
-                                    b_slice_steps,
-                                    c_list_here,
-                                    guard_res.cand_dev_loc,
-                                    sol.rep0_cand_spans,
-                                )
-                            else:
-                                is_ref_like = (
-                                    _uncovered_ref_bp_open(ca, rank_a, rank_b)
-                                    < config.min_sv_len
-                                    and _dev_branch_bp_in_span(
-                                        ca.contig_idx, rank_a, rank_b
-                                    )
-                                    < config.min_sv_len
-                                )
                             contig_sig_by_hap[hap_id].append(
-                                "0" if is_ref_like else "."
+                                "0"
+                                if ckey in guard_res.rep0_backbone_matched_contigs
+                                else "."
                             )
                         else:
                             contig_sig_by_hap[hap_id].append(".")
@@ -7190,14 +7138,10 @@ def run_chromosome_pipeline(
                         or ckey in guard_res.contig_had_subtracted_homolog
                     ):
                         contig_sig_by_hap[hap_id].append(".")
-                    elif (
-                        _contig_covers_anchor_pair(ca, rank_a, rank_b)
-                        and _uncovered_ref_bp_open(ca, rank_a, rank_b)
-                        < config.min_sv_len
-                        and _dev_branch_bp_in_span(
-                            ca.contig_idx, rank_a, rank_b
-                        )
-                        < config.min_sv_len
+                    elif _contig_covers_anchor_pair(
+                        ca, rank_a, rank_b
+                    ) and not _contig_has_disqualifying_subdev(
+                        ca.contig_idx, rank_a, rank_b
                     ):
                         contig_sig_by_hap[hap_id].append("0")
                     else:
