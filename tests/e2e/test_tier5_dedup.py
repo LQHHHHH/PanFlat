@@ -1251,3 +1251,220 @@ def test_tier5_dedup_7_protected_ins_non50_min_sv_len_cli(tmp_path: Path) -> Non
         assert bun.inserts[0]["pan_end"] - bun.inserts[0]["pan_start"] == 55
         assert novel_55 in bun.pan_seq
         assert int(bun.summary_kv["dedup_dropped_groups"]) == 0
+
+
+def _poisson_mutate_with_indels_cli(
+    seq: str,
+    snp_rate: float,
+    ins_specs: Sequence[tuple[int, int]],
+    del_specs: Sequence[tuple[int, int]],
+    seed: int,
+) -> str:
+    rng = random.Random(seed)
+    swap = {"A": "CGT", "C": "AGT", "G": "ACT", "T": "ACG"}
+    ins_map = {p: "".join(rng.choices("ACGT", k=ln)) for p, ln in ins_specs}
+    dels = sorted(del_specs)
+    out: list[str] = []
+    i = 0
+    d_i = 0
+    n = len(seq)
+    while i < n:
+        if i in ins_map:
+            out.append(ins_map[i])
+        if d_i < len(dels) and i == dels[d_i][0]:
+            i += dels[d_i][1]
+            d_i += 1
+            continue
+        ch = seq[i]
+        out.append(rng.choice(swap[ch]) if (ch in swap and rng.random() < snp_rate) else ch)
+        i += 1
+    return "".join(out)
+
+
+def test_tier5_dedup_8_poisson_swiss_cheese_whole_sv_drop_and_zero_micro_islands_cli(
+    tmp_path: Path,
+) -> None:
+    """Chr06 opaque-box CLI regression:
+    - Realistic Poisson-divergent + micro-indel + SV-deletion ectopic/cross-locus homologs are
+      eliminated cleanly without 50 bp Swiss-cheese fragmentation or <150 bp boundary shards.
+    - Multi-piece seamless synthetic duplicates `[1200 + 25 + 1200]` drop as whole SVs (zero `< 50 bp`
+      zombie pieces or wasted `100N` spacers).
+    - Standalone `65 bp` insertions, internal `60 bp` `protected_ins`, and `1,000 bp` novel genes
+      are 100% recalled, `--qc` 0.90 redundancy is `< 1%`, and `--threads 1` == `--threads 4`.
+    """
+    b = SyntheticInputBuilder(tmp_path / "cli_chr06_fix", chrom="Chr06A", backbone_prefix="Ref#1#")
+
+    plus_cds = make_coding_seq(num_codons=120, seed=8501)
+    r_nodes: dict[int, str] = {
+        1: make_complex_seq(600, seed=8511),
+        2: _fast_complex_dna(8_000, seed=8512),  # 8 kb reference TE
+        3: make_complex_seq(20, seed=8513) + plus_cds[:180],
+        4: make_complex_seq(500, seed=8514),
+        5: plus_cds[180:] + make_complex_seq(20, seed=8515),
+        6: make_complex_seq(600, seed=8516),
+        7: make_complex_seq(600, seed=8517),
+        8: make_complex_seq(600, seed=8518),
+        9: make_complex_seq(600, seed=8519),
+        10: make_satellite_seq(unit_len=20, total_len=1000, seed=8520),
+        11: make_complex_seq(600, seed=8521),
+    }
+    for idx_n, sq in r_nodes.items():
+        b.add_node(str(idx_n), sq)
+
+    ref_steps = [f"{i}+" for i in range(1, 12)]
+    b.set_ref_path("Ref#1#Chr06A", ref_steps)
+
+    # Place '+' coding gene spanning slot 4..5 and centromere BED on node 10
+    off = 0
+    coords: dict[int, tuple[int, int]] = {}
+    for i in range(1, 12):
+        ln = len(r_nodes[i])
+        coords[i] = (off, off + ln)
+        off += ln
+    b.add_bed_region(coords[10][0], coords[10][1], region_id="CEN_06A")
+    b.add_gff_gene(
+        gene_id="g_chr06",
+        mrna_id="m_chr06",
+        strand="+",
+        exons=[(coords[3][0] + 21, coords[3][1]), (coords[5][0] + 1, coords[5][0] + 180)],
+        cds_list=[(coords[3][0] + 21, coords[3][1], 0), (coords[5][0] + 1, coords[5][0] + 180, 0)],
+    )
+
+    # Ectopic 8 kb TE with Poisson ~4.5% SNPs + micro-indels (8-16 bp) + 140 bp deletion + 70 bp soft-clip tip
+    tip_70 = make_complex_seq(70, seed=8530)
+    ectopic_te_poisson = tip_70 + _poisson_mutate_with_indels_cli(
+        r_nodes[2],
+        snp_rate=0.045,
+        ins_specs=[(910, 11), (2640, 15), (4820, 9), (6710, 14)],
+        del_specs=[(1800, 12), (3900, 140), (7100, 8)],
+        seed=8531,
+    )
+    # Ectopic TE embedding a genuine 60 bp novel insertion (`protected_ins`)
+    prot_60 = make_complex_seq(60, seed=8532)
+    te_with_prot60 = (
+        _poisson_mutate_with_indels_cli(r_nodes[2][:3000], 0.04, [(800, 9)], [(1500, 10)], 8533)
+        + prot_60
+        + _poisson_mutate_with_indels_cli(r_nodes[2][3000:6000], 0.04, [(900, 12)], [], 8534)
+    )
+
+    # High-support pan-novel locus (2425 bp = 1200 + 25 + 1200) & lower-priority multi-piece synthetic copy
+    pan_l = make_complex_seq(1200, seed=8540)
+    pan_m25 = make_complex_seq(25, seed=8541)
+    pan_m90 = make_complex_seq(90, seed=8542)
+    pan_r = make_complex_seq(1200, seed=8543)
+    pan_full = pan_l + pan_m25 + pan_r
+    pan_l_mut = _poisson_mutate_with_indels_cli(pan_l, 0.04, [(410, 8)], [], 8544)
+    pan_r_mut = _poisson_mutate_with_indels_cli(pan_r, 0.04, [], [(520, 10)], 8545)
+
+    novel_gene_1000 = make_complex_seq(1000, seed=8550)
+    standalone_65 = make_complex_seq(65, seed=8551)
+
+    for nid, sq in [
+        ("20", ectopic_te_poisson),
+        ("21", te_with_prot60),
+        ("22", pan_full),
+        ("23", pan_l_mut),
+        ("24", pan_m25),
+        ("25", pan_r_mut),
+        ("26", pan_m90),
+        ("27", novel_gene_1000),
+        ("28", standalone_65),
+    ]:
+        b.add_node(nid, sq)
+
+    # High-support carriers of pan_full (n=4) and pan_m90 (n=3) at 5..6
+    for k in range(1, 5):
+        b.add_path(
+            f"Sup{k}#1#Chr06A",
+            ["1+", "2+", "3+", "4+", "5+", "22+", "6+", "7+", "8+", "9+", "10+", "11+"],
+        )
+    for k in range(1, 4):
+        b.add_path(
+            f"SupAlt{k}#1#Chr06A",
+            ["1+", "2+", "3+", "4+", "5+", "23+", "26+", "25+", "6+", "7+", "8+", "9+", "10+", "11+"],
+        )
+
+    # H1: Poisson ectopic TE + 70 bp tip at 3..4 (must drop 100%) + novel_gene_1000 at 4..5
+    b.add_path(
+        "H1#1#Chr06A",
+        ["1+", "2+", "3+", "20+", "4+", "27+", "5+", "6+", "7+", "8+", "9+", "10+", "11+"],
+    )
+    # H2 & H3: seamless synthetic `[23(1200) + 24(25) + 25(1200)]` + `26(90)` duplicate at 6..7 (must drop 100%!)
+    b.add_path(
+        "H2#1#Chr06A",
+        ["1+", "2+", "3+", "4+", "5+", "6+", "23+", "24+", "25+", "7+", "8+", "9+", "10+", "11+"],
+    )
+    b.add_path(
+        "H3#1#Chr06A",
+        ["1+", "2+", "3+", "4+", "5+", "6+", "23+", "26+", "25+", "7+", "8+", "9+", "10+", "11+"],
+    )
+    # H4: ectopic TE with genuine 60 bp protected_ins at 7..8 + standalone 65 bp insertion at 8..9
+    b.add_path(
+        "H4#1#Chr06A",
+        ["1+", "2+", "3+", "4+", "5+", "6+", "7+", "21+", "8+", "28+", "9+", "10+", "11+"],
+    )
+
+    inp = b.write("chr06_fix_e2e")
+    assert inp.gff_path is not None and inp.bed_path is not None
+    env = {"PANFLAT_FORCE_FORK": "1", "PYTHONWARNINGS": "default"}
+    cli_args = [
+        "--centromere-mode",
+        "bypass",
+        "--dedup-mode",
+        "pan",
+        "--dedup-id",
+        "0.90",
+        "--qc",
+    ]
+
+    out_t1 = tmp_path / "chr06_t1"
+    out_t4 = tmp_path / "chr06_t4"
+    proc_t1, bun_t1 = run_build(
+        inp,
+        extra_args=[*cli_args, "--threads", "1"],
+        out_prefix=out_t1,
+        extra_env=env,
+    )
+    proc_t4, bun_t4 = run_build(
+        inp,
+        extra_args=[*cli_args, "--threads", "4"],
+        out_prefix=out_t4,
+        extra_env=env,
+    )
+    assert proc_t1.returncode == 0 and bun_t1 is not None
+    assert proc_t4.returncode == 0 and bun_t4 is not None
+
+    _assert_12_files_sha256_identical_and_clean_streams(out_t1, out_t4, proc_t1, proc_t4)
+    run_verify(
+        out_t1,
+        inp.gfa_path,
+        inp.ref_fa_path,
+        extra_args=["--centromere-bed", inp.bed_path, "--ref-gff", inp.gff_path],
+        check=True,
+    )
+    assert_all_global_invariants(bun_t1, inp.gfa_path, inp.ref_fa_path)
+    assert_gff3_liftover_integrity(
+        inp.ref_fa_path, inp.gff_path, bun_t1.pan_fa_path, bun_t1.lifted_gff_path
+    )
+
+    # 1. Both redundant groups (3..4 ectopic Poisson TE and 6..7 multi-piece synthetic dup) dropped 100%!
+    ins_anchors = {str(r["anchors"]) for r in bun_t1.sv_rows if r["type"] == "INS"}
+    assert "2..3" not in ins_anchors  # node 3..4 = rank 2..3
+    assert "5..6" not in ins_anchors  # node 6..7 = rank 5..6
+    assert int(bun_t1.summary_kv["dedup_dropped_groups"]) == 2
+
+    # 2. Zero <50 bp pieces and zero <50 bp non-N islands anywhere in pan.fa!
+    assert all(int(r["pan_end"]) - int(r["pan_start"]) >= 50 for r in bun_t1.inserts)
+    non_n_islands = [seg for seg in bun_t1.pan_seq.upper().split("N") if seg]
+    assert all(len(seg) >= 50 for seg in non_n_islands)
+
+    # 3. 100% recall of novel_gene_1000, prot_60, standalone_65, and pan_full
+    pan_up = bun_t1.pan_seq.upper()
+    assert novel_gene_1000 in pan_up
+    assert prot_60 in pan_up
+    assert standalone_65 in pan_up
+    assert pan_full in pan_up
+
+    # 4. --qc >=90% redundancy strictly < 1%
+    assert float(bun_t1.summary_kv["qc_redundancy_0.90_pct"]) < 1.0
+

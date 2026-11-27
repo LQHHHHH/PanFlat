@@ -980,6 +980,32 @@ def _extract_contiguous_nonref_runs_for_unresolved(
 # ============================================================================
 
 
+_DEDUP_MIN_SPLIT_ISLAND_BP: int = 150
+
+
+def _is_kept_split_residual(
+    u_s: int,
+    u_e: int,
+    min_sv_len: int,
+    prot_ivs: Sequence[tuple[int, int]],
+) -> bool:
+    """
+    Return True iff an unmasked residual `[u_s, u_e)` left over after homologous
+    subtraction should be mounted:
+    - Residuals `< min_sv_len` are always discarded.
+    - Residuals `>= 150 bp` (one short-read length) are always kept.
+    - Residuals in `[min_sv_len, 150)` bp are kept iff they overlap an explicit
+      `protected_ins` (`I >= min_sv_len` within a flanking homologous alignment);
+      detached boundary/soft-clip shards `< 150 bp` are counted in `short_residual_bp`.
+    """
+    r_len = u_e - u_s
+    if r_len < min_sv_len:
+        return False
+    if r_len >= _DEDUP_MIN_SPLIT_ISLAND_BP:
+        return True
+    return any(max(u_s, ps) < min(u_e, pe) for ps, pe in prot_ivs)
+
+
 def screen_and_fold_candidate(
     raw_cand: CandidateBlock,
     graph: GFAGraph,
@@ -1108,6 +1134,7 @@ def screen_and_fold_candidate(
                     best_n=50,
                 )
 
+        prot_ins_ivs: list[tuple[int, int]] = []
         ref_masked_ivs, ref_unmasked_ivs, b_ref_bp = subtract_reference_intervals_mappy(
             query_seq=raw_cand.seq,
             ref_region_seq="",
@@ -1117,6 +1144,8 @@ def screen_and_fold_candidate(
             min_identity=config.dedup_id,
             short_aligner=ref_dedup_short_aligner,
             short_buf=ref_dedup_short_buf,
+            smooth_homolog_blocks=True,
+            protected_ins_out=prot_ins_ivs,
         )
 
         if ref_masked_ivs:
@@ -1124,7 +1153,10 @@ def screen_and_fold_candidate(
                 dedup_stats_out.had_subtracted_homolog = True
                 dedup_stats_out.ref_masked_bp += b_ref_bp
 
-            if not any(u_e - u_s >= config.min_sv_len for u_s, u_e in ref_unmasked_ivs):
+            if not any(
+                _is_kept_split_residual(u_s, u_e, config.min_sv_len, prot_ins_ivs)
+                for u_s, u_e in ref_unmasked_ivs
+            ):
                 if dedup_stats_out is not None:
                     dedup_stats_out.short_residual_bp += sum(
                         u_e - u_s for u_s, u_e in ref_unmasked_ivs
@@ -1162,12 +1194,14 @@ def screen_and_fold_candidate(
                 keep_intervals=ref_unmasked_ivs,
                 mask_intervals=(),
             )
-            for r_idx, (r_start, _, r_steps, r_prov, r_seq) in enumerate(
+            for r_idx, (r_start, r_end, r_steps, r_prov, r_seq) in enumerate(
                 ref_kept_slices, start=1
             ):
                 r_len = len(r_seq)
                 r_id = f"{raw_cand.candidate_id}_r{r_idx}"
-                if r_len < config.min_sv_len:
+                if not _is_kept_split_residual(
+                    r_start, r_end, config.min_sv_len, prot_ins_ivs
+                ):
                     if dedup_stats_out is not None:
                         dedup_stats_out.short_residual_bp += r_len
                     r_contig = merge_contiguous_provenance(r_prov, r_seq)[0][0]
@@ -1764,11 +1798,18 @@ def _solve_multi_member_component(
         occ.partial_content for d in comp for occ in d.occurrences
     )
 
+    sec_anchor_map = build_backbone_anchor_map(b_steps, lo=0, hi=n_b)
     next_child_order = 0
     for m_idx, d in enumerate(m_child):
         d_ex = d.exemplar
         anchors = project_steps_onto_backbone(
-            d.steps, d_ex.provenance, b_steps, graph.nodes, lo=0, hi=n_b
+            d.steps,
+            d_ex.provenance,
+            b_steps,
+            graph.nodes,
+            lo=0,
+            hi=n_b,
+            precomputed_anchor_map=sec_anchor_map,
         )
         main_chain, d_mh = compute_weighted_lis(anchors)
         m_rep_res = False
@@ -4668,7 +4709,7 @@ class _TailSeedGate:
     def __init__(self) -> None:
         self._bloom: np.ndarray | None = None
         self._idx_19: int = 0
-        self._tail_13: dict[str, int] = {}
+        self._tail_13: dict[str, int | tuple[int, ...]] = {}
         self._idx_13: int = 0
         self._off_13: int = 0
         self._last_19_seq: str | None = None
@@ -4736,7 +4777,18 @@ class _TailSeedGate:
                     km = s[i : i + k]
                     if has_n and "N" in km:
                         continue
-                    t13[km] = -1 if km in t13 else (off + i)
+                    pos = off + i
+                    prev = t13.get(km)
+                    if prev is None:
+                        t13[km] = pos
+                    elif prev == -1:
+                        continue
+                    elif isinstance(prev, int):
+                        t13[km] = (prev, pos)
+                    elif len(prev) < 8:
+                        t13[km] = (*prev, pos)
+                    else:
+                        t13[km] = -1
             self._off_13 = off + len(s)
 
     def has_seed_hit(self, sub_seq: str, tail_pieces: Sequence[str]) -> bool:
@@ -4785,17 +4837,26 @@ class _TailSeedGate:
         k = _PAN_DEDUP_SEED_K
         end = sub_len - k + 1
         for qs in (sub_seq, revcomp(sub_seq)):
-            hits: list[tuple[int, int]] = []
+            hits: list[tuple[int, int | tuple[int, ...]]] = []
             for i in range(end):
                 r = t13_get(qs[i : i + k])
                 if r is not None:
                     for pi, pr in hits:
-                        if i - pi >= 7 and (
-                            r == -1
-                            or pr == -1
-                            or (r > pr and abs((r - pr) - (i - pi)) <= 600)
-                        ):
+                        if i - pi < 7:
+                            continue
+                        if r == -1 or pr == -1:
                             return True
+                        dq = i - pi
+                        if isinstance(r, int) and isinstance(pr, int):
+                            if r > pr and abs((r - pr) - dq) <= 600:
+                                return True
+                        else:
+                            r_iter = (r,) if isinstance(r, int) else r
+                            pr_iter = (pr,) if isinstance(pr, int) else pr
+                            for rv in r_iter:
+                                for prv in pr_iter:
+                                    if rv > prv and abs((rv - prv) - dq) <= 600:
+                                        return True
                     hits.append((i, r))
         return False
 
@@ -4832,14 +4893,49 @@ class _WaveIndex:
             return saln
 
 
+_RepPieceChain = tuple[tuple[int, ...], tuple[tuple[int, int], ...], str]
+
+
+def _group_rep_pieces_into_chains(
+    pieces: Sequence[Piece],
+) -> tuple[_RepPieceChain, ...]:
+    """
+    Partition `pieces` into maximal `'N'`-free contiguous chains (breaking only where
+    `orig_idx > 0 and p.join_before == 'spacer'`). Each chain is
+    `(orig_piece_indices, piece_bounds_in_chain, chain_seq_upper)`.
+    """
+    if not pieces:
+        return ()
+    chains: list[_RepPieceChain] = []
+    cur_idxs: list[int] = []
+    cur_bounds: list[tuple[int, int]] = []
+    cur_seqs: list[str] = []
+    cur_off = 0
+    for idx_p, p in enumerate(pieces):
+        if idx_p > 0 and p.join_before == "spacer" and cur_idxs:
+            chains.append((tuple(cur_idxs), tuple(cur_bounds), "".join(cur_seqs)))
+            cur_idxs = []
+            cur_bounds = []
+            cur_seqs = []
+            cur_off = 0
+        s_up = p.seq.upper()
+        cur_idxs.append(idx_p)
+        cur_bounds.append((cur_off, cur_off + len(s_up)))
+        cur_seqs.append(s_up)
+        cur_off += len(s_up)
+    if cur_idxs:
+        chains.append((tuple(cur_idxs), tuple(cur_bounds), "".join(cur_seqs)))
+    return tuple(chains)
+
+
 @dataclass(slots=True)
 class _PendingRepState:
-    """Per-representative surviving interval state tracked across Stage 5.5 batches."""
+    """Per-representative surviving `'N'`-free chain interval state tracked across Stage 5.5 batches."""
 
     pair: tuple[int, int]
     rep: ClusterRepresentative
-    piece_seqs_up: tuple[str, ...]
-    piece_ivs: list[list[tuple[int, int]]]
+    chains: tuple[_RepPieceChain, ...]
+    chain_ivs: list[list[tuple[int, int]]]
     screened_sealed_waves: int = 0
 
 
@@ -4908,22 +5004,23 @@ def _subtract_intervals_against_wave(
     collect_short_slices: list[tuple[int, int]] | None = None,
 ) -> tuple[list[tuple[int, int]], int, int]:
     """
-    Subtract homologous 50 bp blocks from `cur_ivs` (coordinates on `seq_up`) against
-    a single `_WaveIndex`. Untouched intervals (including `< min_sv_len` pieces) remain
-    intact; masked intervals keep residuals `>= min_sv_len` and count `< min_sv_len`
-    residuals in `short_res_bp`.
+    Subtract homologous blocks from `'N'`-free chain intervals `cur_ivs` (coordinates on `seq_up`)
+    against a single `_WaveIndex`. Untouched `>= min_sv_len` intervals remain intact; split
+    intervals retain `protected_ins` (`>= min_sv_len`) and `>= 150 bp` novel islands while
+    counting `< min_sv_len` or `< 150 bp` boundary shards in `short_res_bp`.
     """
     next_ivs: list[tuple[int, int]] = []
     masked_bp = 0
     short_res_bp = 0
     for iv_s, iv_e in cur_ivs:
         if iv_e - iv_s < min_sv_len:
-            next_ivs.append((iv_s, iv_e))
+            short_res_bp += iv_e - iv_s
             continue
         sub_seq = seq_up[iv_s:iv_e]
         sub_short_slices: list[tuple[int, int]] | None = (
             [] if (collect_short_slices is not None and (iv_e - iv_s) > 500) else None
         )
+        prot_sub: list[tuple[int, int]] = []
         masked_sub, unmasked_sub, b_masked = subtract_reference_intervals_mappy(
             query_seq=sub_seq,
             ref_region_seq="",
@@ -4936,6 +5033,8 @@ def _subtract_intervals_against_wave(
             t_starts=wave.t_starts,
             t_ends=wave.t_ends,
             collect_short_slices=sub_short_slices,
+            smooth_homolog_blocks=True,
+            protected_ins_out=prot_sub,
         )
         if sub_short_slices:
             assert collect_short_slices is not None
@@ -4944,13 +5043,313 @@ def _subtract_intervals_against_wave(
         if masked_sub:
             masked_bp += b_masked
             for u_s, u_e in unmasked_sub:
-                if u_e - u_s >= min_sv_len:
+                if _is_kept_split_residual(u_s, u_e, min_sv_len, prot_sub):
                     next_ivs.append((iv_s + u_s, iv_s + u_e))
                 else:
                     short_res_bp += u_e - u_s
         else:
             next_ivs.append((iv_s, iv_e))
     return next_ivs, masked_bp, short_res_bp
+
+
+def _compact_rep_results_in_solutions(
+    sorted_group_pairs: Sequence[tuple[int, int]],
+    group_guard_by_pair: Mapping[tuple[int, int], GroupRepeatGuardResult],
+    group_solutions: Mapping[tuple[int, int], ParallelGroupSolution],
+    rep_results: Mapping[
+        tuple[tuple[int, int], int],
+        tuple[list[Piece], list[frozenset[str]], bool, bool, set[str] | None],
+    ],
+    clear_token_str: bool = True,
+) -> int:
+    """Compact surviving reps densely (`1..K'`), remap `cand_to_rep_idx`/`cand_to_flags`/`cand_to_reconstructed_len`, and return count of dropped groups."""
+    dropped_groups = 0
+    for pair in sorted_group_pairs:
+        sol = group_solutions.get(pair)
+        if sol is None or not sol.non_backbone_reps:
+            continue
+        if clear_token_str and (pair, sol.non_backbone_reps[0].rep_idx) not in rep_results:
+            for rep in sol.non_backbone_reps:
+                rep.token_str = ""
+            continue
+        if (pair, sol.non_backbone_reps[0].rep_idx) not in rep_results:
+            continue
+        guard_res = group_guard_by_pair[pair]
+        kept_reps: list[ClusterRepresentative] = []
+        old_to_new_rep_idx: dict[int, int] = {}
+        trimmed_old_rep_mod_cands: dict[int, set[str] | None] = {}
+        for rep in sol.non_backbone_reps:
+            old_r = rep.rep_idx
+            if clear_token_str:
+                rep.token_str = ""
+            (
+                new_pieces,
+                new_piece_cand_ids,
+                pieces_changed,
+                seq_trimmed,
+                mod_cands,
+            ) = rep_results[(pair, old_r)]
+            if not new_pieces:
+                old_to_new_rep_idx[old_r] = -1
+            else:
+                new_r = len(kept_reps) + 1
+                old_to_new_rep_idx[old_r] = new_r
+                rep.rep_idx = new_r
+                if pieces_changed:
+                    rep.pieces = tuple(new_pieces)
+                    rep.piece_cand_ids = tuple(new_piece_cand_ids)
+                    rep.length_bp_no_n = sum(len(p.seq) for p in new_pieces)
+                if seq_trimmed:
+                    trimmed_old_rep_mod_cands[old_r] = mod_cands
+                    rep.partial_content = True
+                kept_reps.append(rep)
+
+        if not kept_reps:
+            sol.non_backbone_reps = ()
+            dropped_groups += 1
+            dropped_cids = {
+                cid for cid, r_idx in sol.cand_to_rep_idx.items() if r_idx > 0
+            }
+            for j_entry in guard_res.json_log_entries:
+                if (
+                    j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
+                    and (
+                        not dropped_cids
+                        or j_entry.get("candidate_id") in dropped_cids
+                    )
+                ):
+                    j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
+            sol.cand_to_rep_idx = {}
+            sol.cand_to_nested_sig = {}
+            sol.cand_to_reconstructed_len = {}
+            sol.cand_to_flags = {}
+            sol.rep0_cand_spans = {}
+        else:
+            had_orig_cands = {
+                old_r for old_r in sol.cand_to_rep_idx.values() if old_r > 0
+            }
+            new_cand_to_rep_idx: dict[str, int] = {}
+            dropped_cids = set()
+            for cid, old_r in sol.cand_to_rep_idx.items():
+                if old_r <= 0:
+                    new_cand_to_rep_idx[cid] = old_r
+                    continue
+                new_r = old_to_new_rep_idx[old_r]
+                if new_r == -1:
+                    new_cand_to_rep_idx[cid] = -1
+                    dropped_cids.add(cid)
+                    prev_f = sol.cand_to_flags.get(cid, (False, False, False))
+                    sol.cand_to_flags[cid] = (True, prev_f[1], prev_f[2])
+                    sol.cand_to_nested_sig.pop(cid, None)
+                    sol.cand_to_reconstructed_len.pop(cid, None)
+                elif old_r in trimmed_old_rep_mod_cands:
+                    mod_cands = trimmed_old_rep_mod_cands[old_r]
+                    kept_rep = kept_reps[new_r - 1]
+                    if kept_rep.is_synthetic or (
+                        kept_rep.piece_cand_ids
+                        and len(kept_rep.piece_cand_ids) == len(kept_rep.pieces)
+                    ):
+                        cand_len = sum(
+                            len(p.seq)
+                            for p_i, p in enumerate(kept_rep.pieces)
+                            if (
+                                p_i >= len(kept_rep.piece_cand_ids)
+                                or not kept_rep.piece_cand_ids[p_i]
+                                or cid in kept_rep.piece_cand_ids[p_i]
+                            )
+                        )
+                        if cand_len == 0:
+                            new_cand_to_rep_idx[cid] = -1
+                            dropped_cids.add(cid)
+                            prev_f = sol.cand_to_flags.get(
+                                cid, (False, False, False)
+                            )
+                            sol.cand_to_flags[cid] = (
+                                True,
+                                prev_f[1],
+                                prev_f[2],
+                            )
+                            sol.cand_to_nested_sig.pop(cid, None)
+                            sol.cand_to_reconstructed_len.pop(cid, None)
+                        else:
+                            new_cand_to_rep_idx[cid] = new_r
+                            if mod_cands is None or cid in mod_cands:
+                                prev_f = sol.cand_to_flags.get(
+                                    cid, (False, False, False)
+                                )
+                                sol.cand_to_flags[cid] = (
+                                    True,
+                                    prev_f[1],
+                                    prev_f[2],
+                                )
+                                sol.cand_to_reconstructed_len[cid] = cand_len
+                    else:
+                        new_cand_to_rep_idx[cid] = new_r
+                        if mod_cands is None or cid in mod_cands:
+                            prev_f = sol.cand_to_flags.get(
+                                cid, (False, False, False)
+                            )
+                            sol.cand_to_flags[cid] = (
+                                True,
+                                prev_f[1],
+                                prev_f[2],
+                            )
+                            sol.cand_to_reconstructed_len[cid] = (
+                                kept_rep.length_bp_no_n
+                            )
+                else:
+                    new_cand_to_rep_idx[cid] = new_r
+
+            surviving_new_rs = {
+                r for r in new_cand_to_rep_idx.values() if r > 0
+            }
+            new_to_old_rep_idx = {
+                nr: or_ for or_, nr in old_to_new_rep_idx.items() if nr > 0
+            }
+            if any(
+                (nr not in surviving_new_rs)
+                and (new_to_old_rep_idx.get(nr) in had_orig_cands)
+                for nr in range(1, len(kept_reps) + 1)
+            ):
+                final_reps: list[ClusterRepresentative] = []
+                remap_nr: dict[int, int] = {}
+                for old_nr, rep in enumerate(kept_reps, start=1):
+                    if (old_nr not in surviving_new_rs) and (
+                        new_to_old_rep_idx.get(old_nr) in had_orig_cands
+                    ):
+                        continue
+                    final_nr = len(final_reps) + 1
+                    remap_nr[old_nr] = final_nr
+                    rep.rep_idx = final_nr
+                    final_reps.append(rep)
+                kept_reps = final_reps
+                new_cand_to_rep_idx = {
+                    cid: (remap_nr[r] if r > 0 else r)
+                    for cid, r in new_cand_to_rep_idx.items()
+                }
+
+            if not kept_reps:
+                sol.non_backbone_reps = ()
+                dropped_groups += 1
+                for j_entry in guard_res.json_log_entries:
+                    if (
+                        j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
+                        and (
+                            not dropped_cids
+                            or j_entry.get("candidate_id") in dropped_cids
+                        )
+                    ):
+                        j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
+                sol.cand_to_rep_idx = {}
+                sol.cand_to_nested_sig = {}
+                sol.cand_to_reconstructed_len = {}
+                sol.cand_to_flags = {}
+                sol.rep0_cand_spans = {}
+            else:
+                sol.non_backbone_reps = tuple(kept_reps)
+                sol.cand_to_rep_idx = new_cand_to_rep_idx
+                if dropped_cids:
+                    for j_entry in guard_res.json_log_entries:
+                        if (
+                            j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
+                            and j_entry.get("candidate_id") in dropped_cids
+                        ):
+                            j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
+    return dropped_groups
+
+
+def _prune_short_spacer_chains_ref_mode(
+    sorted_group_pairs: Sequence[tuple[int, int]],
+    group_guard_by_pair: Mapping[tuple[int, int], GroupRepeatGuardResult],
+    group_solutions: Mapping[tuple[int, int], ParallelGroupSolution],
+    min_sv_len: int,
+) -> tuple[int, int]:
+    """Under `--dedup-mode ref`, drop any isolated `'N'`-bounded piece chain with total length `< min_sv_len`."""
+    rep_results: dict[
+        tuple[tuple[int, int], int],
+        tuple[list[Piece], list[frozenset[str]], bool, bool, set[str] | None],
+    ] = {}
+    short_bp = 0
+    for pair in sorted_group_pairs:
+        sol = group_solutions.get(pair)
+        if sol is None or not sol.non_backbone_reps:
+            continue
+        chains_per_rep = [
+            _group_rep_pieces_into_chains(rep.pieces) for rep in sol.non_backbone_reps
+        ]
+        if not any(
+            0 < len(c_seq) < min_sv_len
+            for chs in chains_per_rep
+            for _, _, c_seq in chs
+        ):
+            continue
+        for rep, chains in zip(sol.non_backbone_reps, chains_per_rep):
+            orig_pieces = rep.pieces
+            orig_pc_list = rep.piece_cand_ids
+            new_pieces: list[Piece] = []
+            new_piece_cand_ids: list[frozenset[str]] = []
+            pieces_changed = False
+            seq_trimmed = False
+            mod_cands: set[str] | None = set()
+            for orig_indices, _, c_seq in chains:
+                if len(c_seq) < min_sv_len:
+                    short_bp += len(c_seq)
+                    pieces_changed = True
+                    seq_trimmed = True
+                    for orig_p_idx in orig_indices:
+                        orig_pc = (
+                            orig_pc_list[orig_p_idx]
+                            if orig_p_idx < len(orig_pc_list)
+                            else frozenset()
+                        )
+                        if not orig_pc:
+                            mod_cands = None
+                        elif mod_cands is not None:
+                            mod_cands.update(orig_pc)
+                    continue
+                for sub_pos, orig_p_idx in enumerate(orig_indices):
+                    p = orig_pieces[orig_p_idx]
+                    orig_pc = (
+                        orig_pc_list[orig_p_idx]
+                        if orig_p_idx < len(orig_pc_list)
+                        else frozenset()
+                    )
+                    if sub_pos == 0:
+                        if not new_pieces:
+                            jb: Literal[
+                                "source_contiguous", "spacer", "synthetic"
+                            ] = (
+                                p.join_before
+                                if (orig_p_idx == 0 and p.join_before != "spacer")
+                                else "synthetic"
+                            )
+                        else:
+                            jb = "spacer"
+                    else:
+                        jb = p.join_before
+                    if jb == p.join_before:
+                        new_pieces.append(p)
+                    else:
+                        new_pieces.append(replace(p, join_before=jb))
+                        pieces_changed = True
+                    new_piece_cand_ids.append(orig_pc)
+            rep_results[(pair, rep.rep_idx)] = (
+                new_pieces,
+                new_piece_cand_ids,
+                pieces_changed,
+                seq_trimmed,
+                mod_cands,
+            )
+    if not rep_results:
+        return 0, 0
+    dropped = _compact_rep_results_in_solutions(
+        sorted_group_pairs=sorted_group_pairs,
+        group_guard_by_pair=group_guard_by_pair,
+        group_solutions=group_solutions,
+        rep_results=rep_results,
+        clear_token_str=False,
+    )
+    return short_bp, dropped
 
 
 def _deduplicate_representatives_across_chromosome(
@@ -4965,7 +5364,8 @@ def _deduplicate_representatives_across_chromosome(
     DEDUP_PLAN Modules C & D (Stage 5.5, `--dedup-mode pan`):
     Execute deterministic global-priority cross-group/cross-representative homologous
     subtraction strictly AFTER all `fork` pools have exited (`MULTICORE_PLAN.md` §2.3),
-    then compact/reindex surviving reps and update per-allele flags & lengths.
+    evaluating maximal `'N'`-free contiguous piece chains as unified sequences and
+    eliminating `< min_sv_len` orphan islands, then compact/reindex surviving reps.
 
     Returns `(pan_masked_bp, pan_short_residual_bp, module_c_dropped_groups)`.
     """
@@ -4973,17 +5373,14 @@ def _deduplicate_representatives_across_chromosome(
     dedup_id = config.dedup_id
     has_tbuf = hasattr(mappy, "ThreadBuffer")
 
-    # Step 1: Priority-0 seeding from CEN_ISLAND pieces
+    # Step 1: Priority-0 seeding from CEN_ISLAND `'N'`-free chains
     accepted_exact_seqs: set[str] = set()
     sealed_waves: list[_WaveIndex] = []
     cen_chunk: list[str] = []
     cen_chunk_bp = 0
     for c_blk in cen_out.island_slot_blocks:
         for rep_pieces in c_blk.representatives:
-            for p in rep_pieces:
-                s_up = p.seq.upper()
-                if not s_up:
-                    continue
+            for _, _, s_up in _group_rep_pieces_into_chains(rep_pieces):
                 if len(s_up) >= min_sv_len:
                     accepted_exact_seqs.add(s_up)
                     accepted_exact_seqs.add(revcomp(s_up))
@@ -5064,7 +5461,9 @@ def _deduplicate_representatives_across_chromosome(
         if ivs and accepted_exact_seqs:
             kept_ex: list[tuple[int, int]] = []
             for iv_s, iv_e in ivs:
-                if seq_up[iv_s:iv_e] in accepted_exact_seqs:
+                if iv_e - iv_s < min_sv_len:
+                    pan_short_residual_bp += iv_e - iv_s
+                elif seq_up[iv_s:iv_e] in accepted_exact_seqs:
                     pan_masked_bp += iv_e - iv_s
                 else:
                     kept_ex.append((iv_s, iv_e))
@@ -5199,25 +5598,33 @@ def _deduplicate_representatives_across_chromosome(
         if carryover:
             for c_item in carryover:
                 batch.append(c_item)
-                batch_bp += sum(e - s for ivs in c_item.piece_ivs for s, e in ivs)
+                batch_bp += sum(e - s for ivs in c_item.chain_ivs for s, e in ivs)
             carryover = []
         while queue_pos < n_entries and (
             not batch or batch_bp < _PAN_DEDUP_QUERY_BATCH_BP
         ):
             _, pair, rep = entries[queue_pos]
             queue_pos += 1
-            p_seqs_up = tuple(p.seq.upper() for p in rep.pieces)
-            p_ivs = [[(0, len(s))] if s else [] for s in p_seqs_up]
+            rep_chains = _group_rep_pieces_into_chains(rep.pieces)
+            c_ivs: list[list[tuple[int, int]]] = []
+            for _, _, c_seq_up in rep_chains:
+                c_len = len(c_seq_up)
+                if c_len >= min_sv_len:
+                    c_ivs.append([(0, c_len)])
+                    batch_bp += c_len
+                else:
+                    c_ivs.append([])
+                    if c_len > 0:
+                        pan_short_residual_bp += c_len
             batch.append(
                 _PendingRepState(
                     pair=pair,
                     rep=rep,
-                    piece_seqs_up=p_seqs_up,
-                    piece_ivs=p_ivs,
+                    chains=rep_chains,
+                    chain_ivs=c_ivs,
                     screened_sealed_waves=0,
                 )
             )
-            batch_bp += sum(len(s) for s in p_seqs_up)
 
         n_sealed = len(sealed_waves)
         n_sub = len(active_subwaves)
@@ -5229,23 +5636,25 @@ def _deduplicate_representatives_across_chromosome(
         for batch_i, item in enumerate(batch):
             start_sealed = item.screened_sealed_waves
             has_waves = (start_sealed < n_sealed) or (n_sub > 0)
-            for orig_p_idx, seq_up in enumerate(item.piece_seqs_up):
-                cur_ivs = item.piece_ivs[orig_p_idx]
-                if not cur_ivs or len(seq_up) < min_sv_len:
+            for c_idx, (_, _, c_seq_up) in enumerate(item.chains):
+                cur_ivs = item.chain_ivs[c_idx]
+                if not cur_ivs:
                     continue
                 if accepted_exact_seqs:
                     kept_ex: list[tuple[int, int]] = []
                     for iv_s, iv_e in cur_ivs:
-                        if seq_up[iv_s:iv_e] in accepted_exact_seqs:
+                        if iv_e - iv_s < min_sv_len:
+                            pan_short_residual_bp += iv_e - iv_s
+                        elif c_seq_up[iv_s:iv_e] in accepted_exact_seqs:
                             pan_masked_bp += iv_e - iv_s
                         else:
                             kept_ex.append((iv_s, iv_e))
                     cur_ivs = kept_ex
-                    item.piece_ivs[orig_p_idx] = cur_ivs
+                    item.chain_ivs[c_idx] = cur_ivs
                 if cur_ivs and has_waves:
                     q_bp = sum(e - s for s, e in cur_ivs)
                     work_items.append(
-                        (batch_i, orig_p_idx, seq_up, cur_ivs, start_sealed, q_bp)
+                        (batch_i, c_idx, c_seq_up, cur_ivs, start_sealed, q_bp)
                     )
 
         n_work = len(work_items)
@@ -5261,6 +5670,7 @@ def _deduplicate_representatives_across_chromosome(
             ) -> tuple[list[tuple[int, int]], int, int]:
                 _, _, w_seq_up, w_ivs, w_start_sealed, _ = work_items[w_idx]
                 ivs = list(w_ivs)
+                had_gt500 = any(e - s > 500 for s, e in ivs)
                 m_bp = 0
                 sr_bp = 0
                 for sw_i in range(w_start_sealed, n_sealed):
@@ -5291,6 +5701,40 @@ def _deduplicate_representatives_across_chromosome(
                     )
                     m_bp += dm
                     sr_bp += dsr
+                if (
+                    ivs
+                    and had_gt500
+                    and ivs != w_ivs
+                    and any(e - s <= 500 for s, e in ivs)
+                ):
+                    for sw_i in range(w_start_sealed, n_sealed):
+                        if not ivs:
+                            break
+                        ivs, dm, dsr = _subtract_intervals_against_wave(
+                            w_seq_up,
+                            ivs,
+                            sealed_waves[sw_i],
+                            min_sv_len,
+                            dedup_id,
+                            buf_m,
+                            buf_s,
+                        )
+                        m_bp += dm
+                        sr_bp += dsr
+                    for sub_i in range(n_sub):
+                        if not ivs:
+                            break
+                        ivs, dm, dsr = _subtract_intervals_against_wave(
+                            w_seq_up,
+                            ivs,
+                            active_subwaves[sub_i],
+                            min_sv_len,
+                            dedup_id,
+                            buf_m,
+                            buf_s,
+                        )
+                        m_bp += dm
+                        sr_bp += dsr
                 return ivs, m_bp, sr_bp
 
             workers = min(max(1, config.threads), n_work) if has_tbuf else 1
@@ -5335,9 +5779,9 @@ def _deduplicate_representatives_across_chromosome(
                     for fut in futs:
                         fut.result()
 
-            for w_idx, (batch_i, orig_p_idx, _, _, _, _) in enumerate(work_items):
+            for w_idx, (batch_i, c_idx, _, _, _, _) in enumerate(work_items):
                 ivs_res, m_bp, sr_bp = slot_out[w_idx]
-                batch[batch_i].piece_ivs[orig_p_idx] = ivs_res
+                batch[batch_i].chain_ivs[c_idx] = ivs_res
                 pan_masked_bp += m_bp
                 pan_short_residual_bp += sr_bp
 
@@ -5348,27 +5792,48 @@ def _deduplicate_representatives_across_chromosome(
             pieces_changed = False
             seq_trimmed = False
             modified_piece_cands: set[str] | None = set()
-            gap_since_last_kept = False
 
             orig_pieces = item.rep.pieces
             orig_pc_list = item.rep.piece_cand_ids
-            for orig_p_idx, p in enumerate(orig_pieces):
-                seq_up = item.piece_seqs_up[orig_p_idx]
-                orig_pc = (
-                    orig_pc_list[orig_p_idx]
-                    if orig_p_idx < len(orig_pc_list)
-                    else frozenset()
-                )
-                if len(seq_up) < min_sv_len:
-                    surv_ivs = item.piece_ivs[orig_p_idx]
-                else:
-                    surv_ivs = _screen_ivs_against_active(
-                        seq_up, item.piece_ivs[orig_p_idx], n_sub
-                    )
+            emitted_for_orig: list[list[tuple[int, int]]] = [
+                [] for _ in orig_pieces
+            ]
 
-                emitted_sub_for_piece = 0
-                last_end_for_piece = -1
-                sub_idx_before_p = len(active_subwaves)
+            for c_idx, (orig_indices, piece_bounds, c_seq_up) in enumerate(
+                item.chains
+            ):
+                cur_ivs = item.chain_ivs[c_idx]
+                if not cur_ivs:
+                    continue
+                orig_iv_set = set(cur_ivs)
+                surv_ivs = _screen_ivs_against_active(c_seq_up, cur_ivs, n_sub)
+                if surv_ivs and any(iv not in orig_iv_set for iv in surv_ivs):
+                    refined_ivs: list[tuple[int, int]] = []
+                    for s_iv in surv_ivs:
+                        if s_iv in orig_iv_set:
+                            refined_ivs.append(s_iv)
+                            continue
+                        r_ivs = [s_iv]
+                        if s_iv[1] - s_iv[0] <= 500:
+                            for sw_i in range(n_sealed):
+                                if not r_ivs:
+                                    break
+                                r_ivs, dm_r, dsr_r = _subtract_intervals_against_wave(
+                                    c_seq_up,
+                                    r_ivs,
+                                    sealed_waves[sw_i],
+                                    min_sv_len,
+                                    dedup_id,
+                                    seq_buf_main,
+                                    seq_buf_short,
+                                )
+                                pan_masked_bp += dm_r
+                                pan_short_residual_bp += dsr_r
+                        if r_ivs:
+                            r_ivs = _screen_ivs_against_active(c_seq_up, r_ivs, 0)
+                        refined_ivs.extend(r_ivs)
+                    surv_ivs = refined_ivs
+                sub_idx_before_c = len(active_subwaves)
                 iv_queue: collections.deque[tuple[tuple[int, int], bool]] = (
                     collections.deque(
                         (iv, i > 0) for i, iv in enumerate(surv_ivs)
@@ -5378,7 +5843,7 @@ def _deduplicate_representatives_across_chromosome(
                     raw_iv, need_rescreen = iv_queue.popleft()
                     if need_rescreen:
                         sub_final_ivs = _screen_ivs_against_active(
-                            seq_up, [raw_iv], sub_idx_before_p
+                            c_seq_up, [raw_iv], sub_idx_before_c
                         )
                         if not sub_final_ivs:
                             continue
@@ -5389,56 +5854,67 @@ def _deduplicate_representatives_across_chromosome(
                     else:
                         iv_s, iv_e = raw_iv
 
-                    is_full_orig = iv_s == 0 and iv_e == len(p.seq)
-                    if not new_pieces:
-                        if (
-                            orig_p_idx == 0
-                            and iv_s == 0
-                            and p.join_before != "spacer"
-                        ):
-                            jb: Literal[
-                                "source_contiguous", "spacer", "synthetic"
-                            ] = p.join_before
-                        else:
-                            jb = "synthetic"
-                    else:
-                        if (
-                            emitted_sub_for_piece > 0
-                            or gap_since_last_kept
-                            or iv_s > 0
-                        ):
-                            jb = "spacer"
+                    first_sub_in_iv = True
+                    for orig_p_idx, (c_s, c_e) in zip(
+                        orig_indices, piece_bounds
+                    ):
+                        ov_s = max(iv_s, c_s)
+                        ov_e = min(iv_e, c_e)
+                        if ov_s >= ov_e:
+                            continue
+                        loc_s = ov_s - c_s
+                        loc_e = ov_e - c_s
+                        p = orig_pieces[orig_p_idx]
+                        orig_pc = (
+                            orig_pc_list[orig_p_idx]
+                            if orig_p_idx < len(orig_pc_list)
+                            else frozenset()
+                        )
+                        if first_sub_in_iv:
+                            if not new_pieces:
+                                if (
+                                    orig_p_idx == 0
+                                    and loc_s == 0
+                                    and p.join_before != "spacer"
+                                ):
+                                    jb: Literal[
+                                        "source_contiguous",
+                                        "spacer",
+                                        "synthetic",
+                                    ] = p.join_before
+                                else:
+                                    jb = "synthetic"
+                            else:
+                                jb = "spacer"
+                            first_sub_in_iv = False
                         else:
                             jb = p.join_before
-                    if is_full_orig and jb == p.join_before:
-                        sp = p
-                    else:
-                        sp = _subslice_piece(p, iv_s, iv_e, jb)
-                        pieces_changed = True
-                    new_pieces.append(sp)
-                    new_piece_cand_ids.append(orig_pc)
-                    _accept_piece_seq(seq_up if is_full_orig else sp.seq.upper())
-                    emitted_sub_for_piece += 1
-                    last_end_for_piece = iv_e
 
-                piece_seq_modified = (
-                    emitted_sub_for_piece != 1
-                    or last_end_for_piece != len(p.seq)
-                    or len(new_pieces[-1].seq) != len(p.seq)
-                )
-                if piece_seq_modified:
+                        is_full_orig = loc_s == 0 and loc_e == len(p.seq)
+                        if is_full_orig and jb == p.join_before:
+                            sp = p
+                        else:
+                            sp = _subslice_piece(p, loc_s, loc_e, jb)
+                            pieces_changed = True
+                        new_pieces.append(sp)
+                        new_piece_cand_ids.append(orig_pc)
+                        emitted_for_orig[orig_p_idx].append((loc_s, loc_e))
+
+                    _accept_piece_seq(c_seq_up[iv_s:iv_e])
+
+            for orig_p_idx, p in enumerate(orig_pieces):
+                if emitted_for_orig[orig_p_idx] != [(0, len(p.seq))]:
                     pieces_changed = True
                     seq_trimmed = True
+                    orig_pc = (
+                        orig_pc_list[orig_p_idx]
+                        if orig_p_idx < len(orig_pc_list)
+                        else frozenset()
+                    )
                     if not orig_pc:
                         modified_piece_cands = None
                     elif modified_piece_cands is not None:
                         modified_piece_cands.update(orig_pc)
-
-                if emitted_sub_for_piece == 0:
-                    if new_pieces:
-                        gap_since_last_kept = True
-                else:
-                    gap_since_last_kept = last_end_for_piece < len(p.seq)
 
             rep_results[(item.pair, item.rep.rep_idx)] = (
                 new_pieces,
@@ -5468,192 +5944,13 @@ def _deduplicate_representatives_across_chromosome(
                 break
 
     # Step 4 (Module D): Compact surviving reps densely, remap cand_to_rep_idx / flags / lengths
-    module_c_dropped_groups = 0
-    for pair in sorted_group_pairs:
-        sol = group_solutions.get(pair)
-        if sol is None or not sol.non_backbone_reps:
-            continue
-        guard_res = group_guard_by_pair[pair]
-        kept_reps: list[ClusterRepresentative] = []
-        old_to_new_rep_idx: dict[int, int] = {}
-        trimmed_old_rep_mod_cands: dict[int, set[str] | None] = {}
-        for rep in sol.non_backbone_reps:
-            old_r = rep.rep_idx
-            rep.token_str = ""
-            (
-                new_pieces,
-                new_piece_cand_ids,
-                pieces_changed,
-                seq_trimmed,
-                mod_cands,
-            ) = rep_results[(pair, old_r)]
-            if not new_pieces:
-                old_to_new_rep_idx[old_r] = -1
-            else:
-                new_r = len(kept_reps) + 1
-                old_to_new_rep_idx[old_r] = new_r
-                rep.rep_idx = new_r
-                if pieces_changed:
-                    rep.pieces = tuple(new_pieces)
-                    rep.piece_cand_ids = tuple(new_piece_cand_ids)
-                    rep.length_bp_no_n = sum(len(p.seq) for p in new_pieces)
-                if seq_trimmed:
-                    trimmed_old_rep_mod_cands[old_r] = mod_cands
-                    rep.partial_content = True
-                kept_reps.append(rep)
-
-        if not kept_reps:
-            sol.non_backbone_reps = ()
-            module_c_dropped_groups += 1
-            dropped_cids = {
-                cid for cid, r_idx in sol.cand_to_rep_idx.items() if r_idx > 0
-            }
-            for j_entry in guard_res.json_log_entries:
-                if (
-                    j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
-                    and (
-                        not dropped_cids
-                        or j_entry.get("candidate_id") in dropped_cids
-                    )
-                ):
-                    j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
-            sol.cand_to_rep_idx = {}
-            sol.cand_to_nested_sig = {}
-            sol.cand_to_reconstructed_len = {}
-            sol.cand_to_flags = {}
-            sol.rep0_cand_spans = {}
-        else:
-            had_orig_cands = {
-                old_r for old_r in sol.cand_to_rep_idx.values() if old_r > 0
-            }
-            new_cand_to_rep_idx: dict[str, int] = {}
-            dropped_cids = set()
-            for cid, old_r in sol.cand_to_rep_idx.items():
-                if old_r <= 0:
-                    new_cand_to_rep_idx[cid] = old_r
-                    continue
-                new_r = old_to_new_rep_idx[old_r]
-                if new_r == -1:
-                    new_cand_to_rep_idx[cid] = -1
-                    dropped_cids.add(cid)
-                    prev_f = sol.cand_to_flags.get(cid, (False, False, False))
-                    sol.cand_to_flags[cid] = (True, prev_f[1], prev_f[2])
-                    sol.cand_to_nested_sig.pop(cid, None)
-                    sol.cand_to_reconstructed_len.pop(cid, None)
-                elif old_r in trimmed_old_rep_mod_cands:
-                    mod_cands = trimmed_old_rep_mod_cands[old_r]
-                    kept_rep = kept_reps[new_r - 1]
-                    if kept_rep.is_synthetic or (
-                        kept_rep.piece_cand_ids
-                        and len(kept_rep.piece_cand_ids) == len(kept_rep.pieces)
-                    ):
-                        cand_len = sum(
-                            len(p.seq)
-                            for p_i, p in enumerate(kept_rep.pieces)
-                            if (
-                                p_i >= len(kept_rep.piece_cand_ids)
-                                or not kept_rep.piece_cand_ids[p_i]
-                                or cid in kept_rep.piece_cand_ids[p_i]
-                            )
-                        )
-                        if cand_len == 0:
-                            new_cand_to_rep_idx[cid] = -1
-                            dropped_cids.add(cid)
-                            prev_f = sol.cand_to_flags.get(
-                                cid, (False, False, False)
-                            )
-                            sol.cand_to_flags[cid] = (
-                                True,
-                                prev_f[1],
-                                prev_f[2],
-                            )
-                            sol.cand_to_nested_sig.pop(cid, None)
-                            sol.cand_to_reconstructed_len.pop(cid, None)
-                        else:
-                            new_cand_to_rep_idx[cid] = new_r
-                            if mod_cands is None or cid in mod_cands:
-                                prev_f = sol.cand_to_flags.get(
-                                    cid, (False, False, False)
-                                )
-                                sol.cand_to_flags[cid] = (
-                                    True,
-                                    prev_f[1],
-                                    prev_f[2],
-                                )
-                                sol.cand_to_reconstructed_len[cid] = cand_len
-                    else:
-                        new_cand_to_rep_idx[cid] = new_r
-                        if mod_cands is None or cid in mod_cands:
-                            prev_f = sol.cand_to_flags.get(
-                                cid, (False, False, False)
-                            )
-                            sol.cand_to_flags[cid] = (
-                                True,
-                                prev_f[1],
-                                prev_f[2],
-                            )
-                            sol.cand_to_reconstructed_len[cid] = (
-                                kept_rep.length_bp_no_n
-                            )
-                else:
-                    new_cand_to_rep_idx[cid] = new_r
-
-            # Defensive compaction if cand_len==0 remapping orphaned a kept_rep
-            surviving_new_rs = {
-                r for r in new_cand_to_rep_idx.values() if r > 0
-            }
-            new_to_old_rep_idx = {
-                nr: or_ for or_, nr in old_to_new_rep_idx.items() if nr > 0
-            }
-            if any(
-                (nr not in surviving_new_rs)
-                and (new_to_old_rep_idx.get(nr) in had_orig_cands)
-                for nr in range(1, len(kept_reps) + 1)
-            ):
-                final_reps: list[ClusterRepresentative] = []
-                remap_nr: dict[int, int] = {}
-                for old_nr, rep in enumerate(kept_reps, start=1):
-                    if (old_nr not in surviving_new_rs) and (
-                        new_to_old_rep_idx.get(old_nr) in had_orig_cands
-                    ):
-                        continue
-                    final_nr = len(final_reps) + 1
-                    remap_nr[old_nr] = final_nr
-                    rep.rep_idx = final_nr
-                    final_reps.append(rep)
-                kept_reps = final_reps
-                new_cand_to_rep_idx = {
-                    cid: (remap_nr[r] if r > 0 else r)
-                    for cid, r in new_cand_to_rep_idx.items()
-                }
-
-            if not kept_reps:
-                sol.non_backbone_reps = ()
-                module_c_dropped_groups += 1
-                for j_entry in guard_res.json_log_entries:
-                    if (
-                        j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
-                        and (
-                            not dropped_cids
-                            or j_entry.get("candidate_id") in dropped_cids
-                        )
-                    ):
-                        j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
-                sol.cand_to_rep_idx = {}
-                sol.cand_to_nested_sig = {}
-                sol.cand_to_reconstructed_len = {}
-                sol.cand_to_flags = {}
-                sol.rep0_cand_spans = {}
-            else:
-                sol.non_backbone_reps = tuple(kept_reps)
-                sol.cand_to_rep_idx = new_cand_to_rep_idx
-                if dropped_cids:
-                    for j_entry in guard_res.json_log_entries:
-                        if (
-                            j_entry.get("final_reason") == "ACCEPTED_CANDIDATE"
-                            and j_entry.get("candidate_id") in dropped_cids
-                        ):
-                            j_entry["final_reason"] = "PAN_HOMOLOG_SUBTRACTED"
+    module_c_dropped_groups = _compact_rep_results_in_solutions(
+        sorted_group_pairs=sorted_group_pairs,
+        group_guard_by_pair=group_guard_by_pair,
+        group_solutions=group_solutions,
+        rep_results=rep_results,
+        clear_token_str=True,
+    )
 
     # Explicit cleanup of Stage 5.5 indexes and scratch sets
     sealed_waves.clear()
@@ -6202,6 +6499,15 @@ def run_chromosome_pipeline(
             f"  Cross-group pan deduplication done ({time.monotonic() - t_stage55:.2f}s): "
             f"pan_masked_bp={dedup_pan_masked_bp:,}, dropped_groups={pan_drop_g:,}"
         )
+    elif config.dedup_mode == "ref" and group_solutions:
+        ref_sr_bp, ref_drop_g = _prune_short_spacer_chains_ref_mode(
+            sorted_group_pairs=sorted_group_pairs,
+            group_guard_by_pair=group_guard_by_pair,
+            group_solutions=group_solutions,
+            min_sv_len=config.min_sv_len,
+        )
+        dedup_short_residual_bp += ref_sr_bp
+        dedup_dropped_groups += ref_drop_g
 
     # 6. Collect all top-level normal SV events before assigning region_id and event_id
     @dataclass

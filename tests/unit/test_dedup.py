@@ -2087,3 +2087,228 @@ def test_regression_finding3_nested_intra_piece_dup_and_finding4_jb(tmp_path: Pa
     assert sol0.non_backbone_reps[0].pieces[0].join_before == "synthetic"
     assert sol0.non_backbone_reps[0].partial_content is False
     assert sol0.cand_to_flags["c0"][0] is False
+
+
+def _mutate_poisson_with_micro_indels(
+    seq: str,
+    snp_rate: float,
+    micro_ins_specs: Sequence[tuple[int, int]],
+    micro_del_specs: Sequence[tuple[int, int]],
+    seed: int,
+) -> str:
+    """Apply realistic random Poisson SNPs plus deterministic micro-insertions and deletions."""
+    rng = random.Random(seed)
+    swap = {"A": "CGT", "C": "AGT", "G": "ACT", "T": "ACG"}
+    ins_map = {pos: "".join(rng.choices("ACGT", k=ln)) for pos, ln in micro_ins_specs}
+    del_ranges = sorted(micro_del_specs)
+    out: list[str] = []
+    i = 0
+    n = len(seq)
+    del_idx = 0
+    while i < n:
+        if i in ins_map:
+            out.append(ins_map[i])
+        if del_idx < len(del_ranges) and i == del_ranges[del_idx][0]:
+            i += del_ranges[del_idx][1]
+            del_idx += 1
+            continue
+        ch = seq[i]
+        if ch in swap and rng.random() < snp_rate:
+            out.append(rng.choice(swap[ch]))
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def test_smooth_homolog_blocks_poisson_micro_indels_sv_del_and_large_window() -> None:
+    """Chr06 regression: `smooth_homolog_blocks=True` eliminates 50 bp Swiss-cheese holes from
+    Poisson SNP clusters, 6-25 bp micro-indels, and >=50 bp target deletions while preserving
+    `protected_ins`, >=200 bp sub-threshold tracts, and >32 kb window-boundary insertions.
+    """
+    rng = random.Random(8101)
+    ref_seq = "".join(rng.choices("ACGT", k=90_000))
+    aln = mappy.Aligner(seq=ref_seq, preset="asm20", best_n=50)
+    saln = mappy.Aligner(seq=ref_seq, k=13, w=5, min_cnt=2, min_chain_score=20, best_n=50)
+    buf_m = mappy.ThreadBuffer()
+    buf_s = mappy.ThreadBuffer()
+
+    # (a) 15 kb homologous TE (~94.5% identity) with random Poisson SNPs (4.8%), six 8-18 bp
+    #     micro-insertions, four 8-15 bp micro-deletions, and one 160 bp structural deletion:
+    base_15k = ref_seq[10_000:25_000]
+    mut_15k = _mutate_poisson_with_micro_indels(
+        base_15k,
+        snp_rate=0.048,
+        micro_ins_specs=[(1210, 10), (3420, 14), (5815, 8), (8120, 18), (10910, 12), (13205, 9)],
+        micro_del_specs=[(2100, 10), (4900, 12), (7500, 160), (12100, 9)],
+        seed=8102,
+    )
+    # Without smoothing (strict v1 50 bp block grid), Poisson dips + micro-indels + 160D punch many holes
+    _, u_raw, _ = subtract_reference_intervals_mappy(
+        mut_15k, aligner=aln, buf=buf_m, min_identity=0.90, smooth_homolog_blocks=False
+    )
+    assert len(u_raw) >= 10
+
+    # With smooth_homolog_blocks=True, 100% of the homologous query is masked on '+' and '-' strands
+    for q_hom in (mut_15k, revcomp_dna(mut_15k)):
+        m_sm, u_sm, bp_sm = subtract_reference_intervals_mappy(
+            q_hom,
+            aligner=aln,
+            buf=buf_m,
+            min_identity=0.90,
+            short_aligner=saln,
+            short_buf=buf_s,
+            smooth_homolog_blocks=True,
+        )
+        assert u_sm == [] and m_sm == [(0, len(q_hom))] and bp_sm == len(q_hom)
+
+    # (b) Guards: >=200 bp sub-threshold tract NOT masked at 0.95; 150 bp 60%-divergent replacement NOT masked
+    flank_l = ref_seq[30_000:30_400]
+    mid_250_92 = _mutate_per_50bp_block(ref_seq[30_400:30_650], (4, 14, 28, 42))  # 46/50 = 92%
+    flank_r = ref_seq[30_650:31_050]
+    _, u_guard95, _ = subtract_reference_intervals_mappy(
+        flank_l + mid_250_92 + flank_r,
+        aligner=aln,
+        buf=buf_m,
+        min_identity=0.95,
+        smooth_homolog_blocks=True,
+    )
+    assert u_guard95 == [(400, 650)]
+
+    div_150 = _mutate_poisson_with_micro_indels(
+        ref_seq[30_400:30_550], snp_rate=0.45, micro_ins_specs=[], micro_del_specs=[], seed=8103
+    )
+    _, u_div, _ = subtract_reference_intervals_mappy(
+        flank_l + div_150 + flank_r[100:],
+        aligner=aln,
+        buf=buf_m,
+        min_identity=0.90,
+        smooth_homolog_blocks=True,
+    )
+    assert any(350 <= us <= 410 and 540 <= ue <= 600 for us, ue in u_div)
+
+    # (c) >32 kb large-query windowing (`70 kb` + `2,000 bp` novel insertion straddling 24,000 boundary at [23996, 25996))
+    big_base = _mutate_poisson_with_micro_indels(
+        ref_seq[15_000:85_000],
+        snp_rate=0.04,
+        micro_ins_specs=[(5120, 9), (23500, 11), (45200, 12)],
+        micro_del_specs=[(12300, 8), (52000, 120)],
+        seed=8104,
+    )
+    novel_2k = make_complex_seq(2000, seed=8105)
+    ins_pos = 23_996  # 4 bp before first 24,000 bp window boundary!
+    big_q = big_base[:ins_pos] + novel_2k + big_base[ins_pos:]
+    prot_out: list[tuple[int, int]] = []
+    _, u_big, _ = subtract_reference_intervals_mappy(
+        big_q,
+        aligner=aln,
+        buf=buf_m,
+        min_identity=0.90,
+        short_aligner=saln,
+        short_buf=buf_s,
+        smooth_homolog_blocks=True,
+        protected_ins_out=prot_out,
+    )
+    assert len(u_big) == 1
+    assert u_big[0][1] - u_big[0][0] == 2000
+    assert abs(u_big[0][0] - ins_pos) <= 5
+    assert any(ps <= ins_pos + 50 and pe >= ins_pos + 1950 for ps, pe in prot_out)
+
+
+def test_stage55_contiguous_chain_whole_sv_drop_and_zero_lt50_islands(tmp_path: Path) -> None:
+    """Chr06 regression:
+    1. Multi-piece N-free synthetic SV `[1000 bp, 30 bp, 1000 bp]` duplicating an accepted
+       `2,030 bp` locus is subtracted as ONE unified sequence and 100% dropped as a whole SV
+       (zero `< 50 bp` zombie pieces).
+    2. Isolated `< min_sv_len` N-bounded chains and `< 150 bp` non-protected split shards are
+       discarded into `dedup_short_residual_bp` across both `ref` and `pan` modes.
+    """
+    gb = SyntheticGFAFixtureBuilder()
+    for i in range(1, 9):
+        gb.add_node(str(i), make_complex_seq(300, seed=8200 + i))
+
+    seg_l = make_complex_seq(1000, seed=8220)
+    seg_m30 = make_complex_seq(30, seed=8221)
+    seg_m30_alt = make_complex_seq(80, seed=8222)
+    seg_r = make_complex_seq(1000, seed=8223)
+    full_2030 = seg_l + seg_m30 + seg_r
+    unrelated_28 = make_complex_seq(28, seed=8224)
+    tip_70 = make_complex_seq(70, seed=8225)
+    clean_65 = make_complex_seq(65, seed=8226)
+
+    for nid, sq in [
+        ("10", full_2030),
+        ("11", seg_l),
+        ("12", seg_m30),
+        ("13", seg_r),
+        ("14", seg_m30_alt),
+        ("15", unrelated_28),
+        ("16", tip_70 + _mutate_per_50bp_block(seg_l + seg_r, (5, 35))),
+        ("17", clean_65),
+    ]:
+        gb.add_node(nid, sq)
+
+    ref_steps = [(str(i), "+") for i in range(1, 9)]
+    gb.add_p_path("Ref#1#Chr01", ref_steps)
+    # High-support locus (1, 2) carries full_2030 + alt_80 so both full_2030 and alt_80 are accepted
+    for k in range(1, 5):
+        gb.add_p_path(
+            f"Sup{k}#1#Chr01",
+            [("1", "+"), ("10", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+        )
+    gb.add_p_path(
+        "SupAlt#1#Chr01",
+        [("1", "+"), ("11", "+"), ("14", "+"), ("13", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+    )
+    # Locus (3, 4): multi-member synthetic rep `[11(1000) + 12(30) + 13(1000)]` + child `14(80)` -> 100% redundant!
+    gb.add_p_path(
+        "DupA#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("11", "+"), ("12", "+"), ("13", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+    )
+    gb.add_p_path(
+        "DupB#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("11", "+"), ("14", "+"), ("13", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+    )
+    # Locus (4, 5): `[11(1000) + 15(unrelated 28bp) + 13(1000)]` -> flanks subtracted, 28bp < 50bp dropped -> whole SV dropped!
+    gb.add_p_path(
+        "Orph#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("11", "+"), ("15", "+"), ("13", "+"), ("5", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+    )
+    # Locus (5, 6): 70 bp unaligned boundary tip + 2000 bp homolog -> 70 bp < 150 bp shard dropped -> whole SV dropped!
+    gb.add_p_path(
+        "Tip#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("16", "+"), ("6", "+"), ("7", "+"), ("8", "+")],
+    )
+    # Locus (6, 7): untouched standalone 65 bp insertion -> MUST be retained!
+    gb.add_p_path(
+        "Clean#1#Chr01",
+        [("1", "+"), ("2", "+"), ("3", "+"), ("4", "+"), ("5", "+"), ("6", "+"), ("17", "+"), ("7", "+"), ("8", "+")],
+    )
+
+    graph, cfg = _build_graph_and_config(
+        tmp_path, "u_chr06_chain", gb, ref_steps, dedup_mode="pan", dedup_id=0.90
+    )
+    res = run_chromosome_pipeline(graph, cfg)  # type: ignore[arg-type]
+    write_build_outputs(res, cfg)
+    v = verify_build_outputs(
+        cfg.out_prefix,
+        gfa_path=cfg.gfa,
+        ref_fa_path=cfg.ref_fa,
+        backbone_prefix=cfg.backbone_prefix,
+        spacer_n=cfg.spacer_n,
+    )
+    assert v.passed, f"verify failed: {v.errors}"
+
+    # Loci (3,4) [step 3], (4,5) [step 4], and (5,6) [step 5] MUST all be 100% dropped (0 slot_ins_len)!
+    assert res.step_offsets[3].slot_ins_len == 0
+    assert res.step_offsets[4].slot_ins_len == 0
+    assert res.step_offsets[5].slot_ins_len == 0
+    # Untouched standalone 65 bp insertion at (6,7) [step 6] is preserved with 0 'N' spacers!
+    assert res.step_offsets[6].slot_ins_len == 65
+    assert int(res.summary_metrics["dedup_dropped_groups"]) == 3
+
+    # Strictly zero <50 bp non-N islands in pan.fa
+    non_n_runs = [seg for seg in res.pan_seq.split("N") if seg]
+    assert all(len(seg) >= 50 for seg in non_n_runs)
+    assert all(int(r["pan_end"]) - int(r["pan_start"]) >= 50 for r in res.inserts_rows)
+

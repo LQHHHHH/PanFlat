@@ -173,6 +173,7 @@ def project_steps_onto_backbone(
     *,
     provenance: Sequence[StepProvenance] | None = None,
     backbone_steps: Sequence[Step] | None = None,
+    precomputed_anchor_map: Mapping[str, tuple[int, Literal["+", "-"]]] | None = None,
 ) -> Sequence[ProjectedAnchor]:
     """
     §3.1–§3.2 (F7): Project branch steps onto unique full-step anchors in `backbone_steps[lo:hi)`.
@@ -386,7 +387,11 @@ def project_steps_onto_backbone(
             return list(lazy_seq)
         return lazy_seq
 
-    anchor_map = build_backbone_anchor_map(resolved_backbone, lo=eff_lo, hi=eff_hi_val)
+    anchor_map = (
+        precomputed_anchor_map
+        if precomputed_anchor_map is not None
+        else build_backbone_anchor_map(resolved_backbone, lo=eff_lo, hi=eff_hi_val)
+    )
     anchors: list[ProjectedAnchor] = []
     for idx, (st, prov) in enumerate(zip(resolved_branch_steps, resolved_branch_prov)):
         if not _is_full_step(st):

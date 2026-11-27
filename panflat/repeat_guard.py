@@ -703,42 +703,212 @@ def _finalize_hit_block_counts(
     min_identity: float,
     hit_masked_intervals: list[tuple[int, int]],
     hit_aligned_intervals: list[tuple[int, int]],
+    min_sv_len: int = 50,
+    smooth_homolog_blocks: bool = False,
 ) -> None:
     hit_qualifying_blocks: list[tuple[int, int]] = []
     hit_aligned_blocks: list[tuple[int, int]] = []
-    for k in range(num_blocks):
-        b_s = k * REF_SUB_BLOCK_SIZE
-        b_e = min((k + 1) * REF_SUB_BLOCK_SIZE, q_len)
-        l_k = b_e - b_s
-        m_cnt = block_m[k]
-        x_cnt = block_x[k]
-        i_cnt = block_i[k]
-        d_cnt = block_d[k]
-        denom = m_cnt + x_cnt + i_cnt + d_cnt
 
-        # Rule (i): blocks >=90% spanned by (M + X + I) are marked already aligned;
-        # protected_ins is subtracted below so >=min_sv_len insertions remain re-mappable
-        # for embedded ectopic homologs without dragging adjacent flanks into short_aligner.
-        if (m_cnt + x_cnt + i_cnt) * 10 >= 9 * l_k:
-            hit_aligned_blocks.append((b_s, b_e))
-        elif protected_ins and any(
-            b_s <= pe and ps <= b_e for ps, pe in protected_ins
-        ):
-            # Rule (ii-clean): even when mid-block soft-clipping leaves (M+X+I) < 90%
-            # inside a block touching a protected_ins boundary (closed endpoint), mark
-            # this hit's covered flank bases in that block as aligned so zero adjacent
-            # flank bases leak into unaligned alongside protected_ins.
-            for cs_i, ce_i in cov_spans:
-                ov_s = max(b_s, cs_i)
-                ov_e = min(b_e, ce_i)
-                if ov_e > ov_s:
-                    hit_aligned_blocks.append((ov_s, ov_e))
+    if not smooth_homolog_blocks:
+        for k in range(num_blocks):
+            b_s = k * REF_SUB_BLOCK_SIZE
+            b_e = min((k + 1) * REF_SUB_BLOCK_SIZE, q_len)
+            l_k = b_e - b_s
+            m_cnt = block_m[k]
+            x_cnt = block_x[k]
+            i_cnt = block_i[k]
+            d_cnt = block_d[k]
+            denom = m_cnt + x_cnt + i_cnt + d_cnt
 
-        # Masking Criterion (§3.8.4-B — unchanged):
-        # Condition 1: (M + X) / L_k >= 0.90
-        if (m_cnt + x_cnt) * 10 >= 9 * l_k:
-            # Condition 2: M / (M + X + I + D) >= min_identity
-            if denom > 0 and (m_cnt + 1e-12) >= min_identity * denom:
+            # Rule (i): blocks >=90% spanned by (M + X + I) are marked already aligned;
+            # protected_ins is subtracted below so >=min_sv_len insertions remain re-mappable
+            # for embedded ectopic homologs without dragging adjacent flanks into short_aligner.
+            if (m_cnt + x_cnt + i_cnt) * 10 >= 9 * l_k:
+                hit_aligned_blocks.append((b_s, b_e))
+            elif protected_ins and any(
+                b_s <= pe and ps <= b_e for ps, pe in protected_ins
+            ):
+                # Rule (ii-clean): even when mid-block soft-clipping leaves (M+X+I) < 90%
+                # inside a block touching a protected_ins boundary (closed endpoint), mark
+                # this hit's covered flank bases in that block as aligned so zero adjacent
+                # flank bases leak into unaligned alongside protected_ins.
+                for cs_i, ce_i in cov_spans:
+                    ov_s = max(b_s, cs_i)
+                    ov_e = min(b_e, ce_i)
+                    if ov_e > ov_s:
+                        hit_aligned_blocks.append((ov_s, ov_e))
+
+            # Masking Criterion (§3.8.4-B — unchanged):
+            # Condition 1: (M + X) / L_k >= 0.90
+            if (m_cnt + x_cnt) * 10 >= 9 * l_k:
+                # Condition 2: M / (M + X + I + D) >= min_identity
+                if denom > 0 and (m_cnt + 1e-12) >= min_identity * denom:
+                    hit_qualifying_blocks.append((b_s, b_e))
+    else:
+        merged_prot = merge_intervals(protected_ins) if protected_ins else []
+        is_cov = [False] * num_blocks
+        direct_ok = [False] * num_blocks
+        denoms = [0] * num_blocks
+        rem_bounds: list[tuple[int, int] | None] = [None] * num_blocks
+
+        for k in range(num_blocks):
+            b_s = k * REF_SUB_BLOCK_SIZE
+            b_e = min((k + 1) * REF_SUB_BLOCK_SIZE, q_len)
+            l_k = b_e - b_s
+            m_cnt = block_m[k]
+            x_cnt = block_x[k]
+            i_cnt = block_i[k]
+            d_cnt = block_d[k]
+            aln_q = m_cnt + x_cnt + i_cnt
+            is_terminal_frac = (
+                k == num_blocks - 1
+                and k > 0
+                and l_k < REF_SUB_BLOCK_SIZE
+                and is_cov[k - 1]
+            )
+            if aln_q == 0 and d_cnt == 0 and not merged_prot and not is_terminal_frac:
+                continue
+
+            prot_ov = 0
+            if merged_prot:
+                for ps, pe in merged_prot:
+                    if pe <= b_s:
+                        continue
+                    if ps >= b_e:
+                        break
+                    prot_ov += min(b_e, pe) - max(b_s, ps)
+            eff_l_k = l_k - prot_ov
+            denom_k = aln_q + d_cnt
+            denoms[k] = denom_k
+
+            cov_pass = eff_l_k > 0 and aln_q * 10 >= 9 * eff_l_k
+            if not cov_pass and is_terminal_frac and prot_ov == 0 and eff_l_k > 0:
+                rb_prev_t = rem_bounds[k - 1]
+                if rb_prev_t is not None and rb_prev_t[1] == b_s:
+                    prev_l = rb_prev_t[1] - rb_prev_t[0]
+                    prev_aln = block_m[k - 1] + block_x[k - 1] + block_i[k - 1]
+                    if (prev_aln + aln_q) * 10 >= 9 * (prev_l + eff_l_k):
+                        cov_pass = True
+
+            if cov_pass:
+                hit_aligned_blocks.append((b_s, b_e))
+                is_cov[k] = True
+                if prot_ov == 0:
+                    rem_bounds[k] = (b_s, b_e)
+                else:
+                    rem_k = subtract_intervals([(b_s, b_e)], merged_prot)
+                    if len(rem_k) == 1:
+                        rem_bounds[k] = rem_k[0]
+                if denom_k > 0 and (m_cnt + 1e-12) >= min_identity * denom_k:
+                    direct_ok[k] = True
+                elif denom_k == 0 and is_terminal_frac and direct_ok[k - 1]:
+                    direct_ok[k] = True
+            elif merged_prot and any(
+                b_s <= pe and ps <= b_e for ps, pe in merged_prot
+            ):
+                for cs_i, ce_i in cov_spans:
+                    ov_s = max(b_s, cs_i)
+                    ov_e = min(b_e, ce_i)
+                    if ov_e > ov_s:
+                        hit_aligned_blocks.append((ov_s, ov_e))
+
+        # Partition covered blocks into maximal contiguous runs without crossing protected_ins
+        qual = list(direct_ok)
+        k_cur = 0
+        floor_id = max(0.70, min_identity - 0.15)
+        sub_floor_id = max(0.75, min_identity - 0.10)
+        while k_cur < num_blocks:
+            rb_cur = rem_bounds[k_cur]
+            if not is_cov[k_cur] or rb_cur is None:
+                k_cur += 1
+                continue
+            r_lo = k_cur
+            while k_cur + 1 < num_blocks and is_cov[k_cur + 1]:
+                rb_prev = rem_bounds[k_cur]
+                rb_next = rem_bounds[k_cur + 1]
+                boundary = (k_cur + 1) * REF_SUB_BLOCK_SIZE
+                if (
+                    rb_prev is None
+                    or rb_next is None
+                    or rb_prev[1] != boundary
+                    or rb_next[0] != boundary
+                ):
+                    break
+                k_cur += 1
+            r_hi = k_cur
+            run_len = r_hi - r_lo + 1
+            if run_len >= 2:
+                win_w = min(6, run_len)
+                pm = [0] * (run_len + 1)
+                pd = [0] * (run_len + 1)
+                for j in range(run_len):
+                    pm[j + 1] = pm[j] + block_m[r_lo + j]
+                    pd[j + 1] = pd[j] + denoms[r_lo + j]
+                n_wins = run_len - win_w + 1
+                w_ok = [False] * n_wins
+                for w in range(n_wins):
+                    w_den = pd[w + win_w] - pd[w]
+                    if w_den > 0 and (pm[w + win_w] - pm[w] + 1e-12) >= min_identity * w_den:
+                        w_ok[w] = True
+                if any(w_ok):
+                    for j in range(run_len):
+                        idx_k = r_lo + j
+                        if qual[idx_k]:
+                            continue
+                        w_start = max(0, j - win_w + 1)
+                        w_end = min(j, n_wins - 1)
+                        if not any(w_ok[w] for w in range(w_start, w_end + 1)):
+                            continue
+                        m_k = block_m[idx_k]
+                        x_k = block_x[idx_k]
+                        id_k = block_i[idx_k] + block_d[idx_k]
+                        den_k = denoms[idx_k]
+                        local_ok = (
+                            (den_k > 0 and (m_k + 1e-12) >= floor_id * den_k)
+                            or (
+                                (m_k + x_k) > 0
+                                and id_k < min_sv_len
+                                and (m_k + 1e-12) >= sub_floor_id * (m_k + x_k)
+                            )
+                            or (
+                                den_k == 0
+                                and idx_k == num_blocks - 1
+                                and idx_k > r_lo
+                                and qual[idx_k - 1]
+                            )
+                        )
+                        if local_ok:
+                            qual[idx_k] = True
+
+                    # Guard against bridging wide >= 200 bp tracts below min_identity
+                    j_scan = 0
+                    while j_scan < run_len:
+                        if qual[r_lo + j_scan] and not direct_ok[r_lo + j_scan]:
+                            d_s = j_scan
+                            while (
+                                j_scan < run_len
+                                and qual[r_lo + j_scan]
+                                and not direct_ok[r_lo + j_scan]
+                            ):
+                                j_scan += 1
+                            d_e = j_scan
+                            rb_s = rem_bounds[r_lo + d_s]
+                            rb_e = rem_bounds[r_lo + d_e - 1]
+                            if (
+                                rb_s is not None
+                                and rb_e is not None
+                                and (rb_e[1] - rb_s[0]) >= 200
+                            ):
+                                for j_rev in range(d_s, d_e):
+                                    qual[r_lo + j_rev] = False
+                        else:
+                            j_scan += 1
+            k_cur += 1
+
+        for k in range(num_blocks):
+            if qual[k]:
+                b_s = k * REF_SUB_BLOCK_SIZE
+                b_e = min((k + 1) * REF_SUB_BLOCK_SIZE, q_len)
                 hit_qualifying_blocks.append((b_s, b_e))
 
     if hit_qualifying_blocks:
@@ -758,6 +928,8 @@ def _evaluate_mappy_hits_on_blocks(
     min_identity: float = REF_SUB_MIN_IDENTITY,
     t_starts: Sequence[int] | None = None,
     t_ends: Sequence[int] | None = None,
+    smooth_homolog_blocks: bool = False,
+    protected_ins_out: list[tuple[int, int]] | None = None,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """
     Evaluate `mappy` hits on the global 50 bp block grid `[50*k, min(50*(k+1), q_len))`.
@@ -790,10 +962,22 @@ def _evaluate_mappy_hits_on_blocks(
             protected_ins: list[tuple[int, int]] = []
 
             q_st_abs = query_offset + int(hit.q_st)
+            q_en_abs = query_offset + int(hit.q_en)
             q_pos = q_st_abs
             for op, length in ops:
                 if op == "I" and length >= min_sv_len:
                     protected_ins.append((q_pos, q_pos + length))
+                    if smooth_homolog_blocks:
+                        q_pos += length
+                        continue
+                elif (
+                    smooth_homolog_blocks
+                    and op == "D"
+                    and length >= min_sv_len
+                    and (q_pos - q_st_abs) >= min_sv_len
+                    and (q_en_abs - q_pos) >= min_sv_len
+                ):
+                    continue
                 _accumulate_block_op(
                     q_pos,
                     op,
@@ -808,6 +992,9 @@ def _evaluate_mappy_hits_on_blocks(
                 if op in ("M", "X", "I"):
                     q_pos += length
 
+            if protected_ins and protected_ins_out is not None:
+                protected_ins_out.extend(protected_ins)
+
             _finalize_hit_block_counts(
                 block_m=block_m,
                 block_x=block_x,
@@ -820,6 +1007,8 @@ def _evaluate_mappy_hits_on_blocks(
                 min_identity=min_identity,
                 hit_masked_intervals=hit_masked_intervals,
                 hit_aligned_intervals=hit_aligned_intervals,
+                min_sv_len=min_sv_len,
+                smooth_homolog_blocks=smooth_homolog_blocks,
             )
         else:
             # Bridged hit across concatenated target pieces: partition ops strictly by
@@ -842,9 +1031,30 @@ def _evaluate_mappy_hits_on_blocks(
                 block_d = [0] * num_blocks
                 protected_ins = []
                 runs_k = piece_runs[k_piece]
+                tot_q_k = (
+                    sum(
+                        sub_len
+                        for _qp, _rlo, _rhi, op, sub_len in runs_k
+                        if op in ("M", "X", "I")
+                    )
+                    if smooth_homolog_blocks
+                    else 0
+                )
+                seen_q_k = 0
                 for q_p, _r_lo, _r_hi, op, sub_len in runs_k:
                     if op == "I" and sub_len >= min_sv_len:
                         protected_ins.append((q_p, q_p + sub_len))
+                        if smooth_homolog_blocks:
+                            seen_q_k += sub_len
+                            continue
+                    elif (
+                        smooth_homolog_blocks
+                        and op == "D"
+                        and sub_len >= min_sv_len
+                        and seen_q_k >= min_sv_len
+                        and (tot_q_k - seen_q_k) >= min_sv_len
+                    ):
+                        continue
                     _accumulate_block_op(
                         q_p,
                         op,
@@ -856,6 +1066,10 @@ def _evaluate_mappy_hits_on_blocks(
                         block_i,
                         block_d,
                     )
+                    if op in ("M", "X", "I"):
+                        seen_q_k += sub_len
+                if protected_ins and protected_ins_out is not None:
+                    protected_ins_out.extend(protected_ins)
                 cov_k: Sequence[tuple[int, int]] = (
                     [
                         (q_p, q_p + sub_len)
@@ -877,6 +1091,8 @@ def _evaluate_mappy_hits_on_blocks(
                     min_identity=min_identity,
                     hit_masked_intervals=hit_masked_intervals,
                     hit_aligned_intervals=hit_aligned_intervals,
+                    min_sv_len=min_sv_len,
+                    smooth_homolog_blocks=smooth_homolog_blocks,
                 )
 
     return hit_masked_intervals, hit_aligned_intervals
@@ -921,6 +1137,12 @@ def _filter_shadowed_short_hits(
     return kept
 
 
+_LARGE_QUERY_WINDOW_THRESHOLD: int = 32_000
+_LARGE_QUERY_WINDOW_LEN: int = 24_000
+_LARGE_QUERY_WINDOW_STEP: int = 20_000
+_LARGE_QUERY_WINDOW_MARGIN: int = 1_000
+
+
 def subtract_reference_intervals_mappy(
     query_seq: str,
     ref_region_seq: str = "",
@@ -933,6 +1155,8 @@ def subtract_reference_intervals_mappy(
     t_starts: Sequence[int] | None = None,
     t_ends: Sequence[int] | None = None,
     collect_short_slices: list[tuple[int, int]] | None = None,
+    smooth_homolog_blocks: bool = False,
+    protected_ins_out: list[tuple[int, int]] | None = None,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], int]:
     """
     Reference / homologous interval subtraction using `mappy` (`preset='asm20'`, `cs=True`) (§3.8.4-B).
@@ -944,11 +1168,12 @@ def subtract_reference_intervals_mappy(
       their right, or to the last block if located at the end of the query.
     - Any contiguous query insertion (`I`) with `length >= min_sv_len` within a hit is
       protected from being masked by that hit.
-    - A block `k` is masked by a hit iff:
-      1. `(M + X) / L_k >= 0.90` (at least 90% aligned query bases), AND
-      2. `M / (M + X + I + D) >= min_identity` (default `0.85`, I/D counted in bases).
-    - When `short_aligner` is supplied, queries or unaligned slices with length `<= 500 bp`
-      also query `short_aligner` (with optional `short_buf`) and merge hits.
+    - When `smooth_homolog_blocks=False` (default, e.g. §3.8.4-B centromere Step B), a
+      block `k` is masked iff `(M + X) / L_k >= 0.90` and `M / (M + X + I + D) >= min_identity`.
+    - When `smooth_homolog_blocks=True` (`--dedup-mode {ref,pan}`), collinear windows absorb
+      `< min_sv_len` micro-indels and local `< 200 bp` SNP dips within `<= 300 bp` spans
+      satisfying `min_identity`, and queries `> 32 kb` execute in overlapping 50 bp-aligned
+      windows for guaranteed `O(L)` runtime on repetitive pericentromeric arrays.
     - Returns `(masked_intervals, unmasked_intervals, reference_like_bp)`.
     """
     q_len = len(query_seq)
@@ -961,7 +1186,65 @@ def subtract_reference_intervals_mappy(
     if aligner is None and ref_region_seq:
         aligner = mappy.Aligner(seq=ref_region_seq.upper(), preset="asm20")
 
+    if smooth_homolog_blocks and q_len > _LARGE_QUERY_WINDOW_THRESHOLD:
+        win_masked_all: list[tuple[int, int]] = []
+        win_prot_all: list[tuple[int, int]] = []
+        w_s = 0
+        while w_s < q_len:
+            w_e = min(q_len, w_s + _LARGE_QUERY_WINDOW_LEN)
+            if q_len - w_e < (_LARGE_QUERY_WINDOW_LEN - _LARGE_QUERY_WINDOW_STEP):
+                w_e = q_len
+            w_short: list[tuple[int, int]] | None = (
+                [] if collect_short_slices is not None else None
+            )
+            w_prot: list[tuple[int, int]] | None = (
+                [] if protected_ins_out is not None else None
+            )
+            w_m, _, _ = subtract_reference_intervals_mappy(
+                query_seq=q_upper[w_s:w_e],
+                ref_region_seq="",
+                min_sv_len=min_sv_len,
+                aligner=aligner,
+                buf=buf,
+                min_identity=min_identity,
+                short_aligner=short_aligner,
+                short_buf=short_buf,
+                t_starts=t_starts,
+                t_ends=t_ends,
+                collect_short_slices=w_short,
+                smooth_homolog_blocks=True,
+                protected_ins_out=w_prot,
+            )
+            core_s = 0 if w_s == 0 else w_s + _LARGE_QUERY_WINDOW_MARGIN
+            core_e = q_len if w_e == q_len else w_e - _LARGE_QUERY_WINDOW_MARGIN
+            for ms, me in w_m:
+                cs = max(core_s, w_s + ms)
+                ce = min(core_e, w_s + me)
+                if cs < ce:
+                    win_masked_all.append((cs, ce))
+            if w_short and collect_short_slices is not None:
+                for ss, se in w_short:
+                    collect_short_slices.append((w_s + ss, w_s + se))
+            if w_prot and protected_ins_out is not None:
+                for ps, pe in w_prot:
+                    abs_ps, abs_pe = w_s + ps, w_s + pe
+                    if max(core_s, abs_ps) < min(core_e, abs_pe):
+                        win_prot_all.append((abs_ps, abs_pe))
+            if w_e == q_len:
+                break
+            w_s += _LARGE_QUERY_WINDOW_STEP
+
+        if win_prot_all and protected_ins_out is not None:
+            protected_ins_out.extend(merge_intervals(win_prot_all))
+        masked_intervals = merge_intervals(win_masked_all)
+        unmasked_intervals = complement_intervals(q_len, masked_intervals)
+        reference_like_bp = sum(e - s for s, e in masked_intervals)
+        return masked_intervals, unmasked_intervals, reference_like_bp
+
     num_blocks = (q_len + REF_SUB_BLOCK_SIZE - 1) // REF_SUB_BLOCK_SIZE
+    raw_prot_ins: list[tuple[int, int]] | None = (
+        [] if protected_ins_out is not None else None
+    )
 
     def _map_and_evaluate_slice(
         sub_seq: str,
@@ -989,6 +1272,31 @@ def subtract_reference_intervals_mappy(
             return [], []
         kept_short = _filter_shadowed_short_hits(main_hits, short_hits)
         combined_hits = main_hits + kept_short if main_hits else kept_short
+        sub_len = len(sub_seq)
+        if smooth_homolog_blocks and (query_offset > 0 or sub_len < q_len):
+            sub_blocks = (sub_len + REF_SUB_BLOCK_SIZE - 1) // REF_SUB_BLOCK_SIZE
+            sub_prot: list[tuple[int, int]] | None = (
+                [] if raw_prot_ins is not None else None
+            )
+            loc_m, loc_a = _evaluate_mappy_hits_on_blocks(
+                hits=combined_hits,
+                query_offset=0,
+                q_len=sub_len,
+                num_blocks=sub_blocks,
+                min_sv_len=min_sv_len,
+                min_identity=min_identity,
+                t_starts=t_starts,
+                t_ends=t_ends,
+                smooth_homolog_blocks=True,
+                protected_ins_out=sub_prot,
+            )
+            if sub_prot and raw_prot_ins is not None:
+                for ps, pe in sub_prot:
+                    raw_prot_ins.append((query_offset + ps, query_offset + pe))
+            return (
+                [(query_offset + a, query_offset + b) for a, b in loc_m],
+                [(query_offset + a, query_offset + b) for a, b in loc_a],
+            )
         return _evaluate_mappy_hits_on_blocks(
             hits=combined_hits,
             query_offset=query_offset,
@@ -998,6 +1306,8 @@ def subtract_reference_intervals_mappy(
             min_identity=min_identity,
             t_starts=t_starts,
             t_ends=t_ends,
+            smooth_homolog_blocks=smooth_homolog_blocks,
+            protected_ins_out=raw_prot_ins,
         )
 
     all_hit_masked, all_hit_aligned = _map_and_evaluate_slice(q_upper, 0)
@@ -1011,7 +1321,11 @@ def subtract_reference_intervals_mappy(
     # to protected_ins boundaries) discovers clipped flanks while preserving protected_ins
     # and blocks already aligned and rejected due to < min_identity.
     seen_slices: set[tuple[int, int]] = {(0, q_len)}
+    remap_rounds = 0
     while aligned_intervals:
+        if smooth_homolog_blocks and remap_rounds >= 8:
+            break
+        remap_rounds += 1
         unaligned = complement_intervals(q_len, aligned_intervals)
         for u_s, u_e in unaligned:
             if (
@@ -1040,6 +1354,10 @@ def subtract_reference_intervals_mappy(
         if aligned_intervals == prev_aligned:
             break
 
+    if raw_prot_ins and protected_ins_out is not None:
+        protected_ins_out.extend(
+            subtract_intervals(merge_intervals(raw_prot_ins), masked_intervals)
+        )
     unmasked_intervals = complement_intervals(q_len, masked_intervals)
     reference_like_bp = sum(e - s for s, e in masked_intervals)
     return masked_intervals, unmasked_intervals, reference_like_bp
