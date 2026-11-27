@@ -149,6 +149,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Compute alignment redundancy QC metrics in summary.tsv",
     )
+    p_build.add_argument(
+        "--dedup-mode",
+        default="off",
+        help="Homologous redundancy elimination mode ('off', 'ref', or 'pan', default: 'off')",
+    )
+    p_build.add_argument(
+        "--dedup-id",
+        type=float,
+        default=0.90,
+        help="50 bp block identity threshold in [0.80, 0.99] for --dedup-mode ref|pan (default: 0.90)",
+    )
 
     # 2. panflat verify
     p_verify = subparsers.add_parser(
@@ -259,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 centromere_min_island=int(args.centromere_min_island),
                 dump_repeat_sequences=bool(args.dump_repeat_sequences),
                 qc=bool(args.qc),
+                dedup_mode=args.dedup_mode,
+                dedup_id=float(args.dedup_id),
                 centromere_mode_explicit=cen_mode_explicit,
                 centromere_min_island_explicit=cen_min_island_explicit,
             )
@@ -267,7 +280,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_progress(
                 f"Starting panflat build (out_prefix={config.out_prefix}, "
                 f"threads={config.threads}, centromere_mode={config.effective_centromere_mode}, "
-                f"repeat_guard={config.repeat_guard}, qc={config.qc})"
+                f"repeat_guard={config.repeat_guard}, dedup_mode={config.dedup_mode}, "
+                f"dedup_id={config.dedup_id}, qc={config.qc})"
             )
             log_progress("[1/4] Pre-flight check & loading inputs...")
             validate_build_config(config)

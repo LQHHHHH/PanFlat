@@ -400,6 +400,14 @@ def validate_build_config(config: BuildConfig) -> None:
             f"--centromere-mode must be 'off', 'bypass', or 'extract-islands', "
             f"got '{config.centromere_mode}'"
         )
+    if config.dedup_mode not in ("off", "ref", "pan"):
+        raise CLIArgumentError(
+            f"--dedup-mode must be 'off', 'ref', or 'pan', got '{config.dedup_mode}'"
+        )
+    if not (0.80 <= config.dedup_id <= 0.99):
+        raise CLIArgumentError(
+            f"--dedup-id must be in [0.80, 0.99], got {config.dedup_id}"
+        )
 
     # §3.8.1 & §6 centromere flag interaction checks
     if (

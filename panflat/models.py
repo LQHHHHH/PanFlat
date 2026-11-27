@@ -419,6 +419,8 @@ class BuildConfig:
     centromere_min_island: int = 500
     dump_repeat_sequences: bool = False
     qc: bool = False
+    dedup_mode: Literal["off", "ref", "pan"] = "off"
+    dedup_id: float = 0.90
     centromere_mode_explicit: bool = False
     centromere_min_island_explicit: bool = False
 

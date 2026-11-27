@@ -173,6 +173,12 @@ def write_build_outputs(
     summary_metrics.setdefault(
         "centromere_mode", config.effective_centromere_mode
     )
+    summary_metrics.setdefault("dedup_mode", config.dedup_mode)
+    summary_metrics.setdefault("dedup_id", config.dedup_id)
+    summary_metrics.setdefault("dedup_ref_masked_bp", 0)
+    summary_metrics.setdefault("dedup_pan_masked_bp", 0)
+    summary_metrics.setdefault("dedup_short_residual_bp", 0)
+    summary_metrics.setdefault("dedup_dropped_groups", 0)
 
     for log_line in result.log_lines:
         if "CEN_ANCHOR_NOT_FOUND" in log_line:
@@ -1048,6 +1054,31 @@ def merge_chromosomes(
         sum_lines.append(f"spacer_n\t{next(iter(spacer_vals))}")
     if len(bp_vals) == 1:
         sum_lines.append(f"backbone_prefix\t{next(iter(bp_vals))}")
+
+    dedup_mode_vals = {
+        kv["dedup_mode"] for kv in per_chrom_kv if "dedup_mode" in kv
+    }
+    dedup_id_vals = {
+        kv["dedup_id"] for kv in per_chrom_kv if "dedup_id" in kv
+    }
+    if len(dedup_mode_vals) == 1:
+        sum_lines.append(f"dedup_mode\t{next(iter(dedup_mode_vals))}")
+    if len(dedup_id_vals) == 1:
+        sum_lines.append(f"dedup_id\t{next(iter(dedup_id_vals))}")
+    dedup_sum_keys = (
+        "dedup_ref_masked_bp",
+        "dedup_pan_masked_bp",
+        "dedup_short_residual_bp",
+        "dedup_dropped_groups",
+    )
+    if any(dk in kv for kv in per_chrom_kv for dk in dedup_sum_keys):
+        for dk in dedup_sum_keys:
+            tot_dk = sum(
+                int(kv[dk])
+                for kv in per_chrom_kv
+                if dk in kv and str(kv[dk]).isdigit()
+            )
+            sum_lines.append(f"{dk}\t{tot_dk}")
 
     if per_chrom_kv and all(kv.get("qc_enabled") == "true" for kv in per_chrom_kv):
         tot_short_cnt = sum(int(kv.get("qc_short_50_149_count", "0")) for kv in per_chrom_kv)

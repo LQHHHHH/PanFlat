@@ -1,87 +1,88 @@
-# Project: PanFlat v1 True-Multicore Build (`MULTICORE_PLAN.md`)
+# Project: PanFlat Homologous Redundancy Elimination (`DEDUP_PLAN.md`)
 
 ## Architecture
-PanFlat v1's build pipeline executes four strictly ordered top-level stages orchestrated by `panflat/cli.py::main`:
-1. **Stage 1 (`gfa_io.py::load_and_validate_inputs`)**: Single-threaded streaming 2-pass GFA + SHA-256 + FASTA/BED/GFF3 validation with fine-grained `stderr` progress logs.
-2. **Stage 2 (`linearizer.py::run_chromosome_pipeline`)**:
-   - **Stage 2.1–2.3a**: Single-threaded centromere delimitation, top-level contig orientation, and centromere fragment partitioning (`centromere.py`).
-   - **Stage 2.3b (`centromere.py::process_centromere_regions`, Module D)**: `bypass` single-threaded; `extract-islands` Linux `fork` `ProcessPoolExecutor` across complete non-ref haplotypes per region sharing read-only `mappy.Aligner(seq=...)` via COW, merging strictly in `graph.all_haplotypes` order.
-   - **Stage 2.4 (`linearizer.py`, Module C)**: Linux `fork` `ProcessPoolExecutor` across `normal_fragments_sorted` (LPT-ordered), with pre-warmed `ref_steps._anchor_cache`, `gc.collect()`+`gc.freeze()`, IPC stripping/O(1) rebinding of `LazyProvenanceTuple._node_lens`, slim `CompactVisitCounts` (`_multi_nids` only), explicit `_ContigAnalysis.contig_idx` (eliminating all `id(ca)` checks), read-only discipline on shared split-arm `_orig_codes`, and strict ascending `frag_idx` deterministic merge (`UNANCHORED_END` numbering).
-   - **Stage 2.5 (`linearizer.py`, Module B)**: Replaces the sole existing GIL-bound `ThreadPoolExecutor` with a fused Stage 2.5a (`repeat-guard` + cycle folding) + Stage 2.5b (`solve_parallel_group`) Linux `fork` `ProcessPoolExecutor`. Fast-filters empty groups in parent, packs active groups via LPT base-budget batching, strips `aligner`/unused fields/`sol.backbone_seq`/unexported `REPEAT_LIKE.seq`, merges strictly in `sorted_group_pairs` order (assigning `REPEAT_LIKE` `UNRES_*` IDs and `seen_exported_intervals` before Stage 6a), and performs all container cleanup strictly after pool exit to prevent COW dirtying.
-   - **Stage 2.6–2.7 (`linearizer.py`)**: Single-threaded event collection (`6a INV*`, `6b LARGE_JUMP`, `6c DUP_TRA/CNV/DEL/INS + REPEAT_LIKE`), Stage 7 `region_id`/`event_id` backfill, and pan-genome assembly.
-3. **Stage 3 (`writers.py::write_build_outputs` → `verify_qc.py::run_qc`, Module A)**: After all `fork` pools have exited (`threading.active_count() == 1`), `--qc` runs true C-level GIL-free multithreading via `ThreadPoolExecutor` + per-thread persistent `mappy.ThreadBuffer`, pre-encoded ASCII `bytes`, adaptive LPT chunking, verbatim `mappy.Aligner(seq=...)` (preserving `mid_occ=1000`), and Stage 2 separator-bridging filter (`t_starts`/`t_ends`). Writes all 12 deterministic output files atomically.
-4. **Stage 4 (`verify_qc.py::verify_build_outputs`)**: Unchanged single-threaded streaming verification of Invariants I/II/III and GFA SHA-256.
+Extends PanFlat v1's multicore build pipeline (`panflat/cli.py::main` → `linearizer.py::run_chromosome_pipeline` → `writers.py::write_build_outputs` / `merge_chromosomes`) with a four-layer algorithmic homologous redundancy elimination pipeline controlled by `--dedup-mode {off,ref,pan}` (default `off`) and `--dedup-id <float>` (default `0.90`, valid range `[0.80, 0.99]`):
 
-**Fork & Thread Safety Invariant**: BLAS/OpenMP thread-count env vars (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `OMP_NUM_THREADS`, `NUMEXPR_NUM_THREADS`) default to `"1"` at the top of `panflat/__init__.py` and `panflat/cli.py` prior to `import numpy`; `panflat/progress.py` registers `os.register_at_fork` wrappers for `_PROGRESS_LOCK`; all `fork` pools finish and join `_ExecutorManagerThread` (never setting `max_tasks_per_child`) before Stage 3 enters `ThreadPoolExecutor`. Non-Linux platforms gracefully fall back when `"fork"` is unavailable.
+1. **CLI & Config Layer (`models.py`, `cli.py`, `gfa_io.py`)**:
+   - Extends `BuildConfig` with `dedup_mode: Literal["off", "ref", "pan"] = "off"` and `dedup_id: float = 0.90`.
+   - Validates both arguments in `validate_build_config` (raising `CLIArgumentError`, catching out-of-range, `NaN`, and `±inf`).
+   - Preserves 100% backward compatibility under `--dedup-mode off` (`585 / 585` baseline tests) and keeps centromere `extract-islands` Step B strictly fixed at `REF_SUB_MIN_IDENTITY = 0.85`.
+2. **Module A — Stage 2.5a Full-Reference Homology Subtraction (`repeat_guard.py`, `linearizer.py`)**:
+   - Generalizes `_evaluate_mappy_hits_on_blocks` and `subtract_reference_intervals_mappy` with `min_identity`, `short_aligner` (`k=13, w=5, min_cnt=2, min_chain_score=20, best_n=50` for queries/sub-intervals `<= 500 bp`), `short_buf`, relaxed empty-`ref_region_seq` guard for prebuilt aligners, and `t_starts`/`t_ends` target-piece-scoped op splitting.
+   - Parent constructs read-only `(ref_dedup_aligner, ref_dedup_short_aligner)` once prior to `_fork_gc_frozen()`, sharing via Linux `fork` COW across `_Stage5ForkContext` (and reusing directly in serial path) with per-worker/serial `mappy.ThreadBuffer` pairs; immediately freed (`del` + `gc.collect()`) after Stage 5 exits.
+   - Executes Step 1 (reference subtraction) → Step 2 (15-mer repeat guard on surviving `>= 500 bp` residuals) → Step 3 (`fold_tandem_cycles` on `>= min_sv_len` residuals) inside `screen_and_fold_candidate`, propagating `r_partial` (OR'd) and `r_left_contig`, never stitching across masked intervals (`mask_intervals=()`), and logging `REFERENCE_LIKE` / `SPLIT_BY_REFERENCE_SUBTRACTION` / `SHORT_RESIDUAL` only to `.log` JSON (never `unresolved.tsv`/`unresolved.fa`).
+3. **Module B — Stage 2.5b Childless Secondary-Backbone Unlocking (`linearizer.py`)**:
+   - In `_solve_multi_member_component` (`not active_child_solutions`), sets `is_synthetic=(config.dedup_mode == "off")` so pure single-donor secondary backbones participate in Step 4 similarity clustering (`solve_parallel_group`).
+   - Hardens `solve_parallel_group` `merged_rep0` handling to evaluate `occ.seq != rc.seq` individually via `_check_similarity_merge_with_span` (cached by `occ.seq`), preventing false `"0"` genotypes on `m_child` deletion carriers.
+4. **Module C — Stage 5.5 Cross-Group/Cross-Rep Deterministic Priority Homologous Subtraction (`linearizer.py`, `--dedup-mode pan`)**:
+   - Executes strictly AFTER all `fork` pools (Stages 2.3b, 2.4, 2.5) have exited and `ref_dedup_*` aligners are freed (`MULTICORE_PLAN.md` §2.3 fork-then-thread redline).
+   - Priority-0 seeds accepted pool from `cen_out.island_slot_blocks`.
+   - Orders all normal reps by total T22-deterministic `priority_key = (-rep.support_hap_count, ref_e_open - ref_s_open, -rep.length_bp_no_n, rank_a, rank_b, rep.rep_idx, rep.token_str)`.
+   - Uses O(N), byte-identical wave buffering (`1.5 Mb` sealed waves, `~2 Mb` query batches, `384 kb` mini-subwaves + zero-false-negative dual-regime `_TailSeedGate` + lazy-dirty `tail_wave` + mid-batch wave-seal carryover) with `ThreadPoolExecutor` + per-thread `(buf_main, buf_short)` pairs and target-piece-scoped `'N'*200` hit splitting.
+   - Slices surviving pieces via `_subslice_piece` with strict Global Invariant II `join_before` state transitions (no orphan `"spacer"` at `p_i == 0`; forced `"spacer"` at `p_i > 0` across any split/trim/drop gap), lockstep `rep.piece_cand_ids` updates, and untouched `< min_sv_len` sub-piece preservation.
+5. **Module D — Stage 6–7 Compaction, Safe Genotyping, Summary & Associative Merge (`linearizer.py`, `writers.py`)**:
+   - Compacts surviving reps densely (`1..K'`), maps dropped reps to `-1` in `cand_to_rep_idx`, isolates `,partial_content=1` per allele via `sol.cand_to_flags[cid]`, updates `cand_to_reconstructed_len`, and drops empty groups cleanly (zero `INS`, zero `InsertionSlotBlock`, zero `'N'` spacer; preserves `DEL`/`CNV`/`INV`/`DUP_TRA` and co-located `CEN_ISLAND` invariants).
+   - Protects `genotypes.tsv` against false-negative `"0"` in Stage 6c `(iii)` for both Module A (`ckey in guard_res.contig_had_subtracted_homolog`, `set[int]`) and Module C (`r_idx == -1`), emitting `"."`.
+   - Adds 6 `dedup_*` metrics to `{prefix}.summary.tsv` (keeping `ref_sub_min_identity = 0.85` untouched) with associative hierarchical aggregation in `merge_chromosomes`. `panflat/verify_qc.py` requires zero changes.
 
 ## Feature Inventory
-Every Survey feature from `MULTICORE_PLAN.md` and Steps 0 Explorers is assigned a milestone (0 unassigned):
+Every Survey & `DEDUP_PLAN.md` feature is assigned a milestone (0 unassigned):
 
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | Environment Provisioning & Live `mappy` Parity Check | Install `pip install -e ".[dev]"` into pyenv Python `3.12.16` (+ `pyenv rehash`), verify `numpy`/`mappy`/`edlib`/`pytest`, confirm `mappy.ThreadBuffer` bytes parity & `mappy.Aligner` fork safety, verify baseline 525/525 tests pass | M1 | survey_1, survey_3 |
-| 2 | BLAS / OpenMP Implicit Thread Guard | Set `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `OMP_NUM_THREADS`, `NUMEXPR_NUM_THREADS` to `"1"` via `os.environ.setdefault` at top of `panflat/__init__.py` and `panflat/cli.py` before `import numpy` | M1 | MULTICORE_PLAN §2.3, survey_1 |
-| 3 | Fork-Safe Progress Lock Reset | Register `os.register_at_fork(before, after_in_parent, after_in_child)` wrappers in `panflat/progress.py` guarded by `hasattr(os, "register_at_fork")` | M1 | MULTICORE_PLAN §2.3, survey_1 |
-| 4 | GFA I/O Fine-Grained `stderr` Progress Logs | Add 3 `log_progress` milestones in `panflat/gfa_io.py::load_and_validate_inputs`: S/L complete (O(1) link count), P/W complete, FASTA validated (never touching `.log`) | M1 | MULTICORE_PLAN §3 & §6, survey_1 |
-| 5 | Module A: `--qc` True Multithreading (`verify_qc.py`) | Add `_map_queries_parallel` (`mappy.ThreadBuffer`, pre-encoded ASCII bytes, adaptive LPT chunking, optional `t_starts`/`t_ends` filter), preserve all 4 `Aligner(seq=...)` calls verbatim (`mid_occ=1000`), `config is None` safe, per-round index `del`, `round_need_short`, `stderr` progress logs | M1 | MULTICORE_PLAN §3A, survey_1 |
-| 6 | IPC & COW Model Primitives (`models.py`) | Add `_EMPTY_NODE_LENS`, `LazyProvenanceTuple.without_node_lens()` & `.rebind_node_lens()`, optional `multi_counts=None` on `CompactVisitCounts` | M1 | MULTICORE_PLAN §2.2 & §3C, survey_2 |
-| 7 | Explicit `contig_idx` Replacing `id(ca)` (`linearizer.py`) | Add `contig_idx: int` to `_ContigAnalysis`, replace all 6 Stage 6 `id(ca)` blocks (`INV`, `LARGE_JUMP`, `DUP_TRA`, full `CNV`, `DEL`, partial `CNV`) and clean up in-process `id(dev)` | M1 | MULTICORE_PLAN §2.1 & §3C, survey_2 |
-| 8 | Module C: Stage 2.4 Contig `fork` Parallelism (`linearizer.py`) | Pure `_analyze_single_normal_fragment`, LPT `fork` `ProcessPoolExecutor` (`n_ref >= 5_000` or `PANFLAT_FORCE_FORK=1`, capped by `PANFLAT_MAX_FORK_WORKERS`), `_get_lazy_backbone_anchor_arrays` warmup, `gc.collect()`+`cache_clear()`+`gc.freeze()`, strip/rebind `_node_lens` on `DeviationSegment` & `>64`-step `ReverseChainRecord.novel_unresolved_slices`, slim `node_visit_counts`, read-only split-arm `_orig_codes` discipline, strict ascending `frag_idx` merge & `UNANCHORED_END` emission | M1 | MULTICORE_PLAN §2.1–2.3 & §3C, survey_2 |
-| 9 | Module B: Stage 2.5 Fused `fork` Parallelism (`linearizer.py`) | Fuse Stage 2.5a (`repeat-guard` + cycle folding) & 2.5b (`solve_parallel_group`), fast-filter empty groups, LPT base-budget batching (`>=10_000 bp` singletons, `<=20_000 bp` / `eff_max_groups` batches), `fork` `ProcessPoolExecutor` (`n_active >= 32` or `PANFLAT_FORCE_FORK=1`), strip `sol.backbone_seq`, `rep.aligner`/unused fields, `kept_candidates`, unexported `REPEAT_LIKE.seq`, strict `sorted_group_pairs` `UNRES_*` & `seen_exported_intervals` replay, post-pool COW-safe cleanup, remove unused `threading`/`ThreadPoolExecutor` | M1 | MULTICORE_PLAN §2.1–2.3 & §3B, survey_2 |
-| 10 | Module D: Stage 2.3b `extract-islands` `fork` Parallelism (`centromere.py`) | Pure per-haplotype Steps A–C worker sharing read-only `region_aligner` via COW, LPT `fork` `ProcessPoolExecutor` (`len(work_haps) >= 2` and scale threshold or `PANFLAT_FORCE_FORK=1`), IPC-strip `steps=()` and unexported `CEN_REPEAT_LIKE.seq=""`, optional `buf` in `repeat_guard.py::subtract_reference_intervals_mappy`, deterministic `graph.all_haplotypes`-ordered parent merge preserving `{region_id}_UNRES_*` and `.log` `CANDIDATE_JSON` order | M1 | MULTICORE_PLAN §3D & §6, survey_3 |
-| 11 | New Unit & Opaque-Box E2E Multicore/T22 Tests | Add `tests/unit/test_multicore.py` (white-box IPC, pickle size, `contig_idx`, `CompactVisitCounts`, `run_qc`, `progress` fork lock, BLAS env, Module D parity) and `tests/e2e/test_tier5_multicore.py` (ZERO `panflat` imports; forced-fork adversarial compact-int graph with all SV/unresolved types + `>64`-step `INV_EDGE` + split-arm `_orig_codes` + `bypass`/`extract-islands` + `--dump-repeat-sequences` + `--ref-gff` + `--qc`; natural real-threshold `ref_steps>=5000` & `>=32` active groups; 12-file SHA-256 parity + independent `panflat verify` + zero fork `DeprecationWarning`) | M2 | MULTICORE_PLAN §5.3, survey_2, survey_3 |
-| 12 | 30+ Haplotype Chromosome-Scale Benchmark & Final Acceptance Verification | Benchmark 33-hap chromosome-scale synthetic graph (`--threads 1` vs `--threads 2`/`4`, with `--qc` & `extract-islands`) measuring per-stage wall time, CPU%, peak RSS, and 12-file SHA-256 parity; pass static gates (`ruff`, E2E import check, `panflat_v1_final_revised.md` diff = 0), full regression (`525 + new` tests), batched 2 Reviewers + 2 Challengers + 1 Forensic Auditor gate | M2 / Verify | MULTICORE_PLAN §5.1–5.4, survey_1–3 |
+| 1 | Environment Provisioning & Live `mappy` Short-Aligner Check | Install `python3 -m pip install -e ".[dev]" && pyenv rehash` into pyenv Python `3.12.16`, verify `numpy`/`mappy`/`edlib`/`pytest`, confirm `short_aligner` (`k=13, w=5, min_cnt=2, min_chain_score=20, best_n=50`) emits `hit.cs` on `+/-` strands | M1 | survey_1 |
+| 2 | §2 CLI, Config & Validation | Add `dedup_mode`/`dedup_id` to `BuildConfig` (`models.py`), `--dedup-mode`/`--dedup-id` to `cli.py`, validation (`off|ref|pan`, `[0.80, 0.99]`, `NaN`/`inf` rejection) in `gfa_io.py::validate_build_config` | M1 | DEDUP_PLAN §2, survey_1 |
+| 3 | §3 Module A.1: Generalized `repeat_guard.py` | Extend `_evaluate_mappy_hits_on_blocks` & `subtract_reference_intervals_mappy` with `min_identity`, `short_aligner`, `short_buf`, empty-`ref_region_seq` guard, and `t_starts`/`t_ends` target-piece-scoped op splitting; keep centromere Step B fixed at `0.85` | M1 | DEDUP_PLAN §3A.1, survey_1, survey_3 |
+| 4 | §3 Module A.2: Stage 2.5a Ref Subtraction + Fork COW + IPC | Parent prebuilt `(ref_dedup_aligner, ref_dedup_short_aligner)` in `_Stage5ForkContext` before `_fork_gc_frozen()`, worker/serial `ThreadBuffer` pairs, post-Stage 5 `del` + `gc.collect()`, `screen_and_fold_candidate` Step 1→Step 2→Step 3 with `r_partial`/`r_left_contig` propagation, `REFERENCE_LIKE` JSON-only logging, `contig_had_subtracted_homolog: set[int]`, `support_hap_count` & conditional `token_str` IPC retention | M1 | DEDUP_PLAN §3A.2, survey_2 |
+| 5 | §3 Module B: Stage 2.5b Childless Component Unlocking + `rep0` Guard | Set `is_synthetic=(config.dedup_mode == "off")` in `_solve_multi_member_component` (`not active_child_solutions`) and guard `merged_rep0` in `solve_parallel_group` for `occ.seq != rc.seq` via `_check_similarity_merge_with_span` | M1 | DEDUP_PLAN §3B, survey_2 |
+| 6 | §3 Module C: Stage 5.5 Cross-Group Pan Dedup | Post-all-`fork` `_deduplicate_representatives_across_chromosome` with Priority-0 `CEN_ISLAND` seeding, T22 priority key, O(N) `1.5 Mb` wave / `128 kb` subwave / 13-mer seed gate / lazy-dirty `tail_wave` / mid-batch seal carryover, `ThreadPoolExecutor` + per-thread `ThreadBuffer` pairs, `_subslice_piece` `join_before` state machine, lockstep `piece_cand_ids`, untouched `< min_sv_len` preservation | M1 | DEDUP_PLAN §3C, survey_3 |
+| 7 | §3 Module D: Stage 6–7 Compaction, Genotyping, Summary & Merge | Dense rep reindexing, `-1` mapping, per-allele `cand_to_flags` `partial_content=True` & `cand_to_reconstructed_len`, clean empty-group omission, Stage 6c `(iii)` `"."` genotype backfill (Module A + Module C), 6 `dedup_*` `summary.tsv` metrics (preserving `ref_sub_min_identity = 0.85`), associative `merge_chromosomes` aggregation | M1 | DEDUP_PLAN §3D, survey_1, survey_3 |
+| 8 | §4.2 Unit & Opaque-Box CLI E2E Dedup Test Suite | Add `tests/unit/test_dedup.py` (CLI/config, `min_identity`/`short_aligner`/`t_starts`/`t_ends`, Module B + `m_child` `rep0`, `_subslice_piece` 7 transitions, wave/subwave/carryover determinism, associative merge) and `tests/e2e/test_tier5_dedup.py` (ZERO `panflat` imports; Tests 1–4: ectopic TE + GFF3, pericentromeric anchor drift, 20+ hap `--qc` closed-loop <2% with 100% recall, T22 multicore + shuffled GFA 12-file SHA-256 identity) | M2 | DEDUP_PLAN §4.2, survey_1–3 |
+| 9 | Independent Whole-Project Verification Gate | Batched (`<= 2` concurrent) 2 Reviewers + 2 Challengers + 1 Whole-Project Forensic Auditor verifying all static gates, `panflat_v1_final_revised.md` 0-byte diff, full `585 + new` regression, adversarial probes, and T22 determinism (noting real `Chr06A` data absence on VM) | M3 | DEDUP_PLAN §4.1–4.3, survey_1–3 |
 
 ## Milestones
-*(Note: Executed directly by Project Orchestrator without nested sub-orchestrators to enforce user's strict VM safety cap of ≤ 3 concurrent subagents / ≤ 5 total active agents.)*
+*(Executed sequentially by Project Orchestrator without sub-orchestrators to enforce strict user VM safety cap: at most 2 concurrent child subagents / ≤ 4 total active agents.)*
 
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| 0 | Survey | 3 parallel Read-only Survey Explorers covering env, Modules A/B/C/D, tests, gates | none | DONE (`explorer_survey_1..3` killed) |
-| 1 | M1: Env Provisioning & Core Multicore Implementation (Foundation + Modules A, B, C, D) | Features #1–#10 across `panflat/{__init__,cli,progress,gfa_io,verify_qc,models,linearizer,centromere,repeat_guard}.py`; verify static gates & 525/525 baseline regression | M0 | DONE (`worker_core_impl`, 525/525 pass) |
-| 2 | M2: Multicore/T22 Unit + E2E Test Suite & 33-Hap Benchmark | Features #11–#12: `tests/unit/test_multicore.py`, `tests/e2e/test_tier5_multicore.py`, optional `extra_env` in `tests/e2e/helpers.py`, run full suite + 33-hap benchmark in `/tmp` | M1 | DONE (`worker_tests_bench`, 543/543 pass, 1.69× 33-hap speedup) |
-| 3 | M3: Independent Batched Verification Wave & Final Gate | Batch 1: `reviewer_1` (full suite + static gates) + `reviewer_2` (code/COW/IPC audit) + `auditor_1` (whole-project Forensic Audit); Batch 2a: `challenger_1` (adversarial probes); Batch 2b: `challenger_2` (solo 33-hap multicore scaling & RSS benchmark); Gate pass → Report to Sentinel for Victory Audit | M2 | DONE (Gate PASS: `auditor_1` CLEAN, `reviewer_1` APPROVE 543/543, `reviewer_2` APPROVE, `challenger_1` APPROVE, `challenger_2` APPROVE) |
+| 0 | Survey | 3 read-only Survey Explorers (`explorer_survey_1..3`) mapping CLI/Config, `repeat_guard.py`, `linearizer.py` Modules A–D, `writers.py`, `verify_qc.py`, tests, and `Chr06A` availability | none | DONE (`explorer_survey_1..3` retired & killed) |
+| 1 | M1: Env Provisioning & Core Implementation | Features #1–#7 across `panflat/{models,cli,gfa_io,repeat_guard,linearizer,writers}.py`; verify static gates & `585 / 585` baseline regression under `--dedup-mode off` | M0 | DONE (`worker_core_impl`, 585/585 pass, static gates pass) |
+| 2 | M2: Dedup Unit & Opaque-Box CLI E2E Tests | Feature #8: `tests/unit/test_dedup.py` + `tests/e2e/test_tier5_dedup.py` (Tests 1–4 + edge cases), resolve any uncovered edge-case bugs, verify full `585 + new` suite & static gates | M1 | DONE (`worker_dedup_tests`, 611/611 pass, 26 new tests, 0 core bugs) |
+| 3 | M3: Independent Batched Verification Wave & Final Gate | Feature #9: Iter 15 `worker_fix_iter15` DONE (`665/665`, `80/80` dedup, `BUG-R14-1` & `BUG-R14-2` closed strictly in `repeat_guard.py` `8eb9dd64...8d5112`, `linearizer.py` untouched, all 7 gates PASS) → Iter 15 Full 5-Verifier Wave (`reviewer_dedup_r15_1` & `r15_2` running) | M2 | IN_PROGRESS (Iter 15 Batch 1 Reviewers running) |
 
 ## Interface Contracts
 
-### Environment Controls (Consistent Across Modules B, C, D)
-- `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `OMP_NUM_THREADS`, `NUMEXPR_NUM_THREADS`: defaulted to `"1"` via `os.environ.setdefault` before `numpy` import.
-- `PANFLAT_FORCE_FORK`: `"1"` / `"true"` / `"yes"` / `"on"` (case-insensitive) forces `fork` execution when `config.threads > 1` and `"fork"` is supported, even below production scale thresholds. When `config.threads == 1`, execution remains strictly serial regardless of `PANFLAT_FORCE_FORK`.
-- `PANFLAT_MAX_FORK_WORKERS`: optional positive integer capping `max_workers` for `fork` `ProcessPoolExecutor` pools in Stages 2.3b, 2.4, and 2.5 (does NOT cap Stage 3 `--qc` threads).
-- Non-Linux fallback: `"fork" in multiprocessing.get_all_start_methods()`; if absent, cleanly falls back to serial execution in Stages 2.3b/2.4/2.5.
+### `panflat/models.py` ↔ `panflat/cli.py` ↔ `panflat/gfa_io.py`
+- `BuildConfig`: adds `dedup_mode: Literal["off", "ref", "pan"] = "off"` and `dedup_id: float = 0.90`.
+- `validate_build_config(config)`: enforces `config.dedup_mode in ("off", "ref", "pan")` and `0.80 <= config.dedup_id <= 0.99`, raising `CLIArgumentError`.
 
-### IPC / Model Contracts (`panflat/models.py` ↔ `panflat/linearizer.py`)
-- `LazyProvenanceTuple.without_node_lens() -> LazyProvenanceTuple`: non-mutating shallow view with `_node_lens = _EMPTY_NODE_LENS` (`np.empty(0, dtype=np.int32)`) and `_cum_cache = [None]`.
-- `LazyProvenanceTuple.rebind_node_lens(node_lens: np.ndarray) -> LazyProvenanceTuple`: O(1) restores `self._node_lens = node_lens` and returns `self`.
-- `CompactVisitCounts(multi_nids: np.ndarray, multi_counts: np.ndarray | None = None, ...)`: when `multi_counts is None`, `get(nid, default)` returns `2` for `nid in self._multi_set`, preserving Stage 2.5 `> 1` semantics.
-- `_ContigAnalysis.contig_idx: int = -1`: deterministic integer identity replacing all `id(ca)` checks in Stage 6.
+### `panflat/repeat_guard.py` ↔ `panflat/linearizer.py` & `panflat/centromere.py`
+- `_evaluate_mappy_hits_on_blocks(hits, query_offset, q_len, num_blocks, min_sv_len, min_identity=REF_SUB_MIN_IDENTITY, t_starts=None, t_ends=None)`
+- `subtract_reference_intervals_mappy(query_seq, ref_region_seq="", min_sv_len=50, aligner=None, buf=None, min_identity=REF_SUB_MIN_IDENTITY, short_aligner=None, short_buf=None, t_starts=None, t_ends=None)`
+- `hit_covers_subinterval_mappy(hit, p_s, p_e, min_identity, t_starts=None, t_ends=None) -> bool`
+- Centromere Step B (`panflat/centromere.py:1340`) passes defaults only → locked at `0.85` (`asm20` only).
 
-### Global `UNRES_*` Numbering & Output Order Contract (T22)
-1. Stage 2.3 (`centromere.py`): `{region_id}_UNRES_*` and `CANDIDATE_JSON` strictly in `graph.all_haplotypes` order.
-2. Stage 2.4 (`linearizer.py`): `UNANCHORED_END` strictly in ascending `frag_idx = 0 .. K-1` order, immediately appended to `unresolved_records`.
-3. Stage 2.5 (`linearizer.py`): `REPEAT_LIKE` numbered strictly in `sorted_group_pairs` order (updating `seen_exported_intervals` iff `config.dump_repeat_sequences`), deferred in `guard_res.unresolved_records`.
-4. Stage 6a (`linearizer.py`): `INV_EDGE` / `INV_CONFLICT` in `(rmin, rmax, cls_name)` order.
-5. Stage 6b (`linearizer.py`): `LARGE_JUMP` in `(rank_a, rank_b)` order.
-6. Stage 6c & Stage 7 (`linearizer.py`): `REPEAT_LIKE` appended in `sorted_group_pairs` order; Stage 7 backfills `region_id` & `event_id`.
+### `panflat/linearizer.py` Internal Stage 2.5 → Stage 5.5 → Stage 6–7
+- `GroupRepeatGuardResult`: adds `contig_had_subtracted_homolog: set[int]`, `ref_masked_bp: int`, `short_residual_bp: int` (keyed by `analysis.contig_idx: int` matching Stage 6c `ckey`).
+- `ClusterRepresentative`: adds `support_hap_count: int = 0` (`len(rep.support_haps)` set in `solve_parallel_group`); `rep.token_str` preserved across Stage 5 IPC iff `config.dedup_mode == "pan"` and cleared after Stage 5.5.
+- `ParallelGroupSolution.cand_to_rep_idx`: `-1` sentinel marks candidates whose rep was 100% subtracted in Stage 5.5; Stage 6c `(iii)` emits `"."` (never `"0"`).
+- Fork-then-Thread Redline: Stage 5.5 `ThreadPoolExecutor` runs strictly after all `fork` pools (Stages 2.3b, 2.4, 2.5) have exited and `ref_dedup_*` aligners have been deleted + `gc.collect()`.
 
-### Module A (`panflat/writers.py` ↔ `panflat/verify_qc.py`)
-- `run_qc(result: ChromosomeBuildResult, config: BuildConfig | None = None) -> dict[str, Any]` (unchanged public signature; alias `compute_qc_metrics = run_qc` preserved; `config is None` defaults `n_threads = 1`).
-- `_map_queries_parallel(aligner_main, aligner_short, query_indices, piece_bytes, piece_lens, n_threads, t_starts=None, t_ends=None) -> list[tuple[int, list[tuple[int, int, float]]]]`.
+### `panflat/linearizer.py` ↔ `panflat/writers.py`
+- `summary.tsv` adds `dedup_mode`, `dedup_id`, `dedup_ref_masked_bp`, `dedup_pan_masked_bp`, `dedup_short_residual_bp`, `dedup_dropped_groups` while leaving `ref_sub_min_identity = 0.85` unchanged.
+- `merge_chromosomes`: isolates top-level `dedup_*` keys from already-merged inputs (`top_level_fallbacks` only copies `("spacer_n", "backbone_prefix")`) and computes associative top-level aggregates purely from `per_chrom_kv`.
 
 ## Code Layout
-- `panflat/` (13 Python modules; no `pipeline.py`):
-  - `__init__.py`, `__main__.py`, `cli.py`, `progress.py`, `models.py`, `gfa_io.py`, `normalizer.py`, `repeat_guard.py`, `centromere.py`, `linearizer.py`, `gff_liftover.py`, `writers.py`, `verify_qc.py`
-- `tests/`:
-  - `conftest.py`
-  - `tests/unit/`: `test_m1_foundation.py`, `test_m2_normalizer_centromere.py`, `test_m3_linearizer.py`, `test_m4_liftover_writers_verify_cli.py`, `test_m7_deep_review_hardening.py`, **`test_multicore.py` (new)**
-  - `tests/e2e/` (**ZERO `panflat` imports permitted!**): `helpers.py`, `test_tier1_features.py`, `test_tier2_boundaries.py`, `test_tier3_combinations.py`, `test_tier4_scenarios.py`, `test_tier5_adversarial.py`, **`test_tier5_multicore.py` (new)**
-- Immutable spec file (0-byte diff required): `panflat_v1_final_revised.md`
-- Agent metadata ONLY (never source/tests/data): `.agents/teamwork/`
+- `panflat/` (modified in M1): `models.py`, `cli.py`, `gfa_io.py`, `repeat_guard.py`, `linearizer.py`, `writers.py` (`verify_qc.py` and `centromere.py` require zero changes).
+- `tests/unit/` (added in M2): `test_dedup.py` (alongside existing 7 unit test files, `217` baseline tests).
+- `tests/e2e/` (**ZERO `panflat` imports permitted!**; added in M2): `test_tier5_dedup.py` (alongside existing 7 E2E test files, `368` baseline tests).
+- Immutable spec (0-byte diff required): `panflat_v1_final_revised.md`.
+- Agent metadata ONLY (never source/tests/data): `.agents/teamwork/`.
 
-## Acceptance Gates (`MULTICORE_PLAN.md §5`)
-1. `ruff check --select F,E9,W panflat tests` → 0 errors
-2. `! rg -n '^\s*(import|from)\s+panflat\b' tests/e2e` → 0 violations
-3. `git diff --exit-code panflat_v1_final_revised.md` → 0 bytes changed
-4. Full regression suite (`525` existing + all new unit & E2E tests) → 100% pass
-5. Byte-for-byte SHA-256 match across all 12 output files (`--threads 1` vs `--threads 4`) + independent `panflat verify` + zero Python 3.12 fork `DeprecationWarning` on `stderr` for both forced-fork adversarial and natural real-threshold graphs
-6. 33-haplotype chromosome-scale synthetic benchmark (`threads=1` vs `threads=2`/`4`) confirming real multicore speedup, CPU utilization, bounded RSS, and 12-file SHA-256 identity
+## Acceptance Gates (`DEDUP_PLAN.md` §4)
+1. `git diff --exit-code panflat_v1_final_revised.md` → 0 bytes changed
+2. `ruff check --select F,E9,W panflat tests` → 0 errors
+3. `! rg -n '^\s*(import|from)\s+panflat\b' tests/e2e` → 0 violations
+4. Full regression (`585` baseline tests under `--dedup-mode off` + all new dedup unit & E2E tests) → 100% pass
+5. §4.2 Tests 1–4 verified via independent `panflat verify` (`[INV1]`/`[INV2]`/`[INV3]`/`[CEN]`/`[UNRES]`), pure-Python GFF3 protein/transcript oracle, `--qc` closed-loop `< 2%` redundancy with `100%` novel recall, and T22 12-file SHA-256 byte-identity (`--threads 1` vs `--threads 4` with `PANFLAT_FORCE_FORK=1` + shuffled GFA)
+6. Note: Real pear `Chr06A` dataset (§4.3) is not present on this VM (verified read-only); clearly disclosed in final report.
